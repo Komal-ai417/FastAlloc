@@ -15,20 +15,20 @@ FastAlloc is a custom-built memory allocator designed as a drop-in replacement f
 
 ```mermaid
 flowchart TD
-    User["Thread (fast_malloc / fast_free)"] -->|O(1) Lock-Free| TLS["Thread Local Storage (TLS) Cache"]
-    User -->|Large Allocations (>1024B)| OS
+    User[Thread Allocations] -->|O1 Lock-Free| TLS[TLS Cache]
+    User -->|Large Allocations| OS
     
-    subgraph "FastAlloc Core"
-        TLS -->|Batch Fetch / Evict| GH{"Global Heap (Mutex Protected)"}
+    subgraph FastAlloc Core
+        TLS -->|Batch Fetch and Evict| GH{Global Heap}
         
-        GH <-->|Size Class 16b| S1["Slab (64KB)"]
-        GH <-->|Size Class 32b| S2["Slab (64KB)"]
-        GH <-->|Size Class ...| S3["Slab (64KB)"]
+        GH <-->|Size Class 16b| S1[Slab 64KB]
+        GH <-->|Size Class 32b| S2[Slab 64KB]
+        GH <-->|Size Class ...| S3[Slab 64KB]
     end
     
-    S1 <-->|Page Map / Unmap Empty| OS["OS Virtual Memory (VirtualAlloc / mmap)"]
-    S2 <-->|Page Map / Unmap Empty| OS
-    S3 <-->|Page Map / Unmap Empty| OS
+    S1 <-->|Map and Unmap| OS[OS Virtual Memory]
+    S2 <-->|Map and Unmap| OS
+    S3 <-->|Map and Unmap| OS
 ```
 
 ## Usage Overview
