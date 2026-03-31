@@ -1,0 +1,35 @@
+name: FastAlloc CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    name: Build & Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Test on both Linux (mmap) and Windows (VirtualAlloc) to prove cross-platform stability!
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build Project
+      run: cmake --build build --config Release
+
+    - name: Run Correctness Tests (Google Test)
+      working-directory: ${{github.workspace}}/build/tests
+      run: ctest -C Release -V
+
+    - name: Build Benchmarks (Validation only)
+      # We only compile the benchmarks to ensure no compiler errors. 
+      # Running performance benchmarks on noisy CI virtual machines yields unreliable data.
+      run: cmake --build build --target fast_alloc_bench --config Release
