@@ -73,3 +73,6 @@ ctest -C Release -V
 ```bash
 .\build\benchmarks\Release\fast_alloc_bench.exe
 ```
+
+## License
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
