@@ -23,6 +23,7 @@ struct Slab {
     std::size_t block_size;
     std::size_t total_blocks;
     std::size_t free_blocks;
+    std::size_t memory_size;
 
     /**
      * @brief Formats a raw memory buffer into a Slab.
