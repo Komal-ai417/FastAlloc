@@ -10,6 +10,7 @@ struct Slab;
  */
 struct FreeBlock {
     Slab* slab;       // Always valid (never overwritten by user data)
+    char _padding[16 - sizeof(Slab*)]; // Explicit 16-byte offset padding
     FreeBlock* next;  // Overwritten by user data when allocated!
 };
 
