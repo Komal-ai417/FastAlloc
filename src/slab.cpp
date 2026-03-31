@@ -1,4 +1,5 @@
 #include "slab.h"
+#include "fast_alloc_config.h"
 #include <cassert>
 
 namespace FastAlloc {
