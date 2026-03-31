@@ -5,7 +5,7 @@ FastAlloc is a custom-built memory allocator designed as a drop-in replacement f
 
 ## Architecture Highlights
 - **O(1) Lock-Free Fast Path:** By utilizing Thread-Local Storage (TLS), thread-specific block caches bypass mutex locks completely for small allocations. 
-- **Batch Eviction & Contention Control:** When a thread's cache hits its ceiling, it slices off 50% of its blocks and transfers them back to the global heap under a *single* lock acquisition, reducing mutex contention by orders of magnitude.
+- **Symmetric Batch Fetching & Eviction:** When a thread's cache hits its ceiling (or is empty), it slices off 50% of its blocks and transfers them back to the global heap (or fetches them) under a *single* lock acquisition, reducing mutex contention by orders of magnitude.
 - **Slab Allocation & Runtime Reclaiming:** Categorizes memory requests into exact "Size Classes" (16 bytes, 32 bytes... 1024 bytes) using raw OS pages. The Global Heap aggressively monitors slab occupancy and unmaps `IsEmpty()` slabs back to the OS, preventing memory-bloat over long uptimes.
 - **Embedded Metadata & Alignment:** FastAlloc deducts metadata on `free()` requests using inline negative offsets. Memory boundaries are strictly mathematically aligned ensuring SIMD-vectorization safety across both 32-bit and 64-bit platforms.
 - **Reallocation De-hoarding:** Intelligently fragments memory downwards if a `realloc` dictates a significant drop in size-class, preventing large 1MB pages from being permanently hoarded for 16-byte payloads.
