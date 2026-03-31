@@ -2,37 +2,40 @@
 #include "tls_cache.h"
 #include "global_heap.h"
 #include "fast_alloc_config.h"
+#include "os_memory.h"
 
 #include <cstring>
 #include <new>
 
 namespace FastAlloc {
 
+// Strictly enforce 16-byte metadata offset so User Data sits on exactly 16-byte aligned boundaries (SIMD safety).
+constexpr std::size_t USER_OFFSET = 16;
+
+struct LargeAllocHeader {
+    std::size_t alloc_size;
+    char _pad1[8];
+    Slab* slab; // Always nullptr for large allocations
+    char _pad2[8];
+};
+
 void* fast_malloc(std::size_t size) {
     if (size == 0) return nullptr;
 
-    // We need space for at least FreeBlock (which contains Slab* and next pointer)
-    // The user sees memory starting at `next`.
-    // offsetof(FreeBlock, next) is sizeof(Slab*).
-    std::size_t total_size = size + offsetof(FreeBlock, next);
+    std::size_t total_size = size + USER_OFFSET;
     
     if (total_size > MAX_SLAB_SIZE) {
-        // Large allocation (bypassing slabs)
-        // Memory layout: [ alloc_size (8 bytes) ] [ Slab* (8 bytes, nullptr) ] [ User Data ... ]
-        std::size_t metadata_size = sizeof(std::size_t) + offsetof(FreeBlock, next);
-        std::size_t alloc_size = size + metadata_size;
+        // Large allocation bypassing slabs
+        std::size_t alloc_size = size + sizeof(LargeAllocHeader);
         
         void* mem = GlobalHeap::GetInstance().AllocateLarge(alloc_size);
         if (!mem) return nullptr;
         
-        std::size_t* size_header = static_cast<std::size_t*>(mem);
-        *size_header = alloc_size;
+        LargeAllocHeader* header = static_cast<LargeAllocHeader*>(mem);
+        header->alloc_size = alloc_size;
+        header->slab = nullptr; 
         
-        // The slab pointer must be directly before the user data
-        Slab** slab_header = reinterpret_cast<Slab**>(size_header + 1);
-        *slab_header = nullptr; 
-        
-        return slab_header + 1; // User data starts here
+        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); // User data
     }
 
     std::size_t class_index = SizeToClassIndex(total_size);
@@ -40,31 +43,28 @@ void* fast_malloc(std::size_t size) {
     
     if (!block) return nullptr;
 
-    // block->slab is already correctly set when the Slab was created!
-    // We just return the pointer to the user area (which overlaps with `next` when free)
-    return &block->next;
+    return reinterpret_cast<char*>(block) + USER_OFFSET;
 }
 
 void fast_free(void* ptr) {
     if (!ptr) return;
 
-    // Step back to find the FreeBlock start (the Slab pointer)
-    FreeBlock* block = reinterpret_cast<FreeBlock*>(
-        static_cast<char*>(ptr) - offsetof(FreeBlock, next));
-    
-    Slab* slab = block->slab;
+    // Step back to read the Slab pointer natively
+    Slab** slab_ptr = reinterpret_cast<Slab**>(static_cast<char*>(ptr) - USER_OFFSET);
+    Slab* slab = *slab_ptr;
+
     if (slab == nullptr) {
         // It's a large allocation!
-        // Step back one more to find the size location
-        std::size_t* size_header = reinterpret_cast<std::size_t*>(
-            reinterpret_cast<char*>(block) - sizeof(std::size_t));
+        LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
+            static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         
-        std::size_t alloc_size = *size_header;
-        GlobalHeap::GetInstance().DeallocateLarge(size_header, alloc_size);
+        std::size_t alloc_size = header->alloc_size;
+        GlobalHeap::GetInstance().DeallocateLarge(header, alloc_size);
         return;
     }
 
     std::size_t class_index = SizeToClassIndex(slab->block_size);
+    FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
     TLSCache::Get().DeallocateBlock(class_index, block);
 }
 
@@ -86,45 +86,39 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         return fast_malloc(new_size);
     }
 
-    // Must find out the old size to copy data
     std::size_t old_size = 0;
-    
-    FreeBlock* block = reinterpret_cast<FreeBlock*>(
-        static_cast<char*>(ptr) - offsetof(FreeBlock, next));
-        
-    Slab* slab = block->slab;
+    Slab** slab_ptr = reinterpret_cast<Slab**>(static_cast<char*>(ptr) - USER_OFFSET);
+    Slab* slab = *slab_ptr;
+
     if (slab == nullptr) {
-        std::size_t* size_header = reinterpret_cast<std::size_t*>(
-            reinterpret_cast<char*>(block) - sizeof(std::size_t));
-        // Real user capacity is total allocated size minus metadata
-        old_size = *size_header - sizeof(std::size_t) - offsetof(FreeBlock, next);
+        LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
+            static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
+        old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
-        // Slab capacity minus the header
-        old_size = slab->block_size - offsetof(FreeBlock, next);
+        old_size = slab->block_size - USER_OFFSET;
     }
 
     if (new_size <= old_size) {
         bool should_shrink = false;
         
         if (slab != nullptr) {
-            std::size_t new_class_index = SizeToClassIndex(new_size + offsetof(FreeBlock, next));
+            std::size_t new_class_index = SizeToClassIndex(new_size + USER_OFFSET);
             std::size_t old_class_index = SizeToClassIndex(slab->block_size);
-            // If dropping more than 1 size class, reclaim
             if (old_class_index > new_class_index + 1) should_shrink = true;
         } else {
-            // Large to small dropping by more than 1 page
-            std::size_t page_size = 4096; // typical
+            std::size_t page_size = OSMemory::GetPageSize();
             if (old_size - new_size >= page_size) should_shrink = true;
         }
 
         if (!should_shrink) {
-            return ptr; // Simple reuse buffer
+            return ptr;
         }
     }
 
     void* new_ptr = fast_malloc(new_size);
     if (new_ptr) {
-        std::memcpy(new_ptr, ptr, old_size);
+        // Safe copy without overflow
+        std::memcpy(new_ptr, ptr, (old_size < new_size) ? old_size : new_size);
         fast_free(ptr);
     }
     return new_ptr;
