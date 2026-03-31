@@ -89,6 +89,7 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
 }
 
 void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
+    (void)slab; // Unused since batch eviction natively retrieves it from the block layout
     FreeBlock* block = static_cast<FreeBlock*>(ptr);
     block->next = nullptr;
     DeallocateBatch(block);
