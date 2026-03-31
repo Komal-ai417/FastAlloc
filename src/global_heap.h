@@ -19,6 +19,9 @@ public:
     // Return a block directly to its slab
     void DeallocateBlock(Slab* slab, void* ptr);
 
+    // Return a batched linked list of blocks back to their respective slabs natively
+    void DeallocateBatch(FreeBlock* head);
+
     // Bypasses slabs for allocations > MAX_SLAB_SIZE
     void* AllocateLarge(std::size_t size);
     void  DeallocateLarge(void* ptr, std::size_t size);
