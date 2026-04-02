@@ -12,11 +12,11 @@ namespace FastAlloc {
 // Strictly enforce 16-byte metadata offset so User Data sits on exactly 16-byte aligned boundaries (SIMD safety).
 constexpr std::size_t USER_OFFSET = 16;
 
-#include <cstddef>
-struct LargeAllocHeader {
+struct alignas(16) LargeAllocHeader {
     std::size_t alloc_size;
     Slab* slab; // Always nullptr for large allocations
 };
+static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OFFSET");
 
 void* fast_malloc(std::size_t size) {
     if (size == 0) return nullptr;
@@ -26,8 +26,7 @@ void* fast_malloc(std::size_t size) {
     
     if (total_size > MAX_SLAB_SIZE) {
         // Large allocation bypassing slabs
-        std::size_t header_overhead = offsetof(LargeAllocHeader, slab) + USER_OFFSET;
-        std::size_t alloc_size = size + header_overhead;
+        std::size_t alloc_size = size + sizeof(LargeAllocHeader);
         
         void* mem = GlobalHeap::GetInstance().AllocateLarge(alloc_size);
         if (!mem) return nullptr;
@@ -36,7 +35,7 @@ void* fast_malloc(std::size_t size) {
         header->alloc_size = alloc_size;
         header->slab = nullptr; 
         
-        return reinterpret_cast<char*>(&header->slab) + USER_OFFSET; // User data
+        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); // User data
     }
 
     std::size_t class_index = SizeToClassIndex(total_size);
@@ -57,7 +56,7 @@ void fast_free(void* ptr) {
     if (slab == nullptr) {
         // It's a large allocation!
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
-            reinterpret_cast<char*>(slab_ptr) - offsetof(LargeAllocHeader, slab));
+            static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         
         std::size_t alloc_size = header->alloc_size;
         GlobalHeap::GetInstance().DeallocateLarge(header, alloc_size);
@@ -93,8 +92,8 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 
     if (slab == nullptr) {
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
-            reinterpret_cast<char*>(slab_ptr) - offsetof(LargeAllocHeader, slab));
-        old_size = header->alloc_size - (offsetof(LargeAllocHeader, slab) + USER_OFFSET);
+            static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
+        old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
         old_size = slab->block_size - USER_OFFSET;
     }
