@@ -12,17 +12,17 @@ namespace FastAlloc {
 // Strictly enforce 16-byte metadata offset so User Data sits on exactly 16-byte aligned boundaries (SIMD safety).
 constexpr std::size_t USER_OFFSET = 16;
 
-struct LargeAllocHeader {
+struct alignas(16) LargeAllocHeader {
     std::size_t alloc_size;
-    char _pad1[8];
     Slab* slab; // Always nullptr for large allocations
-    char _pad2[8];
 };
+static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OFFSET");
 
 void* fast_malloc(std::size_t size) {
     if (size == 0) return nullptr;
 
     std::size_t total_size = size + USER_OFFSET;
+    if (total_size < size) return nullptr; // Integer overflow check
     
     if (total_size > MAX_SLAB_SIZE) {
         // Large allocation bypassing slabs
