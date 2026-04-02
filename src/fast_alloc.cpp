@@ -13,8 +13,8 @@ namespace FastAlloc {
 constexpr std::size_t USER_OFFSET = 16;
 
 struct alignas(16) LargeAllocHeader {
+    Slab* slab; // MUST be first (offset 0) to identically match ptr-16 mapping logic
     std::size_t alloc_size;
-    Slab* slab; // Always nullptr for large allocations
 };
 static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OFFSET");
 
