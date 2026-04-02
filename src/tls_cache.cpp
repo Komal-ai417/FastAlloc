@@ -12,11 +12,9 @@ TLSCache::~TLSCache() {
     // Return all cached blocks to global heap on thread exit
     // Note: GlobalHeap outlives thread_local instances.
     for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-        FreeBlock* block = fast_bins_[i];
-        while (block) {
-            FreeBlock* next = block->next;
-            GlobalHeap::GetInstance().DeallocateBlock(block->slab, block);
-            block = next;
+        if (fast_bins_[i]) {
+            GlobalHeap::GetInstance().DeallocateBatch(fast_bins_[i]);
+            fast_bins_[i] = nullptr;
         }
     }
 }
