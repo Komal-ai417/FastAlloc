@@ -12,24 +12,28 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # Test on both Linux (mmap) and Windows (VirtualAlloc) to prove cross-platform stability!
         os: [ubuntu-latest, windows-latest]
+        build_type: [Debug, Release]
 
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
     - name: Build Project
-      run: cmake --build build --config Release
+      run: cmake --build build --config ${{ matrix.build_type }}
 
     - name: Run Correctness Tests (Google Test)
-      working-directory: ${{github.workspace}}/build
-      run: ctest -C Release -V
+      run: ctest --test-dir build -C ${{ matrix.build_type }} -V
 
-    - name: Build Benchmarks (Validation only)
-      # We only compile the benchmarks to ensure no compiler errors. 
-      # Running performance benchmarks on noisy CI virtual machines yields unreliable data.
-      run: cmake --build build --target fast_alloc_bench --config Release
+    - name: Run Benchmarks (Validation)
+      # We run the benchmark for a brief period to ensure no runtime crashes.
+      shell: bash
+      run: |
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          ./build/fast_alloc_bench.exe --benchmark_min_time=0.1
+        else
+          ./build/fast_alloc_bench --benchmark_min_time=0.1
+        fi
