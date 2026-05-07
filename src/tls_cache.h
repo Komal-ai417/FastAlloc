@@ -3,28 +3,52 @@
 #include "fast_alloc_config.h"
 #include <array>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 namespace FastAlloc {
 
 class TLSCache {
 public:
     static TLSCache& Get();
 
-    // Allocate a block for the given size class.
-    // Returns the raw FreeBlock* (including the slab header inside).
     void* AllocateBlock(std::size_t class_index);
-
-    // Deallocate a raw FreeBlock* back to the cache (or global heap if cache is full)
     void DeallocateBlock(std::size_t class_index, FreeBlock* block);
+
+    // Destructor must be public for the FLS/pthread cleanup callbacks
+    ~TLSCache();
 
 private:
     TLSCache() = default;
-    ~TLSCache();
 
     std::array<FreeBlock*, NUM_SIZE_CLASSES> fast_bins_{};
     std::array<std::size_t, NUM_SIZE_CLASSES> counts_{};
 
-    // To prevent hoarding and unbounded memory growth
-    static constexpr std::size_t MAX_CACHE_SIZE = 128; 
+    // MEMORY OPTIMIZATION: Prevent memory hoarding.
+    // Scale the cache limit inversely to the block size.
+    static std::size_t GetMaxCacheSize(std::size_t class_index) {
+        std::size_t size = ClassIndexToSize(class_index);
+        if (size <= 256) return 256;  // Tiny objects: Cache aggressively 
+        if (size <= 4096) return 64;  // Medium objects: Cache moderately
+        return 8;                     // Large objects (>4K): Keep cache tiny
+    }
+
+    // Platform-specific TLS key
+    // Using FlsAlloc (Windows) / pthread_key_create (Linux) avoids the
+    // C++ thread_local loader-lock deadlock on Windows/MinGW.
+#ifdef _WIN32
+    static DWORD tls_key_;
+#else
+    static pthread_key_t tls_key_;
+    static void TlsDestructor(void* ptr);
+#endif
+    static void InitTlsKey();
 };
 
 } // namespace FastAlloc

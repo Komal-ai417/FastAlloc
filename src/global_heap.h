@@ -2,6 +2,7 @@
 #include "slab.h"
 #include "fast_alloc_config.h"
 #include <mutex>
+#include <atomic>
 #include <array>
 
 namespace FastAlloc {
@@ -22,6 +23,9 @@ public:
     // Return a batched linked list of blocks back to their respective slabs natively
     void DeallocateBatch(FreeBlock* head);
 
+    // Lock-free deferred return for use during thread teardown (avoids loader lock deadlock)
+    void DeferredDeallocateBatch(FreeBlock* head);
+
     // Bypasses slabs for allocations > MAX_SLAB_SIZE
     void* AllocateLarge(std::size_t size);
     void  DeallocateLarge(void* ptr, std::size_t size);
@@ -35,6 +39,12 @@ private:
     // Arrays of intrusive linked lists for slabs
     std::array<Slab*, NUM_SIZE_CLASSES> partial_slabs_{};
     std::array<Slab*, NUM_SIZE_CLASSES> full_slabs_{};
+
+    // Lock-free pending return queue: TLS destructors push here to avoid mutex/loader-lock deadlock
+    std::atomic<FreeBlock*> pending_returns_{nullptr};
+
+    // Drain pending returns into slabs (called under mutex_)
+    void DrainPendingReturns();
 
     Slab* AllocateNewSlab(std::size_t class_index);
 };

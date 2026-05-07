@@ -4,26 +4,27 @@
 FastAlloc is a custom-built memory allocator designed as a drop-in replacement for standard `malloc` and `free`. It avoids OS overhead by leveraging low-level OS utilities (`VirtualAlloc` on Windows, `mmap` on Linux) mapped to heavily-optimized caching and concurrency synchronization techniques.
 
 ## Architecture Highlights
-- **O(1) Lock-Free Fast Path:** By utilizing Thread-Local Storage (TLS), thread-specific block caches bypass mutex locks completely for small allocations. 
-- **Symmetric Batch Fetching & Eviction:** When a thread's cache hits its ceiling (or is empty), it slices off 50% of its blocks and transfers them back to the global heap (or fetches them) under a *single* lock acquisition, reducing mutex contention by orders of magnitude.
-- **Slab Allocation & Runtime Reclaiming:** Categorizes memory requests into exact "Size Classes" (16 bytes, 32 bytes... 1024 bytes) using raw OS pages. The Global Heap aggressively monitors slab occupancy and unmaps `IsEmpty()` slabs back to the OS, preventing memory-bloat over long uptimes.
-- **Embedded Metadata & Alignment:** FastAlloc deducts metadata on `free()` requests using inline negative offsets. Memory boundaries are strictly mathematically aligned ensuring SIMD-vectorization safety across both 32-bit and 64-bit platforms.
-- **Reallocation De-hoarding:** Intelligently fragments memory downwards if a `realloc` dictates a significant drop in size-class, preventing large 1MB pages from being permanently hoarded for 16-byte payloads.
-- **Platform Agnostic:** Natively handles Windows through `VirtualAlloc` and POSIX compliant systems through `mmap`.
+- **O(1) Lock-Free Fast Path:** By utilizing Platform-Native TLS (FLS on Windows, Pthreads on Linux), thread-specific block caches bypass mutex locks completely. The implementation is hardened against loader-lock deadlocks on Windows/MinGW.
+- **Dynamic Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects stay lean on 64KB slabs, while larger objects scale up to 2MB to maintain peak performance without fragmentation.
+- **Anti-Hoarding Caches:** Thread caches use adaptive thresholds. Tiny objects are cached aggressively (256 blocks), while large objects (>4KB) are strictly limited (8 blocks) to prevent threads from hoarding physical memory in high-concurrency environments.
+- **Lock-Free Handoff & Stability:** Dying threads return memory via a lock-free MPSC `pending_returns_` queue. The Global Heap also defers OS `VirtualFree`/`munmap` calls until after releasing the global mutex to maximize throughput and prevent re-entrant system deadlocks.
+- **Embedded Metadata & Alignment:** FastAlloc deducts metadata on `free()` requests using inline negative offsets. Memory boundaries are strictly mathematically aligned ensuring SIMD-vectorization safety.
+- **Platform Native:** Natively handles Windows through `VirtualAlloc`/`FlsAlloc` and POSIX compliant systems through `mmap`/`pthread_key`.
 
 ## System Flow Diagram
 
 ```mermaid
 flowchart TD
-    User[Thread Allocations] -->|O1 Lock-Free| TLS[TLS Cache]
+    User[Thread Allocations] -->|O1 Lock-Free| TLS[Native TLS Cache]
     User -->|Large Allocations| OS
     
     subgraph FastAlloc Core
         TLS -->|Batch Fetch and Evict| GH{Global Heap}
+        GH -.->|Lock-Free Handoff| TLS
         
-        GH <-->|Size Class 16b| S1[Slab 64KB]
-        GH <-->|Size Class 32b| S2[Slab 64KB]
-        GH <-->|Size Class ...| S3[Slab 64KB]
+        GH <-->|Small Class 16b| S1[Slab 64KB]
+        GH <-->|Medium Class 512b| S2[Slab 128KB]
+        GH <-->|Large Class 8Kb| S3[Slab 2MB]
     end
     
     S1 <-->|Map and Unmap| OS[OS Virtual Memory]
@@ -65,13 +66,15 @@ This project configures `FetchContent` to dynamically isolate and link **Google 
 
 **Verify Memory Integrity (GTest):**
 ```bash
-cd build\tests
-ctest -C Release -V
+ctest --test-dir build -C Release -V
 ```
 
 **Compare Against System Default Allocators (GBench):**
 ```bash
-.\build\benchmarks\Release\fast_alloc_bench.exe
+# Windows
+.\build\fast_alloc_bench.exe
+# Linux
+./build/fast_alloc_bench
 ```
 
 ## License

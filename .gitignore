@@ -17,7 +17,6 @@ _deps/
 *.dylib
 *.a
 *.lib
-*.out
 
 # IDEs
 .idea/
