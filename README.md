@@ -71,8 +71,10 @@ ctest --test-dir build -C Release -V
 
 **Compare Against System Default Allocators (GBench):**
 ```bash
-# Windows
-.\build\fast_alloc_bench.exe
+# Windows (Release)
+.\build\Release\fast_alloc_bench.exe  # MSVC
+.\build\fast_alloc_bench.exe          # MinGW/Ninja
+
 # Linux
 ./build/fast_alloc_bench
 ```
