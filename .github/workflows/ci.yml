@@ -33,7 +33,12 @@ jobs:
       shell: bash
       run: |
         if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-          ./build/fast_alloc_bench.exe --benchmark_min_time=0.1
+          # On Windows (MSVC), executables are often in build/Release/ or build/Debug/
+          if [ -f "./build/${{ matrix.build_type }}/fast_alloc_bench.exe" ]; then
+            ./build/${{ matrix.build_type }}/fast_alloc_bench.exe --benchmark_min_time=0.1
+          else
+            ./build/fast_alloc_bench.exe --benchmark_min_time=0.1
+          fi
         else
           ./build/fast_alloc_bench --benchmark_min_time=0.1
         fi
