@@ -25,7 +25,7 @@ public:
 
     // Large Allocation Cache
     void* AllocateLargeCached(std::size_t size);
-    void  DeallocateLargeCached(void* ptr, std::size_t alloc_size, std::size_t user_size);
+    void  DeallocateLargeCached(void* ptr, std::size_t alloc_size);
 
     ~TLSCache();
 
@@ -49,7 +49,6 @@ private:
     struct LargeFreeEntry {
         LargeFreeEntry* next;
         std::size_t alloc_size;
-        std::size_t user_size;
     };
 
     static constexpr std::size_t NUM_LARGE_CLASSES = 16;

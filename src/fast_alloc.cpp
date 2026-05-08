@@ -55,7 +55,7 @@ void fast_free(void* ptr) {
         std::size_t alloc_size = header->alloc_size;
         
         // OPT-5: Return to large allocation cache
-        TLSCache::GetFast().DeallocateLargeCached(header, alloc_size, 0);
+        TLSCache::GetFast().DeallocateLargeCached(header, alloc_size);
         return;
     }
 

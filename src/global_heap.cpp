@@ -29,8 +29,8 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index) {
     std::size_t block_size = ClassIndexToSize(class_index);
     
     std::size_t target_blocks = 256;
-    if (block_size >= 1024) target_blocks = 64;
-    if (block_size >= 4096) target_blocks = 16;
+    if (block_size >= 1024) target_blocks = 128;
+    if (block_size >= 4096) target_blocks = 32;
     
     std::size_t target_size = block_size * target_blocks;
     if (target_size < 65536) target_size = 65536; 

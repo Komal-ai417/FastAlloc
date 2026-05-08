@@ -17,7 +17,7 @@ public:
     explicit ScopedSpinLock(std::atomic_flag& f) : flag_(f) {
         int spins = 0;
         while (flag_.test_and_set(std::memory_order_acquire)) {
-            if (++spins > 32) {
+            if (++spins > 64) {
                 std::this_thread::yield();
                 spins = 0;
             } else {

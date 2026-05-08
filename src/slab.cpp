@@ -45,6 +45,7 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
 }
 
 void* Slab::Allocate() {
+    assert(free_blocks > 0 && free_list != nullptr && "Allocating from empty slab!");
     if (free_blocks == 0 || free_list == nullptr) {
         return nullptr;
     }
@@ -60,8 +61,11 @@ void* Slab::Allocate() {
 void Slab::Deallocate(void* ptr) {
     assert(ptr != nullptr);
     
-    // Push onto head of free list
     FreeBlock* block = static_cast<FreeBlock*>(ptr);
+    assert(block->slab == this && "Block returned to wrong slab!");
+    assert(free_blocks < total_blocks && "Double free detected!");
+    
+    // Push onto head of free list
     block->next = free_list;
     free_list = block;
     free_blocks++;

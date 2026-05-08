@@ -110,7 +110,7 @@ void* TLSCache::AllocateBlock(std::size_t class_index) {
 
     // OPT-12: Prefetch deep
 #if defined(__GNUC__) || defined(__clang__)
-    FreeBlock* curr = batch_head->next;
+    FreeBlock* curr = batch_head;
     for (int i = 0; i < 4 && curr; ++i) {
         __builtin_prefetch(curr, 0, 1);
         curr = curr->next;
@@ -167,8 +167,7 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
     return nullptr;
 }
 
-void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size, std::size_t user_size) {
-    (void)user_size;
+void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
     std::size_t cls = LargeSizeToClass(alloc_size);
     if (large_counts_[cls] < MAX_LARGE_CACHE) {
         LargeFreeEntry* entry = reinterpret_cast<LargeFreeEntry*>(ptr);
