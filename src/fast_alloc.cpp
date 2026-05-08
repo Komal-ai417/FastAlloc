@@ -116,7 +116,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     return new_ptr;
 }
 
-} // namespace FastAlloc
+} // namespace FastAlloc 
 
 #ifdef FAST_ALLOC_OVERRIDE_NEW
 void* operator new(std::size_t size) {
