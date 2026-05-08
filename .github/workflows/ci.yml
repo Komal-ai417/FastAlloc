@@ -29,7 +29,8 @@ jobs:
       run: ctest --test-dir build -C ${{ matrix.build_type }} -V
 
     - name: Run Benchmarks (Validation)
-      # We run the benchmark for a brief period to ensure no runtime crashes.
+      if: matrix.build_type == 'Release'
+      # We run the benchmark for a brief period to ensure no runtime crashes and valid timings.
       shell: bash
       run: |
         if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
