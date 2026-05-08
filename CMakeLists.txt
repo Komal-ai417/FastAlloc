@@ -24,11 +24,13 @@ target_include_directories(fast_alloc PUBLIC
     PRIVATE src
 )
 
-# Compiler warnings
+# Compiler warnings and optimizations
 if(MSVC)
     target_compile_options(fast_alloc PRIVATE /W4 /WX)
+    target_compile_options(fast_alloc PRIVATE $<$<CONFIG:Release>:/O2 /Ob2 /Ot /Gy>)
 else()
     target_compile_options(fast_alloc PRIVATE -Wall -Wextra -Werror)
+    target_compile_options(fast_alloc PRIVATE $<$<CONFIG:Release>:-O3 -march=native -fno-plt>)
 endif()
 
 # Fetch dependencies (GTest and GBench)

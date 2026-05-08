@@ -3,6 +3,7 @@
 #include "fast_alloc_config.h"
 #include <atomic>
 #include <array>
+#include <thread>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -14,12 +15,18 @@ class ScopedSpinLock {
     std::atomic_flag& flag_;
 public:
     explicit ScopedSpinLock(std::atomic_flag& f) : flag_(f) {
+        int spins = 0;
         while (flag_.test_and_set(std::memory_order_acquire)) {
+            if (++spins > 32) {
+                std::this_thread::yield();
+                spins = 0;
+            } else {
 #if defined(_MSC_VER)
-            _mm_pause();
+                _mm_pause();
 #elif defined(__i386__) || defined(__x86_64__)
-            __builtin_ia32_pause();
+                __builtin_ia32_pause();
 #endif
+            }
         }
     }
     ~ScopedSpinLock() { flag_.clear(std::memory_order_release); }
@@ -76,7 +83,7 @@ private:
         void* ptr;
         std::size_t size;
     };
-    static constexpr std::size_t MAX_DEFERRED_FREE = 64;
+    static constexpr std::size_t MAX_DEFERRED_FREE = 128;
 
     // Drain pending returns into slabs (called under appropriate stripe lock)
     void DrainPendingReturns(std::size_t stripe_index, SlabToFree* deferred_slabs, std::size_t& deferred_count);

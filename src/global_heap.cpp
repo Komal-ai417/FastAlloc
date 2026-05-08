@@ -27,7 +27,12 @@ static void RemoveSlab(Slab*& head, Slab* slab) {
 
 Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index) {
     std::size_t block_size = ClassIndexToSize(class_index);
-    std::size_t target_size = block_size * 256;
+    
+    std::size_t target_blocks = 256;
+    if (block_size >= 1024) target_blocks = 64;
+    if (block_size >= 4096) target_blocks = 16;
+    
+    std::size_t target_size = block_size * target_blocks;
     if (target_size < 65536) target_size = 65536; 
     if (target_size > 2 * 1024 * 1024) target_size = 2 * 1024 * 1024; 
     
@@ -56,6 +61,7 @@ void GlobalHeap::DeferredDeallocateBatch(FreeBlock* head) {
 }
 
 void GlobalHeap::DrainPendingReturns(std::size_t stripe_index, SlabToFree* deferred_slabs, std::size_t& deferred_count) {
+    if (pending_returns_[stripe_index].head.load(std::memory_order_relaxed) == nullptr) return;
     FreeBlock* pending = pending_returns_[stripe_index].head.exchange(nullptr, std::memory_order_acquire);
     if (!pending) return;
 
@@ -91,18 +97,24 @@ void* GlobalHeap::AllocateBlock(std::size_t class_index) {
         DrainPendingReturns(stripe, stack_buf, deferred_count);
 
         Slab* slab = partial_slabs_[class_index];
-        if (!slab) {
-            slab = AllocateNewSlab(class_index);
-            if (slab) {
-                PushSlab(partial_slabs_[class_index], slab);
-            }
-        }
-
         if (slab) {
             ptr = slab->Allocate();
             if (slab->IsFull()) {
                 RemoveSlab(partial_slabs_[class_index], slab);
                 PushSlab(full_slabs_[class_index], slab);
+            }
+        }
+    }
+
+    if (!ptr) {
+        Slab* new_slab = AllocateNewSlab(class_index);
+        if (new_slab) {
+            ScopedSpinLock lock(class_locks_[stripe]);
+            PushSlab(partial_slabs_[class_index], new_slab);
+            ptr = new_slab->Allocate();
+            if (new_slab->IsFull()) {
+                RemoveSlab(partial_slabs_[class_index], new_slab);
+                PushSlab(full_slabs_[class_index], new_slab);
             }
         }
     }

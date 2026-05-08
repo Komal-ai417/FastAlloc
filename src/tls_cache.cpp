@@ -108,12 +108,14 @@ void* TLSCache::AllocateBlock(std::size_t class_index) {
     
     if (!batch_head) return nullptr;
 
-    // OPT-8: Prefetch
-    if (batch_head->next) {
+    // OPT-12: Prefetch deep
 #if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(batch_head->next, 0, 1);
-#endif
+    FreeBlock* curr = batch_head->next;
+    for (int i = 0; i < 4 && curr; ++i) {
+        __builtin_prefetch(curr, 0, 1);
+        curr = curr->next;
     }
+#endif
 
     block = batch_head;
     fast_bins_[class_index] = block->next;
