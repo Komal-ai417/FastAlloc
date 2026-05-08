@@ -68,6 +68,7 @@ private:
     // Lock-free pending return queue per stripe
     struct alignas(64) PendingList {
         std::atomic<FreeBlock*> head{nullptr};
+        char _padding[64 - sizeof(std::atomic<FreeBlock*>)];
     };
     std::array<PendingList, NUM_STRIPES> pending_returns_{};
 
