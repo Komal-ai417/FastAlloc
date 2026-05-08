@@ -13,6 +13,7 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
     // Place the Slab header at the very beginning of the raw memory
     Slab* slab = static_cast<Slab*>(memory);
     slab->next = nullptr;
+    slab->prev = nullptr;
     slab->block_size = block_size;
     slab->memory_size = memory_size;
 

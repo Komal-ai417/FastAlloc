@@ -20,6 +20,7 @@ struct FreeBlock {
  */
 struct Slab {
     Slab* next; // Intrusive list pointer to link slabs of the same size class
+    Slab* prev; // Added for O(1) removal
     FreeBlock* free_list;
     std::size_t block_size;
     std::size_t total_blocks;

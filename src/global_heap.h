@@ -1,11 +1,29 @@
 #pragma once
 #include "slab.h"
 #include "fast_alloc_config.h"
-#include <mutex>
 #include <atomic>
 #include <array>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace FastAlloc {
+
+class ScopedSpinLock {
+    std::atomic_flag& flag_;
+public:
+    explicit ScopedSpinLock(std::atomic_flag& f) : flag_(f) {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+#if defined(_MSC_VER)
+            _mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+    ~ScopedSpinLock() { flag_.clear(std::memory_order_release); }
+};
 
 class GlobalHeap {
 public:
@@ -31,22 +49,41 @@ public:
     void  DeallocateLarge(void* ptr, std::size_t size);
 
 private:
-    GlobalHeap() = default;
+    GlobalHeap() : class_locks_() {
+        for (auto& lock : class_locks_) lock.clear();
+    }
     ~GlobalHeap() = default;
 
-    std::mutex mutex_;
+    static constexpr std::size_t NUM_STRIPES = 16;
+    std::array<std::atomic_flag, NUM_STRIPES> class_locks_;
+
+    std::size_t ClassToStripe(std::size_t class_index) const {
+        return (class_index * 7) & (NUM_STRIPES - 1);
+    }
     
     // Arrays of intrusive linked lists for slabs
     std::array<Slab*, NUM_SIZE_CLASSES> partial_slabs_{};
     std::array<Slab*, NUM_SIZE_CLASSES> full_slabs_{};
 
-    // Lock-free pending return queue: TLS destructors push here to avoid mutex/loader-lock deadlock
-    std::atomic<FreeBlock*> pending_returns_{nullptr};
+    // Lock-free pending return queue per stripe
+    struct alignas(64) PendingList {
+        std::atomic<FreeBlock*> head{nullptr};
+    };
+    std::array<PendingList, NUM_STRIPES> pending_returns_{};
 
-    // Drain pending returns into slabs (called under mutex_)
-    void DrainPendingReturns();
+    struct SlabToFree {
+        void* ptr;
+        std::size_t size;
+    };
+    static constexpr std::size_t MAX_DEFERRED_FREE = 64;
+
+    // Drain pending returns into slabs (called under appropriate stripe lock)
+    void DrainPendingReturns(std::size_t stripe_index, SlabToFree* deferred_slabs, std::size_t& deferred_count);
 
     Slab* AllocateNewSlab(std::size_t class_index);
+
+    // Helper to extract blocks and advance slab pointers
+    FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count);
 };
 
 } // namespace FastAlloc

@@ -67,7 +67,11 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     add_executable(fast_alloc_bench benchmarks/bench_main.cpp)
     target_link_libraries(fast_alloc_bench PRIVATE fast_alloc benchmark::benchmark)
     
+    add_executable(fast_alloc_bench_extended benchmarks/bench_extended.cpp)
+    target_link_libraries(fast_alloc_bench_extended PRIVATE fast_alloc benchmark::benchmark)
+    
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
     target_link_libraries(fast_alloc_bench PRIVATE Threads::Threads)
+    target_link_libraries(fast_alloc_bench_extended PRIVATE Threads::Threads)
 endif()

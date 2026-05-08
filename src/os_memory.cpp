@@ -35,16 +35,17 @@ void OSMemory::FreePages(void* ptr, std::size_t size) {
 }
 
 std::size_t OSMemory::GetPageSize() {
-    static std::size_t page_size = 0;
-    if (page_size == 0) {
+    static const std::size_t page_size = []() {
+        std::size_t size = 0;
 #ifdef _WIN32
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
-        page_size = sysInfo.dwPageSize;
+        size = sysInfo.dwPageSize;
 #else
-        page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
 #endif
-    }
+        return (size > 0) ? size : 4096;
+    }();
     return page_size;
 }
 

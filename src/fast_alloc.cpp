@@ -9,13 +9,7 @@
 
 namespace FastAlloc {
 
-// Strictly enforce 16-byte metadata offset so User Data sits on exactly 16-byte aligned boundaries (SIMD safety).
 constexpr std::size_t USER_OFFSET = 16;
-
-struct alignas(16) LargeAllocHeader {
-    Slab* slab; // MUST be first (offset 0) to identically match ptr-16 mapping logic
-    std::size_t alloc_size;
-};
 static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OFFSET");
 
 void* fast_malloc(std::size_t size) {
@@ -25,8 +19,12 @@ void* fast_malloc(std::size_t size) {
     if (total_size < size) return nullptr; // Integer overflow check
     
     if (total_size > MAX_SLAB_SIZE) {
-        // Large allocation bypassing slabs
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
+        if (alloc_size < size) return nullptr;
+        
+        // OPT-5: Try large allocation cache
+        void* cached_mem = TLSCache::GetFast().AllocateLargeCached(alloc_size);
+        if (cached_mem) return cached_mem;
         
         void* mem = GlobalHeap::GetInstance().AllocateLarge(alloc_size);
         if (!mem) return nullptr;
@@ -35,12 +33,11 @@ void* fast_malloc(std::size_t size) {
         header->alloc_size = alloc_size;
         header->slab = nullptr; 
         
-        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); // User data
+        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); 
     }
 
     std::size_t class_index = SizeToClassIndex(total_size);
-    FreeBlock* block = static_cast<FreeBlock*>(TLSCache::Get().AllocateBlock(class_index));
-    
+    FreeBlock* block = static_cast<FreeBlock*>(TLSCache::GetFast().AllocateBlock(class_index));
     if (!block) return nullptr;
 
     return reinterpret_cast<char*>(block) + USER_OFFSET;
@@ -49,26 +46,26 @@ void* fast_malloc(std::size_t size) {
 void fast_free(void* ptr) {
     if (!ptr) return;
 
-    // Step back to read the Slab pointer natively
     Slab** slab_ptr = reinterpret_cast<Slab**>(static_cast<char*>(ptr) - USER_OFFSET);
     Slab* slab = *slab_ptr;
 
     if (slab == nullptr) {
-        // It's a large allocation!
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-        
         std::size_t alloc_size = header->alloc_size;
-        GlobalHeap::GetInstance().DeallocateLarge(header, alloc_size);
+        
+        // OPT-5: Return to large allocation cache
+        TLSCache::GetFast().DeallocateLargeCached(header, alloc_size, 0);
         return;
     }
 
     std::size_t class_index = SizeToClassIndex(slab->block_size);
     FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
-    TLSCache::Get().DeallocateBlock(class_index, block);
+    TLSCache::GetFast().DeallocateBlock(class_index, block);
 }
 
 void* fast_calloc(std::size_t num, std::size_t size) {
+    if (num != 0 && size > (static_cast<std::size_t>(-1) / num)) return nullptr;
     std::size_t total = num * size;
     void* ptr = fast_malloc(total);
     if (ptr) {
@@ -100,7 +97,6 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 
     if (new_size <= old_size) {
         bool should_shrink = false;
-        
         if (slab != nullptr) {
             std::size_t new_class_index = SizeToClassIndex(new_size + USER_OFFSET);
             std::size_t old_class_index = SizeToClassIndex(slab->block_size);
@@ -109,15 +105,11 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             std::size_t page_size = OSMemory::GetPageSize();
             if (old_size - new_size >= page_size) should_shrink = true;
         }
-
-        if (!should_shrink) {
-            return ptr;
-        }
+        if (!should_shrink) return ptr;
     }
 
     void* new_ptr = fast_malloc(new_size);
     if (new_ptr) {
-        // Safe copy without overflow
         std::memcpy(new_ptr, ptr, (old_size < new_size) ? old_size : new_size);
         fast_free(ptr);
     }
@@ -126,7 +118,6 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 
 } // namespace FastAlloc
 
-// Global overrides (optional/conditionally compiled).
 #ifdef FAST_ALLOC_OVERRIDE_NEW
 void* operator new(std::size_t size) {
     void* ptr = FastAlloc::fast_malloc(size);
@@ -142,6 +133,12 @@ void operator delete(void* ptr) noexcept {
     FastAlloc::fast_free(ptr);
 }
 void operator delete[](void* ptr) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete(void* ptr, std::size_t) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete[](void* ptr, std::size_t) noexcept {
     FastAlloc::fast_free(ptr);
 }
 #endif
