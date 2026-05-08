@@ -13,6 +13,13 @@ FastAlloc is a custom-built memory allocator designed as a drop-in replacement f
 - **Performance:** Outperforms standard system `malloc` by up to **2.7x** under heavy thread contention and handles `free()` bursts up to **1.8x** faster.
 - **Platform Native:** Natively handles Windows through `VirtualAlloc`/`FlsAlloc` and POSIX compliant systems through `mmap`/`pthread_key`.
 
+## Documentation
+For in-depth explanations of FastAlloc's internal mechanics and performance results, please refer to the detailed documentation:
+- 📊 [**Performance & Benchmark Report**](docs/performance_report.md)
+- ⚙️ [**Technical Design Document**](docs/technical_design.md)
+- 🛡️ [**QA & Memory Safety Report**](docs/qa_report.md)
+- 📖 [**API Reference Guide**](docs/api_reference.md)
+
 ## System Flow Diagram
 
 ```mermaid
