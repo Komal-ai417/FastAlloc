@@ -44,3 +44,17 @@ Compiled using `-fsanitize=memory`.
 Valgrind's memcheck tool was run against the multi-threaded heavy contention benchmark.
 - **Memory Leaks**: `All heap blocks were freed -- no leaks are possible`. 
 - **Proof of Teardown**: FastAlloc natively registers thread exit callbacks via `FlsAlloc` (Windows) and `pthread_key_create` (Linux). When a thread dies, its entire local TLS cache is cleanly flushed back to the Global Heap using the deferred return queue. When the process terminates, all slabs are unconditionally returned to the OS.
+
+## 4. Runtime Debug Assertions
+
+FastAlloc includes `assert()`-guarded invariant checks inside `Slab::Allocate()` and `Slab::Deallocate()`. These are compiled out in Release builds (`NDEBUG` is set) and have zero performance overhead.
+
+| Assertion | Detects | Location |
+| :--- | :--- | :--- |
+| `free_blocks > 0 && free_list != nullptr` | Allocation from an exhausted slab | `Slab::Allocate()` |
+| `block->slab == this` | Block returned to the wrong slab (memory corruption) | `Slab::Deallocate()` |
+| `free_blocks < total_blocks` | Double-free of the same pointer | `Slab::Deallocate()` |
+
+## 5. Dead Code Removal
+
+The `LargeFreeEntry::user_size` field was identified as dead code — it was stored during deallocation but never read back during allocation. It has been removed along with the corresponding function parameter, saving 8 bytes per cached large entry per thread.

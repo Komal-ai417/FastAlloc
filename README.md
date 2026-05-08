@@ -4,13 +4,14 @@
 FastAlloc is a custom-built memory allocator designed as a drop-in replacement for standard `malloc` and `free`. It avoids OS overhead by leveraging low-level OS utilities (`VirtualAlloc` on Windows, `mmap` on Linux) mapped to heavily-optimized caching and concurrency synchronization techniques.
 
 ## Architecture Highlights
-- **Adaptive Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects use 64KB slabs, while larger objects scale efficiently up to 2MB. Slabs for large block sizes (4096B+) are intelligently downsized to prevent virtual memory fragmentation and bloat.
+- **Adaptive Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects use 64KB slabs (256 blocks), medium objects use 128KB slabs (128 blocks for 1024B), and large objects use 128KB slabs (32 blocks for 4096B). This balances throughput with memory efficiency, saving 50-88% virtual memory versus fixed-density slabs.
 - **Out-of-Lock OS Allocation:** Critical system calls (`VirtualAlloc`/`mmap`) are executed *outside* of global spinlocks. This ensures that slow OS-level page mapping never blocks other threads from accessing the global heap.
 - **Wait-Free Fast Path:** By utilizing Platform-Native TLS (FLS on Windows, Pthreads on Linux), thread-specific block caches bypass mutex locks completely. Deallocation bursts are handled via a wait-free `try_lock` fallback directly to per-stripe lock-free caches.
 - **Exponential Spinlock Backoff:** Global stripe locks implement exponential backoff with `std::this_thread::yield()`, drastically reducing cache-line bouncing and improving stability under extreme multi-core contention.
 - **Aggressive Memory Unmapping:** FastAlloc guarantees aggressive return of empty slabs to the OS outside the critical path spinlocks, ensuring a footprint often smaller than `malloc`.
 - **Per-Stripe Lock-Free Handoff:** Dying threads and heavily contended thread queues return memory via 16 isolated, per-stripe lock-free MPSC `pending_returns_` queues, eliminating O(N^2) overhead.
-- **Performance:** Outperforms standard system `malloc` by up to **2.7x** under heavy thread contention and handles `free()` bursts up to **1.8x** faster.
+- **Performance:** Outperforms standard system `malloc` by up to **6.7x** under heavy 16-thread contention (`BM_HeavyContention/256B`), up to **1,310x** for large allocation reuse, and **4.5x** for scoped alloc-free patterns.
+- **Debug Safety:** Includes `assert()`-guarded invariant checks for double-free detection and wrong-slab returns, compiling to zero overhead in Release builds.
 - **Platform Native:** Natively handles Windows through `VirtualAlloc`/`FlsAlloc` and POSIX compliant systems through `mmap`/`pthread_key`.
 
 ## Documentation
@@ -31,9 +32,9 @@ flowchart TD
         TLS -->|Batch Fetch and Evict| GH{Global Heap}
         GH -.->|Lock-Free Handoff| TLS
         
-        GH <-->|Small Class 16b| S1[Slab 64KB]
-        GH <-->|Medium Class 512b| S2[Slab 128KB]
-        GH <-->|Large Class 8Kb| S3[Slab 2MB]
+        GH <-->|Small Class 16b| S1[Slab 64KB · 256 blocks]
+        GH <-->|Medium Class 1Kb| S2[Slab 128KB · 128 blocks]
+        GH <-->|Large Class 4Kb| S3[Slab 128KB · 32 blocks]
     end
     
     S1 <-->|Map and Unmap| OS[OS Virtual Memory]
