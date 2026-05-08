@@ -1,0 +1,93 @@
+# FastAlloc
+*A High-Performance, Thread-Safe C++ Memory Allocator*
+
+FastAlloc is a custom-built memory allocator designed as a drop-in replacement for standard `malloc` and `free`. It avoids OS overhead by leveraging low-level OS utilities (`VirtualAlloc` on Windows, `mmap` on Linux) mapped to heavily-optimized caching and concurrency synchronization techniques.
+
+## Architecture Highlights
+- **Adaptive Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects use 64KB slabs (256 blocks), medium objects use 128KB slabs (128 blocks for 1024B), and large objects use 128KB slabs (32 blocks for 4096B). This balances throughput with memory efficiency, saving 50-88% virtual memory versus fixed-density slabs.
+- **Out-of-Lock OS Allocation:** Critical system calls (`VirtualAlloc`/`mmap`) are executed *outside* of global spinlocks. This ensures that slow OS-level page mapping never blocks other threads from accessing the global heap.
+- **Wait-Free Fast Path:** By utilizing Platform-Native TLS (FLS on Windows, Pthreads on Linux), thread-specific block caches bypass mutex locks completely. Deallocation bursts are handled via a wait-free `try_lock` fallback directly to per-stripe lock-free caches.
+- **Exponential Spinlock Backoff:** Global stripe locks implement exponential backoff with `std::this_thread::yield()`, drastically reducing cache-line bouncing and improving stability under extreme multi-core contention.
+- **Aggressive Memory Unmapping:** FastAlloc guarantees aggressive return of empty slabs to the OS outside the critical path spinlocks, ensuring a footprint often smaller than `malloc`.
+- **Per-Stripe Lock-Free Handoff:** Dying threads and heavily contended thread queues return memory via 16 isolated, per-stripe lock-free MPSC `pending_returns_` queues, eliminating O(N^2) overhead.
+- **Performance:** Outperforms standard system `malloc` by up to **6.7x** under heavy 16-thread contention (`BM_HeavyContention/256B`), up to **1,310x** for large allocation reuse, and **4.5x** for scoped alloc-free patterns.
+- **Debug Safety:** Includes `assert()`-guarded invariant checks for double-free detection and wrong-slab returns, compiling to zero overhead in Release builds.
+- **Platform Native:** Natively handles Windows through `VirtualAlloc`/`FlsAlloc` and POSIX compliant systems through `mmap`/`pthread_key`.
+
+## Documentation
+For in-depth explanations of FastAlloc's internal mechanics and performance results, please refer to the detailed documentation:
+- 📊 [**Performance & Benchmark Report**](docs/performance_report.md)
+- ⚙️ [**Technical Design Document**](docs/technical_design.md)
+- 🛡️ [**QA & Memory Safety Report**](docs/qa_report.md)
+- 📖 [**API Reference Guide**](docs/api_reference.md)
+
+## System Flow Diagram
+
+```mermaid
+flowchart TD
+    User[Thread Allocations] -->|O1 Lock-Free| TLS[Native TLS Cache]
+    User -->|Large Allocations| OS
+    
+    subgraph FastAlloc Core
+        TLS -->|Batch Fetch and Evict| GH{Global Heap}
+        GH -.->|Lock-Free Handoff| TLS
+        
+        GH <-->|Small Class 16b| S1[Slab 64KB · 256 blocks]
+        GH <-->|Medium Class 1Kb| S2[Slab 128KB · 128 blocks]
+        GH <-->|Large Class 4Kb| S3[Slab 128KB · 32 blocks]
+    end
+    
+    S1 <-->|Map and Unmap| OS[OS Virtual Memory]
+    S2 <-->|Map and Unmap| OS
+    S3 <-->|Map and Unmap| OS
+```
+
+## Usage Overview
+```cpp
+#include "fast_alloc.h"
+
+int main() {
+    // Basic explicit allocation
+    void* my_data = FastAlloc::fast_malloc(128); 
+    FastAlloc::fast_free(my_data);
+
+    return 0;
+}
+```
+
+*Optionally*, by defining `FAST_ALLOC_OVERRIDE_NEW` during configuration, all standard `new` and `delete` operators globally route through FastAlloc automatically, injecting high performance into third party libraries instantly.
+
+## Quick Start (CMake)
+
+Requires C++17 or higher.
+
+```bash
+git clone https://github.com/yourusername/FastAlloc.git
+cd FastAlloc
+
+# Configure Project
+cmake -B build
+# Build (Release Mode Recommended)
+cmake --build build --config Release
+```
+
+## Running Tests and Benchmarks
+This project configures `FetchContent` to dynamically isolate and link **Google Test** and **Google Benchmark**. 
+
+**Verify Memory Integrity (GTest):**
+```bash
+ctest --test-dir build -C Release -V
+```
+
+**Compare Against System Default Allocators (GBench):**
+```bash
+# Windows (Release)
+.\build\Release\fast_alloc_bench.exe  # MSVC
+.\build\fast_alloc_bench.exe          # MinGW/Ninja
+
+# Linux
+./build/fast_alloc_bench
+```
+
+## License
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
