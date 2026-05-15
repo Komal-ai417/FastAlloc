@@ -16,10 +16,10 @@ FastAlloc is a custom-built memory allocator designed as a drop-in replacement f
 
 ## Documentation
 For in-depth explanations of FastAlloc's internal mechanics and performance results, please refer to the detailed documentation:
-- 📊 [**Performance & Benchmark Report**](docs/performance_report.md)
-- ⚙️ [**Technical Design Document**](docs/technical_design.md)
-- 🛡️ [**QA & Memory Safety Report**](docs/qa_report.md)
-- 📖 [**API Reference Guide**](docs/api_reference.md)
+-  [**Performance & Benchmark Report**](docs/performance_report.md)
+-  [**Technical Design Document**](docs/technical_design.md)
+-  [**QA & Memory Safety Report**](docs/qa_report.md)
+-  [**API Reference Guide**](docs/api_reference.md)
 
 ## System Flow Diagram
 
