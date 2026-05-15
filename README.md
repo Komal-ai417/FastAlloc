@@ -33,10 +33,10 @@ void example() {
 Define `FAST_ALLOC_OVERRIDE_NEW` in your build configuration to globally replace standard `new`/`delete`.
 
 ## Documentation
-- 📊 [**Performance & Benchmark Report**](docs/performance_report.md)
-- ⚙️ [**Technical Design Document**](docs/technical_design.md)
-- 🛡️ [**QA & Memory Safety Report**](docs/qa_report.md)
-- 📖 [**API Reference Guide**](docs/api_reference.md)
+- [**Performance & Benchmark Report**](docs/performance_report.md)
+- [**Technical Design Document**](docs/technical_design.md)
+- [**QA & Memory Safety Report**](docs/qa_report.md)
+- [**API Reference Guide**](docs/api_reference.md)
 
 ## Quick Start
 ```bash
