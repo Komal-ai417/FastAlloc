@@ -12,11 +12,13 @@ option(FASTALLOC_OVERRIDE_NEW "Override standard new/delete operators" OFF)
 
 # Compiler-specific optimizations
 if(MSVC)
-    add_compile_options(/W4 /WX /Ot /Ox /GL)
-    add_link_options(/LTCG)
+    add_compile_options(/W4 /WX)
+    add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
+    add_link_options("$<$<CONFIG:Release>:/LTCG>")
 else()
     # Aggressive optimizations for GCC/Clang
-    add_compile_options(-Wall -Wextra -Werror -O3 -march=native -fno-plt)
+    add_compile_options(-Wall -Wextra -Werror)
+    add_compile_options("$<$<CONFIG:Release>:-O3>" "$<$<CONFIG:Release>:-march=native>" "$<$<CONFIG:Release>:-fno-plt>")
 endif()
 
 if(FASTALLOC_OVERRIDE_NEW)
