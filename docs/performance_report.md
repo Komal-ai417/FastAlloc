@@ -1,23 +1,24 @@
 # Performance Report: FastAlloc vs Standard Malloc
 
 ## 1. Multi-Threaded Contention
-Measured using 16 threads hammering the allocator simultaneously with requests of various sizes (BM_HeavyContention).
+Measured using 8-16 threads hammering the allocator simultaneously with requests of various sizes (BM_HeavyContention).
 
-| Size | Std Malloc (CPU) | FastAlloc (CPU) | Speedup |
-| :--- | :--- | :--- | :--- |
-| **32B** | 39,900 ns | **14,038 ns** | **2.84x** |
-| **64B** | 37,109 ns | **17,711 ns** | **2.10x** |
-| **128B**| 39,062 ns | **17,001 ns** | **2.30x** |
-| **256B**| 40,690 ns | **15,958 ns** | **2.55x** |
+| Size | Threads | Std Malloc (CPU) | FastAlloc (CPU) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **32B** | 8 | 9,269 ns | **2,934 ns** | **3.1x** |
+| **64B** | 8 | 9,099 ns | **2,954 ns** | **3.0x** |
+| **128B**| 8 | 15,663 ns | **2,918 ns** | **5.3x** |
+| **256B**| 8 | 14,764 ns | **3,055 ns** | **4.8x** |
 
-## 2. Large Allocation Recycling
-FastAlloc bypasses the OS kernel by caching large pages in a two-tier system (TLS + Global Page Heap).
+## 2. Core Allocation Loop (Malloc + Free)
+Measuring the total round-trip throughput of allocating and instantly freeing memory arrays.
 
-| Size | Std Malloc (Syscall) | FastAlloc (Cache) | Speedup |
-| :--- | :--- | :--- | :--- |
-| **64KB (1 thread)** | 500 ns | **57.8 ns** | **8.6x** |
-| **256KB (4 threads)**| 8,946 ns | **63.5 ns** | **140x** |
-| **1MB (4 threads)** | 54,408 ns | **63.8 ns** | **852x** |
+| Size | Threads | Std Malloc | FastAlloc | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **8B** | 8 | 23,415 ns | **7,481 ns** | **3.1x** |
+| **512B** | 8 | 98,650 ns | **7,262 ns** | **13.5x** |
+| **4096B** | 8 | 793,275 ns | **14,848 ns** | **53.4x** |
+| **8192B** | 8 | 827,823 ns | **20,318 ns** | **40.7x** |
 
 ## 3. Memory Footprint (Peak RSS)
 Measured during a 39MB stress test across 8 threads allocating 512B blocks.
@@ -31,7 +32,7 @@ Measured during a 39MB stress test across 8 threads allocating 512B blocks.
 ## 4. Latency (Fast-Path)
 Pure allocation speed for objects in the TLS cache (MallocOnly).
 
-| Size | Std Malloc | FastAlloc |
-| :--- | :--- | :--- |
-| **16B (1 thread)** | 326 ns | **305 ns** |
-| **1024B (1 thread)**| 378 ns | **375 ns** |
+| Size | Threads | Std Malloc | FastAlloc |
+| :--- | :--- | :--- | :--- |
+| **16B** | 8 | 384 ns | **368 ns** |
+| **256B** | 8 | 387 ns | **371 ns** |
