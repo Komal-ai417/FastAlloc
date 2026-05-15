@@ -13,8 +13,7 @@ FASTALLOC_API void* fast_malloc(std::size_t size);
 **Behavior:** 
 - If `size` is 0, the function returns a `nullptr`.
 - Allocations are mathematically guaranteed to be 16-byte aligned.
-- For allocations `<= 8192` bytes, it routes to the O(1) TLS Cache.
-- For allocations `> 8192` bytes, it bypasses slabs and invokes an OS page-aligned mapping, subject to the Large Allocation Reuse Cache.
+- FastAlloc uses Adaptive Slab Sizing (e.g., 64KB slabs for small, 128KB slabs for large objects). Fast paths are handled wait-free via Platform-Native TLS caches.
 
 ### `FastAlloc::fast_free`
 ```cpp
@@ -24,7 +23,8 @@ FASTALLOC_API void fast_free(void* ptr);
 **Behavior:**
 - If `ptr` is `nullptr`, the function does nothing.
 - Deduces the metadata by reading the 16-byte negative offset natively.
-- Returns the memory block to the TLS Cache. If the cache overflows its tier limit, the block is batch-evicted to the Global Heap.
+- Returns the memory block to the TLS Cache. Deallocation bursts are handled via a wait-free `try_lock` fallback directly to per-stripe lock-free caches.
+- Ensures aggressive memory unmapping back to the OS for empty slabs outside the critical path spinlocks.
 
 ### `FastAlloc::fast_calloc`
 ```cpp
@@ -50,14 +50,14 @@ FASTALLOC_API void* fast_realloc(void* ptr, std::size_t new_size);
 
 FastAlloc can be used invisibly to accelerate entire third-party libraries and large C++ projects without modifying their source code.
 
-By defining the preprocessor macro `FAST_ALLOC_OVERRIDE_NEW` before including the header (or setting it globally in your build system), FastAlloc will automatically intercept and override the global `new` and `delete` operators.
+By defining the preprocessor macro `FAST_ALLOC_OVERRIDE_NEW` during configuration, all standard `new` and `delete` operators globally route through FastAlloc automatically, injecting high performance into third party libraries instantly.
 
 ```cpp
 #define FAST_ALLOC_OVERRIDE_NEW
 #include "fast_alloc.h"
 
 int main() {
-    // This now routes directly through FastAlloc's O(1) TLS cache!
+    // This now routes directly through FastAlloc's O(1) wait-free fast path!
     std::string* my_str = new std::string("Hello World");
     
     // Reroutes to fast_free
