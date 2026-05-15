@@ -15,7 +15,10 @@ static void WINAPI FlsCleanupCallback(PVOID ptr) {
     if (ptr) {
         TLSCache* cache = static_cast<TLSCache*>(ptr);
         cache->~TLSCache();
-        std::free(cache);
+        std::size_t page_size = OSMemory::GetPageSize();
+        std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+        OSMemory::FreePages(cache, alloc_size);
+        fast_path_cache = nullptr;
     }
 }
 
@@ -29,7 +32,10 @@ void TLSCache::TlsDestructor(void* ptr) {
     if (ptr) {
         TLSCache* cache = static_cast<TLSCache*>(ptr);
         cache->~TLSCache();
-        std::free(cache);
+        std::size_t page_size = OSMemory::GetPageSize();
+        std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+        OSMemory::FreePages(cache, alloc_size);
+        fast_path_cache = nullptr;
     }
 }
 
@@ -38,9 +44,8 @@ void TLSCache::InitTlsKey() {
 }
 #endif
 
-TLSCache& TLSCache::GetFast() {
-    if (fast_path_cache) return *fast_path_cache;
-    return GetSlow();
+TLSCache::TLSCache() {
+    arena_index_ = GlobalHeap::GetInstance().GetNextArena();
 }
 
 TLSCache& TLSCache::GetSlow() {
@@ -53,7 +58,9 @@ TLSCache& TLSCache::GetSlow() {
         fast_path_cache = static_cast<TLSCache*>(val);
         return *fast_path_cache;
     }
-    void* mem = std::malloc(sizeof(TLSCache));
+    std::size_t page_size = OSMemory::GetPageSize();
+    std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+    void* mem = OSMemory::AllocatePages(alloc_size);
     TLSCache* cache = new (mem) TLSCache();
     FlsSetValue(tls_key_, cache);
     fast_path_cache = cache;
@@ -64,7 +71,9 @@ TLSCache& TLSCache::GetSlow() {
         fast_path_cache = static_cast<TLSCache*>(val);
         return *fast_path_cache;
     }
-    void* mem = std::malloc(sizeof(TLSCache));
+    std::size_t page_size = OSMemory::GetPageSize();
+    std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+    void* mem = OSMemory::AllocatePages(alloc_size);
     TLSCache* cache = new (mem) TLSCache();
     pthread_setspecific(tls_key_, cache);
     fast_path_cache = cache;
@@ -79,36 +88,27 @@ TLSCache::~TLSCache() {
             fast_bins_[i] = nullptr;
         }
     }
-    // OPT-5: Free large cache
     for (std::size_t i = 0; i < NUM_LARGE_CLASSES; ++i) {
         LargeFreeEntry* entry = large_free_bins_[i];
         while (entry) {
             LargeFreeEntry* next = entry->next;
-            OSMemory::FreePages(entry, entry->alloc_size);
+            GlobalHeap::GetInstance().DeallocateLarge(entry, entry->alloc_size);
             entry = next;
         }
         large_free_bins_[i] = nullptr;
     }
 }
 
-void* TLSCache::AllocateBlock(std::size_t class_index) {
-    FreeBlock* block = fast_bins_[class_index];
-    if (block) {
-        fast_bins_[class_index] = block->next;
-        counts_[class_index]--;
-        return block;
-    }
-
+void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     std::size_t max_cache = GetMaxCacheSize(class_index);
     std::size_t target_count = max_cache / 2;
     if (target_count == 0) target_count = 1; 
     
     std::size_t actual_count = 0;
-    FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(class_index, target_count, actual_count);
+    FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(class_index, target_count, actual_count, arena_index_);
     
     if (!batch_head) return nullptr;
 
-    // OPT-12: Prefetch deep
 #if defined(__GNUC__) || defined(__clang__)
     FreeBlock* curr = batch_head;
     for (int i = 0; i < 4 && curr; ++i) {
@@ -117,35 +117,29 @@ void* TLSCache::AllocateBlock(std::size_t class_index) {
     }
 #endif
 
-    block = batch_head;
+    FreeBlock* block = batch_head;
     fast_bins_[class_index] = block->next;
     counts_[class_index] = actual_count - 1;
 
     return block;
 }
 
-void TLSCache::DeallocateBlock(std::size_t class_index, FreeBlock* block) {
-    block->next = fast_bins_[class_index];
-    fast_bins_[class_index] = block;
-    counts_[class_index]++;
-
+void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
     std::size_t max_cache = GetMaxCacheSize(class_index);
-    if (counts_[class_index] >= max_cache) {
-        std::size_t batch_size = max_cache / 2;
-        if (batch_size == 0) batch_size = 1;
+    std::size_t batch_size = max_cache / 2;
+    if (batch_size == 0) batch_size = 1;
 
-        FreeBlock* head = fast_bins_[class_index];
-        FreeBlock* curr = head;
-        for (std::size_t i = 1; i < batch_size; ++i) {
-            curr = curr->next;
-        }
-        
-        fast_bins_[class_index] = curr->next;
-        curr->next = nullptr; 
-        counts_[class_index] -= batch_size;
-
-        GlobalHeap::GetInstance().DeallocateBatch(head);
+    FreeBlock* head = fast_bins_[class_index];
+    FreeBlock* curr = head;
+    for (std::size_t i = 1; i < batch_size; ++i) {
+        curr = curr->next;
     }
+    
+    fast_bins_[class_index] = curr->next;
+    curr->next = nullptr; 
+    counts_[class_index] -= batch_size;
+
+    GlobalHeap::GetInstance().DeallocateBatch(head);
 }
 
 void* TLSCache::AllocateLargeCached(std::size_t size) {
@@ -164,19 +158,27 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
         }
         pp = &(*pp)->next;
     }
+
+    void* mem = GlobalHeap::GetInstance().AllocateLarge(size);
+    if (mem) {
+        LargeAllocHeader* header = static_cast<LargeAllocHeader*>(mem);
+        header->alloc_size = size;
+        header->slab = nullptr; 
+        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); 
+    }
     return nullptr;
 }
 
 void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
     std::size_t cls = LargeSizeToClass(alloc_size);
-    if (large_counts_[cls] < MAX_LARGE_CACHE) {
+    if (large_counts_[cls] < GetMaxLargeCacheSize(alloc_size)) {
         LargeFreeEntry* entry = reinterpret_cast<LargeFreeEntry*>(ptr);
         entry->alloc_size = alloc_size;
         entry->next = large_free_bins_[cls];
         large_free_bins_[cls] = entry;
         large_counts_[cls]++;
     } else {
-        OSMemory::FreePages(ptr, alloc_size);
+        GlobalHeap::GetInstance().DeallocateLarge(ptr, alloc_size);
     }
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 namespace FastAlloc {
 
@@ -26,6 +27,7 @@ struct Slab {
     std::size_t total_blocks;
     std::size_t free_blocks;
     std::size_t memory_size;
+    uint32_t arena_index;
 
     /**
      * @brief Formats a raw memory buffer into a Slab.
@@ -33,9 +35,10 @@ struct Slab {
      * @param memory Pointer to raw aligned memory mapping.
      * @param memory_size The total size of the memory mapping.
      * @param block_size The size of each element in the slab.
+     * @param arena_index The arena that owns this slab.
      * @return Pointer to the initialized Slab.
      */
-    static Slab* Create(void* memory, std::size_t memory_size, std::size_t block_size);
+    static Slab* Create(void* memory, std::size_t memory_size, std::size_t block_size, uint32_t arena_index);
 
     /**
      * @brief Allocates an object from this slab.

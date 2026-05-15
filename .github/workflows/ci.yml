@@ -38,11 +38,17 @@ jobs:
           if [ -f "./build/${{ matrix.build_type }}/fast_alloc_bench.exe" ]; then
             ./build/${{ matrix.build_type }}/fast_alloc_bench.exe --benchmark_min_time=0.1
             ./build/${{ matrix.build_type }}/fast_alloc_bench_extended.exe --benchmark_min_time=0.1
+            ./build/${{ matrix.build_type }}/fast_alloc_bench_memory.exe
+            ./build/${{ matrix.build_type }}/fast_alloc_bench_memory.exe --fast
           else
             ./build/fast_alloc_bench.exe --benchmark_min_time=0.1
             ./build/fast_alloc_bench_extended.exe --benchmark_min_time=0.1
+            ./build/fast_alloc_bench_memory.exe
+            ./build/fast_alloc_bench_memory.exe --fast
           fi
         else
           ./build/fast_alloc_bench --benchmark_min_time=0.1
           ./build/fast_alloc_bench_extended --benchmark_min_time=0.1
+          ./build/fast_alloc_bench_memory
+          ./build/fast_alloc_bench_memory --fast
         fi

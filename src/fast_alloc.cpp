@@ -22,18 +22,14 @@ void* fast_malloc(std::size_t size) {
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
         if (alloc_size < size) return nullptr;
         
-        // OPT-5: Try large allocation cache
+        std::size_t page_size = OSMemory::GetPageSize();
+        alloc_size = (alloc_size + page_size - 1) & ~(page_size - 1);
+        
+        // AllocateLargeCached handles both TLS bins and GlobalHeap Arena fallbacks
         void* cached_mem = TLSCache::GetFast().AllocateLargeCached(alloc_size);
         if (cached_mem) return cached_mem;
         
-        void* mem = GlobalHeap::GetInstance().AllocateLarge(alloc_size);
-        if (!mem) return nullptr;
-        
-        LargeAllocHeader* header = static_cast<LargeAllocHeader*>(mem);
-        header->alloc_size = alloc_size;
-        header->slab = nullptr; 
-        
-        return reinterpret_cast<char*>(mem) + sizeof(LargeAllocHeader); 
+        return nullptr;
     }
 
     std::size_t class_index = SizeToClassIndex(total_size);
@@ -54,7 +50,7 @@ void fast_free(void* ptr) {
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         std::size_t alloc_size = header->alloc_size;
         
-        // OPT-5: Return to large allocation cache
+        // Return to large allocation cache (TLS -> GlobalHeap)
         TLSCache::GetFast().DeallocateLargeCached(header, alloc_size);
         return;
     }

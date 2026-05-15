@@ -4,7 +4,7 @@
 
 namespace FastAlloc {
 
-Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size) {
+Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size, uint32_t arena_index) {
     // Need space for header + at least one block
     if (!memory || memory_size <= sizeof(Slab) + block_size) {
         return nullptr;
@@ -16,6 +16,7 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
     slab->prev = nullptr;
     slab->block_size = block_size;
     slab->memory_size = memory_size;
+    slab->arena_index = arena_index;
 
     // Determine the offset for user blocks perfectly aligned
     std::size_t offset = (sizeof(Slab) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);

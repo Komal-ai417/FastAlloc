@@ -31,13 +31,17 @@ Standard allocators protect their arenas with global mutexes. FastAlloc avoids t
 Every thread maintains its own private array of size classes. Allocations hit this cache first. Because the cache is strictly thread-local, no atomics or locks are required. Memory is pulled in O(1) time.
 
 ### Tier 2: Symmetric Batch Fetching
-When a thread's cache is empty, it must access the Global Heap. Instead of locking the heap to steal a single block, it steals a **Batch** of blocks. The target count is geometrically scaled (e.g., pulling 128 blocks at once for a 16-byte size class). This drastically amortizes the lock acquisition cost, guaranteeing that the thread won't need the lock again for a long time.
+When a thread's cache is empty, it must access its assigned Global Arena. Instead of locking the arena to steal a single block, it steals a **Batch** of blocks. The target count is geometrically scaled (e.g., pulling up to 16,384 blocks for tiny objects). This drastically amortizes the lock acquisition cost, guaranteeing that the thread won't need the lock again for a long time.
 
-### Tier 3: Striped Spinlocks & Exponential Backoff
-The Global Heap is divided into 16 independent "Stripes", each protected by a lightweight `std::atomic_flag`. If two threads request different size classes that hash to different stripes, they execute entirely in parallel. The spinlocks implement an exponential backoff sequence: after 64 fast `_mm_pause()` spins (~200ns on x86), they yield to the OS scheduler via `std::this_thread::yield()`, preventing cache-line bouncing and thread starvation under extreme contention. Slab density is adaptive per size class (256 blocks for ≤512B, 128 for 1024B, 32 for 4096B+) to balance throughput against virtual memory waste.
+### Tier 3: 16 Independent Arenas
+The Global Heap is divided into 16 independent "Arenas". When a thread first allocates memory, it is assigned to one of these arenas via a round-robin atomic counter. Each Arena manages its own slabs, pending return queues, and class locks. If 16 threads execute concurrently, they operate completely independently, avoiding global lock contention and cache-line bouncing.
 
-### Tier 4: Wait-Free Deferred Returns
-When a thread's local cache is full, it must return blocks to the Global Heap. If the required stripe lock is currently held by another thread, the releasing thread will **not** wait. It pushes the block into an MPSC (Multi-Producer Single-Consumer) lock-free `PendingList` using an atomic compare-and-swap, and returns instantly. The thread holding the lock automatically drains this pending list.
+### Tier 4: Two-Tier Global Page Cache (Large Allocations)
+Allocations larger than 8KB bypass the standard slab mechanic. To prevent thrashing the OS kernel with constant `VirtualAlloc`/`mmap` calls, FastAlloc employs a Two-Tier caching system:
+1. **Local Large Cache:** Threads maintain up to 16MB of large block references in their TLS cache.
+2. **Global Page Heap:** If the TLS cache is empty, threads access a global lock-free `PageHeap` capable of caching empty 2MB chunks. 
+
+This mechanism allows FastAlloc to recycle 1MB allocations in under 100 nanoseconds.
 
 ## 3. Platform Agnosticism
 

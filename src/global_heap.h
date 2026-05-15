@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include <thread>
+#include <cstdint>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -36,11 +37,15 @@ class GlobalHeap {
 public:
     static GlobalHeap& GetInstance();
 
+    uint32_t GetNextArena() {
+        return next_arena_.fetch_add(1, std::memory_order_relaxed) % NUM_ARENAS;
+    }
+
     // Fetch a block from a specific size class
-    void* AllocateBlock(std::size_t class_index);
+    void* AllocateBlock(std::size_t class_index, uint32_t arena_index);
 
     // Fetch a batch of blocks to re-fill thread cache
-    FreeBlock* AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count);
+    FreeBlock* AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index);
 
     // Return a block directly to its slab
     void DeallocateBlock(Slab* slab, void* ptr);
@@ -48,50 +53,46 @@ public:
     // Return a batched linked list of blocks back to their respective slabs natively
     void DeallocateBatch(FreeBlock* head);
 
-    // Lock-free deferred return for use during thread teardown (avoids loader lock deadlock)
+    // Lock-free deferred return for use during thread teardown
     void DeferredDeallocateBatch(FreeBlock* head);
 
-    // Bypasses slabs for allocations > MAX_SLAB_SIZE
+    // Bypasses slabs for allocations > MAX_SLAB_SIZE, uses global large block cache
     void* AllocateLarge(std::size_t size);
     void  DeallocateLarge(void* ptr, std::size_t size);
 
 private:
-    GlobalHeap() : class_locks_() {
-        for (auto& lock : class_locks_) lock.clear();
-    }
+    GlobalHeap() : next_arena_(0) {}
     ~GlobalHeap() = default;
 
-    static constexpr std::size_t NUM_STRIPES = 16;
-    std::array<std::atomic_flag, NUM_STRIPES> class_locks_;
+    static constexpr std::size_t NUM_ARENAS = 16;
+    std::atomic<uint32_t> next_arena_;
 
-    std::size_t ClassToStripe(std::size_t class_index) const {
-        return (class_index * 7) & (NUM_STRIPES - 1);
-    }
-    
-    // Arrays of intrusive linked lists for slabs
-    std::array<Slab*, NUM_SIZE_CLASSES> partial_slabs_{};
-    std::array<Slab*, NUM_SIZE_CLASSES> full_slabs_{};
-
-    // Lock-free pending return queue per stripe
+    // Lock-free pending return queue per size class
     struct alignas(64) PendingList {
         std::atomic<FreeBlock*> head{nullptr};
         char _padding[64 - sizeof(std::atomic<FreeBlock*>)];
     };
-    std::array<PendingList, NUM_STRIPES> pending_returns_{};
 
-    struct SlabToFree {
-        void* ptr;
-        std::size_t size;
+    struct alignas(64) Arena {
+        std::array<std::atomic_flag, NUM_SIZE_CLASSES> class_locks_{};
+        std::array<Slab*, NUM_SIZE_CLASSES> partial_slabs_{};
+        std::array<Slab*, NUM_SIZE_CLASSES> full_slabs_{};
+        std::array<PendingList, NUM_SIZE_CLASSES> pending_returns_{};
+
+        Arena() {
+            for (auto& lock : class_locks_) lock.clear();
+        }
     };
-    static constexpr std::size_t MAX_DEFERRED_FREE = 128;
 
-    // Drain pending returns into slabs (called under appropriate stripe lock)
-    void DrainPendingReturns(std::size_t stripe_index, SlabToFree* deferred_slabs, std::size_t& deferred_count);
+    std::array<Arena, NUM_ARENAS> arenas_;
 
-    Slab* AllocateNewSlab(std::size_t class_index);
+    // Drain pending returns into slabs
+    void DrainPendingReturns(uint32_t arena_index, std::size_t class_index);
+
+    Slab* AllocateNewSlab(std::size_t class_index, uint32_t arena_index);
 
     // Helper to extract blocks and advance slab pointers
-    FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count);
+    FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index);
 };
 
 } // namespace FastAlloc

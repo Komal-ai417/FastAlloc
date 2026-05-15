@@ -1,7 +1,9 @@
 #pragma once
 #include "slab.h"
 #include "fast_alloc_config.h"
+#include "global_heap.h"
 #include <array>
+#include <cstdint>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -15,13 +17,41 @@
 
 namespace FastAlloc {
 
+class TLSCache;
+extern thread_local TLSCache* fast_path_cache;
+
 class TLSCache {
 public:
-    static TLSCache& GetFast();
+    static inline TLSCache& GetFast() {
+        if (fast_path_cache) return *fast_path_cache;
+        return GetSlow();
+    }
     static TLSCache& GetSlow();
 
-    void* AllocateBlock(std::size_t class_index);
-    void DeallocateBlock(std::size_t class_index, FreeBlock* block);
+    inline void* AllocateBlock(std::size_t class_index) {
+        FreeBlock* block = fast_bins_[class_index];
+        if (block) {
+            fast_bins_[class_index] = block->next;
+            counts_[class_index]--;
+            return block;
+        }
+        return AllocateBlockSlow(class_index);
+    }
+    
+    void* AllocateBlockSlow(std::size_t class_index);
+
+    inline void DeallocateBlock(std::size_t class_index, FreeBlock* block) {
+        block->next = fast_bins_[class_index];
+        fast_bins_[class_index] = block;
+        counts_[class_index]++;
+
+        std::size_t max_cache = GetMaxCacheSize(class_index);
+        if (counts_[class_index] >= max_cache) {
+            DeallocateBlockSlow(class_index);
+        }
+    }
+    
+    void DeallocateBlockSlow(std::size_t class_index);
 
     // Large Allocation Cache
     void* AllocateLargeCached(std::size_t size);
@@ -30,45 +60,36 @@ public:
     ~TLSCache();
 
 private:
-    TLSCache() = default;
+    TLSCache();
 
     std::array<FreeBlock*, NUM_SIZE_CLASSES> fast_bins_{};
     std::array<std::size_t, NUM_SIZE_CLASSES> counts_{};
+    uint32_t arena_index_{0};
 
-    // MEMORY OPTIMIZATION: Prevent memory hoarding.
-    static std::size_t GetMaxCacheSize(std::size_t class_index) {
+    static inline std::size_t GetMaxCacheSize(std::size_t class_index) {
         std::size_t size = ClassIndexToSize(class_index);
-        if (size <= 128) return 1024;
-        if (size <= 512) return 512;
-        if (size <= 1024) return 256;
-        if (size <= 4096) return 64;
-        return 16;
+        if (size <= 64) return 16384;
+        if (size <= 256) return 8192;
+        if (size <= 1024) return 4096;
+        if (size <= 4096) return 1024;
+        if (size <= 8192) return 512;
+        return 128;
     }
 
-    // OPT-5: Large Allocation Reuse Pool
     struct LargeFreeEntry {
         LargeFreeEntry* next;
         std::size_t alloc_size;
     };
 
-    static constexpr std::size_t NUM_LARGE_CLASSES = 16;
-    static constexpr std::size_t LARGE_CLASS_BASE = 16; // 2^16 = 64KB
-    static constexpr std::size_t MAX_LARGE_CACHE = 8;
+    static inline std::size_t GetMaxLargeCacheSize(std::size_t size) {
+        std::size_t count = (16 * 1024 * 1024) / size;
+        if (count < 8) return 8;
+        if (count > 2048) return 2048;
+        return count;
+    }
 
     std::array<LargeFreeEntry*, NUM_LARGE_CLASSES> large_free_bins_{};
     std::array<std::size_t, NUM_LARGE_CLASSES> large_counts_{};
-
-    std::size_t LargeSizeToClass(std::size_t size) {
-        if (size <= (1ULL << LARGE_CLASS_BASE)) return 0;
-        unsigned long clz = 0;
-#if defined(_MSC_VER)
-        _BitScanReverse(&clz, (unsigned long)(size - 1));
-#else
-        clz = 31 - __builtin_clz((unsigned int)(size - 1));
-#endif
-        std::size_t cls = clz - LARGE_CLASS_BASE + 1;
-        return cls < NUM_LARGE_CLASSES ? cls : NUM_LARGE_CLASSES - 1;
-    }
 
 #ifdef _WIN32
     static DWORD tls_key_;

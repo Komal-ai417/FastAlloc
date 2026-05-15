@@ -2,6 +2,10 @@
 #include <cstdint>
 #include <cstddef>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace FastAlloc {
 
 // Configuration constants for the allocator
@@ -27,5 +31,24 @@ struct alignas(16) LargeAllocHeader {
     void* slab; // Should be Slab*, but void* avoids circular dependency
     std::size_t alloc_size;
 };
+
+static constexpr std::size_t NUM_LARGE_CLASSES = 64;
+static constexpr std::size_t LARGE_CLASS_BASE = 12; // 4096 bytes (page size)
+
+inline std::size_t LargeSizeToClass(std::size_t size) {
+    if (size <= (1ULL << LARGE_CLASS_BASE)) return 0;
+    unsigned long clz = 0;
+#if defined(_MSC_VER)
+#if defined(_WIN64)
+    _BitScanReverse64(&clz, size - 1);
+#else
+    _BitScanReverse(&clz, (unsigned long)(size - 1));
+#endif
+#else
+    clz = 63 - __builtin_clzll((unsigned long long)(size - 1));
+#endif
+    std::size_t cls = clz - LARGE_CLASS_BASE + 1;
+    return cls < NUM_LARGE_CLASSES ? cls : NUM_LARGE_CLASSES - 1;
+}
 
 } // namespace FastAlloc
