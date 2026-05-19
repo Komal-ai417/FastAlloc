@@ -19,7 +19,7 @@ void* fast_malloc(std::size_t size) {
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
         if (FAST_UNLIKELY(alloc_size < size)) return nullptr; // overflow
         
-        std::size_t page_size = OSMemory::GetPageSize();
+        std::size_t page_size = PAGE_SIZE;
         if (FAST_UNLIKELY(alloc_size > std::numeric_limits<std::size_t>::max() - page_size + 1)) return nullptr;
         alloc_size = (alloc_size + page_size - 1) & ~(page_size - 1);
         
@@ -92,7 +92,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             std::size_t new_class_index = SizeToClassIndex(new_size + USER_OFFSET);
             if (block->class_index > new_class_index + 1) should_shrink = true;
         } else {
-            std::size_t page_size = OSMemory::GetPageSize();
+            std::size_t page_size = PAGE_SIZE;
             if (old_size - new_size >= page_size) should_shrink = true;
         }
         if (!should_shrink) return ptr;

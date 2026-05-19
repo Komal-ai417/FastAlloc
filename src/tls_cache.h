@@ -15,10 +15,18 @@
 #include <pthread.h>
 #endif
 
+#if defined(_MSC_VER)
+#define FAST_THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define FAST_THREAD_LOCAL __thread
+#else
+#define FAST_THREAD_LOCAL thread_local
+#endif
+
 namespace FastAlloc {
 
 class TLSCache;
-extern thread_local TLSCache* fast_path_cache;
+extern FAST_THREAD_LOCAL TLSCache* fast_path_cache;
 
 class TLSCache {
 public:

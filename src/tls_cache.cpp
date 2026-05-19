@@ -6,7 +6,7 @@
 
 namespace FastAlloc {
 
-thread_local TLSCache* fast_path_cache = nullptr;
+FAST_THREAD_LOCAL TLSCache* fast_path_cache = nullptr;
 
 #ifdef _WIN32
 DWORD TLSCache::tls_key_ = FLS_OUT_OF_INDEXES;
