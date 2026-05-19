@@ -33,11 +33,14 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
 
     char* block_start = static_cast<char*>(memory) + offset;
 
+    std::size_t class_index = SizeToClassIndex(block_size);
+
     // Wire up the intrusive free list
     // Iterate backwards so the free list doles out lower addresses first (good for cache locality)
     for (std::size_t i = slab->total_blocks; i > 0; --i) {
         FreeBlock* block = reinterpret_cast<FreeBlock*>(block_start + (i - 1) * block_size);
         block->slab = slab;
+        block->class_index = class_index;
         block->next = slab->free_list;
         slab->free_list = block;
     }
@@ -45,31 +48,6 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
     return slab;
 }
 
-void* Slab::Allocate() {
-    assert(free_blocks > 0 && free_list != nullptr && "Allocating from empty slab!");
-    if (free_blocks == 0 || free_list == nullptr) {
-        return nullptr;
-    }
-    
-    // Pop from head of the free list
-    FreeBlock* block = free_list;
-    free_list = block->next;
-    free_blocks--;
-    
-    return block;
-}
 
-void Slab::Deallocate(void* ptr) {
-    assert(ptr != nullptr);
-    
-    FreeBlock* block = static_cast<FreeBlock*>(ptr);
-    assert(block->slab == this && "Block returned to wrong slab!");
-    assert(free_blocks < total_blocks && "Double free detected!");
-    
-    // Push onto head of free list
-    block->next = free_list;
-    free_list = block;
-    free_blocks++;
-}
 
 } // namespace FastAlloc

@@ -6,7 +6,7 @@
 
 #include <cstring>
 #include <new>
-
+#include <limits>
 namespace FastAlloc {
 
 constexpr std::size_t USER_OFFSET = 16;
@@ -15,14 +15,12 @@ static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OF
 void* fast_malloc(std::size_t size) {
     if (size == 0) return nullptr;
 
-    std::size_t total_size = size + USER_OFFSET;
-    if (total_size < size) return nullptr; // Integer overflow check
-    
-    if (total_size > MAX_SLAB_SIZE) {
+    if (FAST_UNLIKELY(size > MAX_SLAB_SIZE - USER_OFFSET)) {
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
-        if (alloc_size < size) return nullptr;
+        if (FAST_UNLIKELY(alloc_size < size)) return nullptr; // overflow
         
         std::size_t page_size = OSMemory::GetPageSize();
+        if (FAST_UNLIKELY(alloc_size > std::numeric_limits<std::size_t>::max() - page_size + 1)) return nullptr;
         alloc_size = (alloc_size + page_size - 1) & ~(page_size - 1);
         
         // AllocateLargeCached handles both TLS bins and GlobalHeap Arena fallbacks
@@ -32,9 +30,9 @@ void* fast_malloc(std::size_t size) {
         return nullptr;
     }
 
-    std::size_t class_index = SizeToClassIndex(total_size);
+    std::size_t class_index = SizeToClassIndex(size + USER_OFFSET);
     FreeBlock* block = static_cast<FreeBlock*>(TLSCache::GetFast().AllocateBlock(class_index));
-    if (!block) return nullptr;
+    if (FAST_UNLIKELY(!block)) return nullptr;
 
     return reinterpret_cast<char*>(block) + USER_OFFSET;
 }
@@ -42,10 +40,9 @@ void* fast_malloc(std::size_t size) {
 void fast_free(void* ptr) {
     if (!ptr) return;
 
-    Slab** slab_ptr = reinterpret_cast<Slab**>(static_cast<char*>(ptr) - USER_OFFSET);
-    Slab* slab = *slab_ptr;
+    FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
 
-    if (slab == nullptr) {
+    if (FAST_UNLIKELY(block->slab == nullptr)) {
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         std::size_t alloc_size = header->alloc_size;
@@ -55,9 +52,7 @@ void fast_free(void* ptr) {
         return;
     }
 
-    std::size_t class_index = SizeToClassIndex(slab->block_size);
-    FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
-    TLSCache::GetFast().DeallocateBlock(class_index, block);
+    TLSCache::GetFast().DeallocateBlock(block->class_index, block);
 }
 
 void* fast_calloc(std::size_t num, std::size_t size) {
@@ -80,23 +75,22 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     }
 
     std::size_t old_size = 0;
-    Slab** slab_ptr = reinterpret_cast<Slab**>(static_cast<char*>(ptr) - USER_OFFSET);
-    Slab* slab = *slab_ptr;
+    FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
+    Slab* slab = block->slab;
 
-    if (slab == nullptr) {
+    if (FAST_UNLIKELY(slab == nullptr)) {
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
-        old_size = slab->block_size - USER_OFFSET;
+        old_size = ClassIndexToSize(block->class_index) - USER_OFFSET;
     }
 
     if (new_size <= old_size) {
         bool should_shrink = false;
-        if (slab != nullptr) {
+        if (FAST_LIKELY(slab != nullptr)) {
             std::size_t new_class_index = SizeToClassIndex(new_size + USER_OFFSET);
-            std::size_t old_class_index = SizeToClassIndex(slab->block_size);
-            if (old_class_index > new_class_index + 1) should_shrink = true;
+            if (block->class_index > new_class_index + 1) should_shrink = true;
         } else {
             std::size_t page_size = OSMemory::GetPageSize();
             if (old_size - new_size >= page_size) should_shrink = true;

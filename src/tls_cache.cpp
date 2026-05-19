@@ -83,9 +83,10 @@ TLSCache& TLSCache::GetSlow() {
 
 TLSCache::~TLSCache() {
     for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-        if (fast_bins_[i]) {
-            GlobalHeap::GetInstance().DeferredDeallocateBatch(fast_bins_[i]);
-            fast_bins_[i] = nullptr;
+        if (bins_[i].head) {
+            GlobalHeap::GetInstance().DeallocateBatch(bins_[i].head);
+            bins_[i].head = nullptr;
+            bins_[i].count = 0;
         }
     }
     for (std::size_t i = 0; i < NUM_LARGE_CLASSES; ++i) {
@@ -100,7 +101,7 @@ TLSCache::~TLSCache() {
 }
 
 void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
-    std::size_t max_cache = GetMaxCacheSize(class_index);
+    std::size_t max_cache = CACHE_LIMITS[class_index];
     std::size_t target_count = max_cache / 2;
     if (target_count == 0) target_count = 1; 
     
@@ -118,26 +119,27 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
 #endif
 
     FreeBlock* block = batch_head;
-    fast_bins_[class_index] = block->next;
-    counts_[class_index] = actual_count - 1;
+    bins_[class_index].head = block->next;
+    bins_[class_index].count = actual_count - 1;
 
     return block;
 }
 
 void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
-    std::size_t max_cache = GetMaxCacheSize(class_index);
+    std::size_t max_cache = CACHE_LIMITS[class_index];
     std::size_t batch_size = max_cache / 2;
     if (batch_size == 0) batch_size = 1;
 
-    FreeBlock* head = fast_bins_[class_index];
+    CacheBin& bin = bins_[class_index];
+    FreeBlock* head = bin.head;
     FreeBlock* curr = head;
     for (std::size_t i = 1; i < batch_size; ++i) {
         curr = curr->next;
     }
     
-    fast_bins_[class_index] = curr->next;
+    bin.head = curr->next;
     curr->next = nullptr; 
-    counts_[class_index] -= batch_size;
+    bin.count -= batch_size;
 
     GlobalHeap::GetInstance().DeallocateBatch(head);
 }

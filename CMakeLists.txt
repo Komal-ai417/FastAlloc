@@ -12,12 +12,12 @@ option(FASTALLOC_OVERRIDE_NEW "Override standard new/delete operators" OFF)
 
 # Compiler-specific optimizations
 if(MSVC)
-    add_compile_options(/W4 /WX)
+    set(WARNING_FLAGS /W4 /WX)
     add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
     add_link_options("$<$<CONFIG:Release>:/LTCG>")
 else()
     # Aggressive optimizations for GCC/Clang
-    add_compile_options(-Wall -Wextra -Werror)
+    set(WARNING_FLAGS -Wall -Wextra -Werror)
     add_compile_options("$<$<CONFIG:Release>:-O3>" "$<$<CONFIG:Release>:-march=native>" "$<$<CONFIG:Release>:-fno-plt>")
 endif()
 
@@ -33,6 +33,7 @@ add_library(fast_alloc STATIC
     src/global_heap.cpp
     src/os_memory.cpp
 )
+target_compile_options(fast_alloc PRIVATE ${WARNING_FLAGS})
 
 target_include_directories(fast_alloc PUBLIC include src)
 
@@ -49,6 +50,7 @@ if(FASTALLOC_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(fast_alloc_tests tests/test_main.cpp)
+    target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
     
     include(CTest)
@@ -64,14 +66,21 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googlebenchmark)
+    
+    if(TARGET benchmark AND NOT MSVC)
+        target_compile_options(benchmark PRIVATE -Wno-switch)
+    endif()
 
     add_executable(fast_alloc_bench benchmarks/bench_main.cpp)
+    target_compile_options(fast_alloc_bench PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench PRIVATE fast_alloc benchmark::benchmark)
     
     add_executable(fast_alloc_bench_extended benchmarks/bench_extended.cpp)
+    target_compile_options(fast_alloc_bench_extended PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench_extended PRIVATE fast_alloc benchmark::benchmark)
 
     add_executable(fast_alloc_bench_memory benchmarks/bench_memory.cpp)
+    target_compile_options(fast_alloc_bench_memory PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench_memory PRIVATE fast_alloc)
     
     set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -79,4 +88,18 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     target_link_libraries(fast_alloc_bench PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_extended PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_memory PRIVATE Threads::Threads)
+endif()
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT lto_supported)
+if(lto_supported)
+    set_property(TARGET fast_alloc PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    if(FASTALLOC_BUILD_TESTS)
+        set_property(TARGET fast_alloc_tests PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    if(FASTALLOC_BUILD_BENCHMARKS)
+        set_property(TARGET fast_alloc_bench PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_extended PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_memory PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
 endif()

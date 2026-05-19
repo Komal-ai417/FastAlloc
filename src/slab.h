@@ -11,7 +11,8 @@ struct Slab;
  */
 struct FreeBlock {
     Slab* slab;       // Always valid (never overwritten by user data)
-    char _padding[16 - sizeof(Slab*)]; // Explicit 16-byte offset padding
+    uint32_t class_index; // Store class index
+    uint32_t _padding; // Explicit padding
     FreeBlock* next;  // Overwritten by user data when allocated!
 };
 
@@ -44,13 +45,24 @@ struct Slab {
      * @brief Allocates an object from this slab.
      * @return Pointer to object, or nullptr if slab is full.
      */
-    void* Allocate();
+    inline void* Allocate() {
+        if (free_blocks == 0) return nullptr;
+        FreeBlock* block = free_list;
+        free_list = block->next;
+        free_blocks--;
+        return block;
+    }
 
     /**
      * @brief Returns an object to this slab's free list.
      * @param ptr The pointer to return.
      */
-    void Deallocate(void* ptr);
+    inline void Deallocate(void* ptr) {
+        FreeBlock* block = static_cast<FreeBlock*>(ptr);
+        block->next = free_list;
+        free_list = block;
+        free_blocks++;
+    }
 
     bool IsFull() const { return free_blocks == 0; }
     bool IsEmpty() const { return free_blocks == total_blocks; }

@@ -127,20 +127,7 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
     return Slab::Create(memory, memory_size, block_size, arena_index);
 }
 
-void GlobalHeap::DeferredDeallocateBatch(FreeBlock* head) {
-    if (!head) return;
-    std::size_t class_index = SizeToClassIndex(head->slab->block_size);
-    uint32_t arena_index = head->slab->arena_index;
 
-    FreeBlock* tail = head;
-    while (tail->next) tail = tail->next;
-    
-    FreeBlock* old_head = arenas_[arena_index].pending_returns_[class_index].head.load(std::memory_order_relaxed);
-    do {
-        tail->next = old_head;
-    } while (!arenas_[arena_index].pending_returns_[class_index].head.compare_exchange_weak(old_head, head,
-                std::memory_order_release, std::memory_order_relaxed));
-}
 
 void GlobalHeap::DrainPendingReturns(uint32_t arena_index, std::size_t class_index) {
     Arena& arena = arenas_[arena_index];
@@ -258,41 +245,63 @@ void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
 
 void GlobalHeap::DeallocateBatch(FreeBlock* head) {
     if (!head) return;
-    std::size_t class_index = SizeToClassIndex(head->slab->block_size);
-    uint32_t arena_index = head->slab->arena_index;
-    Arena& arena = arenas_[arena_index];
 
-    if (arena.class_locks_[class_index].test_and_set(std::memory_order_acquire)) {
-        DeferredDeallocateBatch(head);
-        return;
+    std::array<FreeBlock*, NUM_ARENAS> arena_heads{};
+    std::array<FreeBlock*, NUM_ARENAS> arena_tails{};
+
+    while (head) {
+        FreeBlock* next = head->next;
+        uint32_t arena_index = head->slab->arena_index;
+        
+        if (!arena_heads[arena_index]) {
+            arena_heads[arena_index] = head;
+            arena_tails[arena_index] = head;
+        } else {
+            arena_tails[arena_index]->next = head;
+            arena_tails[arena_index] = head;
+        }
+        head->next = nullptr;
+        head = next;
     }
 
-    auto process_list = [&](FreeBlock* list) {
-        while (list) {
-            FreeBlock* next = list->next;
-            Slab* slab = list->slab;
-            bool was_full = slab->IsFull();
-            slab->Deallocate(list);
+    for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
+        if (!arena_heads[i]) continue;
+        
+        FreeBlock* list = arena_heads[i];
+        std::size_t class_index = SizeToClassIndex(list->slab->block_size);
+        Arena& arena = arenas_[i];
 
-            if (was_full) {
-                RemoveSlab(arena.full_slabs_[class_index], slab);
-                PushSlab(arena.partial_slabs_[class_index], slab);
+        if (arena.class_locks_[class_index].test_and_set(std::memory_order_acquire)) {
+            FreeBlock* tail = arena_tails[i];
+            FreeBlock* old_head = arena.pending_returns_[class_index].head.load(std::memory_order_relaxed);
+            do {
+                tail->next = old_head;
+            } while (!arena.pending_returns_[class_index].head.compare_exchange_weak(old_head, list,
+                        std::memory_order_release, std::memory_order_relaxed));
+        } else {
+            FreeBlock* curr = list;
+            while (curr) {
+                FreeBlock* next = curr->next;
+                Slab* slab = curr->slab;
+                bool was_full = slab->IsFull();
+                slab->Deallocate(curr);
+
+                if (was_full) {
+                    RemoveSlab(arena.full_slabs_[class_index], slab);
+                    PushSlab(arena.partial_slabs_[class_index], slab);
+                }
+
+                if (slab->IsEmpty()) {
+                    RemoveSlab(arena.partial_slabs_[class_index], slab);
+                    PageHeapFree(slab, slab->memory_size);
+                }
+                curr = next;
             }
 
-            if (slab->IsEmpty()) {
-                RemoveSlab(arena.partial_slabs_[class_index], slab);
-                PageHeapFree(slab, slab->memory_size);
-            }
-            list = next;
+            DrainPendingReturns(i, class_index);
+            arena.class_locks_[class_index].clear(std::memory_order_release);
         }
-    };
-
-    process_list(head);
-
-    FreeBlock* pending = arena.pending_returns_[class_index].head.exchange(nullptr, std::memory_order_acquire);
-    process_list(pending);
-
-    arena.class_locks_[class_index].clear(std::memory_order_release);
+    }
 }
 
 void* GlobalHeap::AllocateLarge(std::size_t size) {

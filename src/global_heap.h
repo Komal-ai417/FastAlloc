@@ -53,9 +53,6 @@ public:
     // Return a batched linked list of blocks back to their respective slabs natively
     void DeallocateBatch(FreeBlock* head);
 
-    // Lock-free deferred return for use during thread teardown
-    void DeferredDeallocateBatch(FreeBlock* head);
-
     // Bypasses slabs for allocations > MAX_SLAB_SIZE, uses global large block cache
     void* AllocateLarge(std::size_t size);
     void  DeallocateLarge(void* ptr, std::size_t size);
