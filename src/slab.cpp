@@ -40,7 +40,7 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
     for (std::size_t i = slab->total_blocks; i > 0; --i) {
         FreeBlock* block = reinterpret_cast<FreeBlock*>(block_start + (i - 1) * block_size);
         block->slab = slab;
-        block->class_index = class_index;
+        block->class_index = static_cast<uint32_t>(class_index);
         block->next = slab->free_list;
         slab->free_list = block;
     }

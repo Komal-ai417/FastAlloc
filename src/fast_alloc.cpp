@@ -20,7 +20,7 @@ void* fast_malloc(std::size_t size) {
         if (FAST_UNLIKELY(alloc_size < size)) return nullptr; // overflow
         
         std::size_t page_size = PAGE_SIZE;
-        if (FAST_UNLIKELY(alloc_size > std::numeric_limits<std::size_t>::max() - page_size + 1)) return nullptr;
+        if (FAST_UNLIKELY(alloc_size > (std::numeric_limits<std::size_t>::max)() - page_size + 1)) return nullptr;
         alloc_size = (alloc_size + page_size - 1) & ~(page_size - 1);
         
         // AllocateLargeCached handles both TLS bins and GlobalHeap Arena fallbacks

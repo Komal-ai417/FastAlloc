@@ -120,7 +120,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
 
     FreeBlock* block = batch_head;
     bins_[class_index].head = block->next;
-    bins_[class_index].count = actual_count - 1;
+    bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
 
     return block;
 }
@@ -139,7 +139,7 @@ void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
     
     bin.head = curr->next;
     curr->next = nullptr; 
-    bin.count -= batch_size;
+    bin.count -= static_cast<uint32_t>(batch_size);
 
     GlobalHeap::GetInstance().DeallocateBatch(head);
 }

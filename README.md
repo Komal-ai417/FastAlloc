@@ -10,7 +10,7 @@ FastAlloc is a custom-built memory allocator designed as a drop-in replacement f
 - **Exponential Spinlock Backoff:** Global stripe locks implement exponential backoff with `std::this_thread::yield()`, drastically reducing cache-line bouncing and improving stability under extreme multi-core contention.
 - **Aggressive Memory Unmapping:** FastAlloc guarantees aggressive return of empty slabs to the OS outside the critical path spinlocks, ensuring a footprint often smaller than `malloc`.
 - **Per-Stripe Lock-Free Handoff:** Dying threads and heavily contended thread queues return memory via 16 isolated, per-stripe lock-free MPSC `pending_returns_` queues, eliminating O(N^2) overhead.
-- **Performance:** Outperforms standard system `malloc` by up to **6.7x** under heavy 16-thread contention (`BM_HeavyContention/256B`), up to **1,310x** for large allocation reuse, and **4.5x** for scoped alloc-free patterns.
+- **Performance:** Outperforms standard system `malloc` by up to **3.95x** under heavy 16-thread contention (`BM_HeavyContention/128B`), up to **1,156x** for large allocation reuse, and **3.20x** for scoped alloc-free patterns.
 - **Debug Safety:** Includes `assert()`-guarded invariant checks for double-free detection and wrong-slab returns, compiling to zero overhead in Release builds.
 - **Platform Native:** Natively handles Windows through `VirtualAlloc`/`FlsAlloc` and POSIX compliant systems through `mmap`/`pthread_key`.
 
