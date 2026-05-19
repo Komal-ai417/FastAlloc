@@ -13,26 +13,35 @@ using namespace FastAlloc;
 // ============================================================
 static void BM_MallocOnly_Std(benchmark::State& state) {
     std::size_t size = state.range(0);
+    const int batch = 64;
+    void* ptrs[64];
     for (auto _ : state) {
-        void* ptr = std::malloc(size);
-        benchmark::DoNotOptimize(ptr);
-        // Intentionally not freeing to test raw allocation throughput
+        for (int i = 0; i < batch; ++i) {
+            ptrs[i] = std::malloc(size);
+            benchmark::DoNotOptimize(ptrs[i]);
+        }
         state.PauseTiming();
-        std::free(ptr);
+        for (int i = 0; i < batch; ++i) std::free(ptrs[i]);
         state.ResumeTiming();
     }
+    state.SetItemsProcessed(state.iterations() * batch);
 }
 BENCHMARK(BM_MallocOnly_Std)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192)->Threads(1)->Threads(4)->Threads(8);
 
 static void BM_MallocOnly_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
+    const int batch = 64;
+    void* ptrs[64];
     for (auto _ : state) {
-        void* ptr = fast_malloc(size);
-        benchmark::DoNotOptimize(ptr);
+        for (int i = 0; i < batch; ++i) {
+            ptrs[i] = fast_malloc(size);
+            benchmark::DoNotOptimize(ptrs[i]);
+        }
         state.PauseTiming();
-        fast_free(ptr);
+        for (int i = 0; i < batch; ++i) fast_free(ptrs[i]);
         state.ResumeTiming();
     }
+    state.SetItemsProcessed(state.iterations() * batch);
 }
 BENCHMARK(BM_MallocOnly_FastAlloc)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192)->Threads(1)->Threads(4)->Threads(8);
 
@@ -77,7 +86,7 @@ static void BM_RandomSize_Std(benchmark::State& state) {
     const int batch = 500;
     std::vector<void*> ptrs;
     ptrs.reserve(batch);
-    std::mt19937 rng(42);
+    std::mt19937 rng(42 + state.thread_index());
     std::uniform_int_distribution<int> dist(1, 4096);
     std::vector<int> sizes(batch);
     for (int i = 0; i < batch; ++i) sizes[i] = dist(rng);
@@ -97,7 +106,7 @@ static void BM_RandomSize_FastAlloc(benchmark::State& state) {
     const int batch = 500;
     std::vector<void*> ptrs;
     ptrs.reserve(batch);
-    std::mt19937 rng(42);
+    std::mt19937 rng(42 + state.thread_index());
     std::uniform_int_distribution<int> dist(1, 4096);
     std::vector<int> sizes(batch);
     for (int i = 0; i < batch; ++i) sizes[i] = dist(rng);
