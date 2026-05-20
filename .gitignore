@@ -8,6 +8,7 @@ CPackConfig.cmake
 CPackSourceConfig.cmake
 _deps/
 Testing/
+Test/
 
 # Compiled object files
 *.o
