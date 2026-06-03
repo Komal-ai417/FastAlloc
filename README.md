@@ -117,7 +117,7 @@ Compare FastAlloc directly against your system's default allocator:
 # Linux
 ./build/fast_alloc_bench
 ```
-*Note: FastAlloc typically outperforms standard system `malloc` by up to **3.95x** under heavy 16-thread contention.*
+*Note: FastAlloc typically outperforms standard system `malloc` by up to **6.49x** under heavy 16-thread contention.*
 
 ## Documentation
 
