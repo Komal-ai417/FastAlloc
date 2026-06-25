@@ -69,7 +69,10 @@ Interleaving the head pointer and active count ensures both values are fetched f
 Critical system calls (`VirtualAlloc`/`mmap`) are executed *outside* of global spinlocks. This ensures that slow OS-level page mapping never blocks other threads from accessing the global heap. FastAlloc guarantees aggressive return of empty slabs to the OS outside the critical path spinlocks, ensuring a footprint often smaller than `malloc`.
 
 ### Exponential Spinlock Backoff
-Global stripe locks implement exponential backoff with `std::this_thread::yield()`, drastically reducing cache-line bouncing and improving stability under extreme multi-core contention.
+Global stripe locks implement true exponential backoff. The spin count doubles on each retry cycle (utilizing hardware-specific pause instructions like `_mm_pause`, `__builtin_ia32_pause`, or ARM64 `yield`) up to a cap before falling back to `std::this_thread::yield()`. This drastically reduces cache-line bouncing and improves stability under extreme multi-core contention.
+
+### Debug Mode Pointer Safety
+When compiled with `FAST_ALLOC_DEBUG`, the allocator embeds a validation canary (`0xFA57A110`) in the `FreeBlock` header. This explicitly catches double-frees or wild pointer memory corruption at the point of deallocation.
 
 ### Per-Stripe Lock-Free Handoff
 Dying threads and heavily contended thread queues return memory via 16 isolated, per-stripe lock-free MPSC `pending_returns_` queues, eliminating O(N^2) overhead.

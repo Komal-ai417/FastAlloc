@@ -7,19 +7,12 @@
 #include <intrin.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define FAST_LIKELY(x) __builtin_expect(!!(x), 1)
-#define FAST_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define FAST_LIKELY(x) (x)
-#define FAST_UNLIKELY(x) (x)
-#endif
+#include "fast_alloc.h"
 
 namespace FastAlloc {
 
 // Configuration constants for the allocator
 constexpr std::size_t PAGE_SIZE = 4096; // Typical OS page size
-constexpr std::size_t MAX_SLAB_SIZE = 8192; // Allocations above this size bypass TLS/Slabs
 constexpr std::size_t ALIGNMENT = 16;   // 16-byte alignment
 
 // Number of size classes: 16, 32, ..., 8192 = 512 classes

@@ -23,29 +23,13 @@ void* PageHeapAllocate(std::size_t size) {
     std::size_t pages = size / OSMemory::GetPageSize();
     if (pages <= MAX_CACHED_PAGES && pages > 0) {
         auto& bin = page_bins_[pages];
-        if (bin.lock.test_and_set(std::memory_order_acquire)) {
-            int spins = 0;
-            while (bin.lock.test_and_set(std::memory_order_acquire)) {
-                if (++spins > 64) {
-                    std::this_thread::yield();
-                    spins = 0;
-                } else {
-#if defined(_MSC_VER)
-                    _mm_pause();
-#elif defined(__i386__) || defined(__x86_64__)
-                    __builtin_ia32_pause();
-#endif
-                }
-            }
-        }
+        ScopedSpinLock lock(bin.lock);
         if (bin.head) {
             PageNode* node = bin.head;
             bin.head = node->next;
             bin.count--;
-            bin.lock.clear(std::memory_order_release);
             return node;
         }
-        bin.lock.clear(std::memory_order_release);
     }
     return OSMemory::AllocatePages(size);
 }
@@ -58,30 +42,14 @@ void PageHeapFree(void* ptr, std::size_t size) {
         std::size_t max_count = (16 * 1024 * 1024) / size;
         if (max_count < 8) max_count = 8;
         
-        if (bin.lock.test_and_set(std::memory_order_acquire)) {
-            int spins = 0;
-            while (bin.lock.test_and_set(std::memory_order_acquire)) {
-                if (++spins > 64) {
-                    std::this_thread::yield();
-                    spins = 0;
-                } else {
-#if defined(_MSC_VER)
-                    _mm_pause();
-#elif defined(__i386__) || defined(__x86_64__)
-                    __builtin_ia32_pause();
-#endif
-                }
-            }
-        }
+        ScopedSpinLock lock(bin.lock);
         if (bin.count < max_count) {
             PageNode* node = static_cast<PageNode*>(ptr);
             node->next = bin.head;
             bin.head = node;
             bin.count++;
-            bin.lock.clear(std::memory_order_release);
             return;
         }
-        bin.lock.clear(std::memory_order_release);
     }
     OSMemory::FreePages(ptr, size);
 }

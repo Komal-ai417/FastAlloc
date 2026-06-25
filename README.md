@@ -4,7 +4,7 @@
   
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![C++17](https://img.shields.io/badge/C++-17-blue.svg)]()
-  [![Platform: Windows | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgray.svg)]()
+  [![Platform: Windows | Linux | macOS](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgray.svg)]()
 </div>
 
 <br>
@@ -22,7 +22,7 @@ FastAlloc is engineered for extreme multi-core scalability:
 - **Lock-Free Memory Handoff:** Returning memory to other arenas is handled via isolated, lock-free MPSC (Multi-Producer, Single-Consumer) pending queues (`std::atomic::compare_exchange_weak`), eliminating O(N²) lock contention when threads deallocate cross-thread.
 - **Aggressive Memory Unmapping:** FastAlloc guarantees aggressive return of empty slabs to the OS *outside* the critical path spinlocks, ensuring a memory footprint often smaller than the system `malloc`.
 - **Out-of-Lock OS Allocation:** Critical system calls (`VirtualAlloc` / `mmap`) are executed entirely outside global spinlocks, ensuring that slow OS page mapping never blocks other threads from accessing the global heap.
-- **Exponential Spinlock Backoff:** Global stripe locks implement hardware-aware backoff (using `_mm_pause()` / `__builtin_ia32_pause()`) and `std::this_thread::yield()`, drastically improving stability under extreme contention.
+- **Exponential Spinlock Backoff:** Global stripe locks implement true exponential backoff with hardware-aware pause instructions (x86 `_mm_pause` and ARM64 `yield`) and `std::this_thread::yield()`, drastically improving stability under extreme contention.
 
 ## System Architecture
 

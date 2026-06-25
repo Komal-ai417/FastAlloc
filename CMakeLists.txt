@@ -49,7 +49,7 @@ if(FASTALLOC_BUILD_TESTS)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(fast_alloc_tests tests/test_main.cpp)
+    add_executable(fast_alloc_tests tests/test_main.cpp tests/test_crash.cpp)
     target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
     

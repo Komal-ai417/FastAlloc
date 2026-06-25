@@ -77,3 +77,38 @@ TEST(FastAllocTest, MultiThreading) {
         t.join();
     }
 }
+
+TEST(FastAllocTest, ThreadExitCleanup) {
+    auto thread_func = []() {
+        void* ptr = fast_malloc(64);
+        EXPECT_NE(ptr, nullptr);
+        fast_free(ptr);
+    };
+    std::thread t(thread_func);
+    t.join();
+}
+
+TEST(FastAllocTest, BoundaryAllocations) {
+    void* ptr0 = fast_malloc(0);
+    EXPECT_EQ(ptr0, nullptr);
+
+    void* ptr1 = fast_malloc(8192 - 16);
+    EXPECT_NE(ptr1, nullptr);
+    fast_free(ptr1);
+
+    void* ptr2 = fast_malloc(8192 - 15);
+    EXPECT_NE(ptr2, nullptr);
+    fast_free(ptr2);
+}
+
+TEST(FastAllocTest, ZeroSizeCallocRealloc) {
+    void* ptr = fast_calloc(0, 64);
+    EXPECT_EQ(ptr, nullptr);
+
+    void* ptr2 = fast_realloc(nullptr, 0);
+    EXPECT_EQ(ptr2, nullptr);
+
+    void* ptr3 = fast_malloc(32);
+    void* ptr4 = fast_realloc(ptr3, 0);
+    EXPECT_EQ(ptr4, nullptr);
+}
