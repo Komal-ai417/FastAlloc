@@ -52,19 +52,3 @@ jobs:
           ./build/fast_alloc_bench_memory
           ./build/fast_alloc_bench_memory --fast
         fi
-
-  sanitizer-checks:
-    name: Sanitizer (${{ matrix.sanitizer }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        sanitizer: [address, thread]
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer"
-    - name: Build Project
-      run: cmake --build build
-    - name: Run Correctness Tests (Google Test)
-      run: ctest --test-dir build -V

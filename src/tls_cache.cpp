@@ -6,7 +6,7 @@
 
 namespace FastAlloc {
 
-FAST_THREAD_LOCAL CacheBin* fast_bins = nullptr;
+FAST_THREAD_LOCAL TLSCache* fast_path_cache = nullptr;
 
 #ifdef _WIN32
 DWORD TLSCache::tls_key_ = FLS_OUT_OF_INDEXES;
@@ -18,7 +18,7 @@ static void WINAPI FlsCleanupCallback(PVOID ptr) {
         std::size_t page_size = OSMemory::GetPageSize();
         std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
         OSMemory::FreePages(cache, alloc_size);
-        fast_bins = nullptr;
+        fast_path_cache = nullptr;
     }
 }
 
@@ -35,7 +35,7 @@ void TLSCache::TlsDestructor(void* ptr) {
         std::size_t page_size = OSMemory::GetPageSize();
         std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
         OSMemory::FreePages(cache, alloc_size);
-        fast_bins = nullptr;
+        fast_path_cache = nullptr;
     }
 }
 
@@ -46,9 +46,6 @@ void TLSCache::InitTlsKey() {
 
 TLSCache::TLSCache() {
     arena_index_ = GlobalHeap::GetInstance().GetNextArena();
-    for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-        bins_[i].limit = CACHE_LIMITS[i];
-    }
 }
 
 TLSCache& TLSCache::GetSlow() {
@@ -58,28 +55,28 @@ TLSCache& TLSCache::GetSlow() {
 #ifdef _WIN32
     void* val = FlsGetValue(tls_key_);
     if (val) {
-        fast_bins = static_cast<TLSCache*>(val)->bins_.data();
-        return *static_cast<TLSCache*>(val);
+        fast_path_cache = static_cast<TLSCache*>(val);
+        return *fast_path_cache;
     }
     std::size_t page_size = OSMemory::GetPageSize();
     std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
     void* mem = OSMemory::AllocatePages(alloc_size);
     TLSCache* cache = new (mem) TLSCache();
     FlsSetValue(tls_key_, cache);
-    fast_bins = cache->bins_.data();
+    fast_path_cache = cache;
     return *cache;
 #else
     void* val = pthread_getspecific(tls_key_);
     if (val) {
-        fast_bins = static_cast<TLSCache*>(val)->bins_.data();
-        return *static_cast<TLSCache*>(val);
+        fast_path_cache = static_cast<TLSCache*>(val);
+        return *fast_path_cache;
     }
     std::size_t page_size = OSMemory::GetPageSize();
     std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
     void* mem = OSMemory::AllocatePages(alloc_size);
     TLSCache* cache = new (mem) TLSCache();
     pthread_setspecific(tls_key_, cache);
-    fast_bins = cache->bins_.data();
+    fast_path_cache = cache;
     return *cache;
 #endif
 }

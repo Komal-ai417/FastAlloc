@@ -2,11 +2,19 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "fast_alloc.h"
-
 namespace FastAlloc {
 
 struct Slab;
+
+/**
+ * @brief Node for intrusive singly-linked free list
+ */
+struct FreeBlock {
+    Slab* slab;       // Always valid (never overwritten by user data)
+    uint32_t class_index; // Store class index
+    uint32_t _padding; // Explicit padding
+    FreeBlock* next;  // Overwritten by user data when allocated!
+};
 
 /**
  * @brief A Slab manages a large chunk of contiguous memory (e.g. OS Page),
@@ -42,9 +50,6 @@ struct Slab {
         FreeBlock* block = free_list;
         free_list = block->next;
         free_blocks--;
-#ifdef FAST_ALLOC_DEBUG
-        block->canary = FAST_ALLOC_DEBUG_CANARY;
-#endif
         return block;
     }
 

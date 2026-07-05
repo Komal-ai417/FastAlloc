@@ -26,12 +26,40 @@
 namespace FastAlloc {
 
 class TLSCache;
+extern FAST_THREAD_LOCAL TLSCache* fast_path_cache;
 
 class TLSCache {
 public:
+    static inline TLSCache& GetFast() {
+        if (fast_path_cache) return *fast_path_cache;
+        return GetSlow();
+    }
     static TLSCache& GetSlow();
 
+    inline void* AllocateBlock(std::size_t class_index) {
+        CacheBin& bin = bins_[class_index];
+        FreeBlock* block = bin.head;
+        if (FAST_LIKELY(block != nullptr)) {
+            bin.head = block->next;
+            bin.count--;
+            return block;
+        }
+        return AllocateBlockSlow(class_index);
+    }
+    
     void* AllocateBlockSlow(std::size_t class_index);
+
+    inline void DeallocateBlock(std::size_t class_index, FreeBlock* block) {
+        CacheBin& bin = bins_[class_index];
+        block->next = bin.head;
+        bin.head = block;
+        bin.count++;
+
+        if (FAST_UNLIKELY(bin.count >= CACHE_LIMITS[class_index])) {
+            DeallocateBlockSlow(class_index);
+        }
+    }
+    
     void DeallocateBlockSlow(std::size_t class_index);
 
     // Large Allocation Cache
@@ -43,6 +71,11 @@ public:
 private:
     TLSCache();
 
+    struct CacheBin {
+        FreeBlock* head{nullptr};
+        uint32_t count{0};
+        uint32_t padding{0};
+    };
     std::array<CacheBin, NUM_SIZE_CLASSES> bins_{};
     uint32_t arena_index_{0};
 

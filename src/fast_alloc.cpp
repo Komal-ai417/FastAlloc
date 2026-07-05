@@ -7,17 +7,15 @@
 #include <cstring>
 #include <new>
 #include <limits>
-#include <cstdlib>
 namespace FastAlloc {
 
+constexpr std::size_t USER_OFFSET = 16;
 static_assert(sizeof(LargeAllocHeader) == 16, "Header size must align to USER_OFFSET");
 
-void* fast_malloc_slow(std::size_t size) {
+void* fast_malloc(std::size_t size) {
     if (size == 0) return nullptr;
 
-    std::size_t total_size = size + USER_OFFSET;
-
-    if (FAST_UNLIKELY(total_size > MAX_SLAB_SIZE)) {
+    if (FAST_UNLIKELY(size > MAX_SLAB_SIZE - USER_OFFSET)) {
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
         if (FAST_UNLIKELY(alloc_size < size)) return nullptr; // overflow
         
@@ -26,40 +24,20 @@ void* fast_malloc_slow(std::size_t size) {
         alloc_size = (alloc_size + page_size - 1) & ~(page_size - 1);
         
         // AllocateLargeCached handles both TLS bins and GlobalHeap Arena fallbacks
-        void* cached_mem = TLSCache::GetSlow().AllocateLargeCached(alloc_size);
+        void* cached_mem = TLSCache::GetFast().AllocateLargeCached(alloc_size);
         if (cached_mem) return cached_mem;
         
         return nullptr;
     }
 
-    std::size_t class_index = (total_size - 1) >> 4;
-    TLSCache& cache = TLSCache::GetSlow();
-    // Cache is initialized and fast_bins is set now. Try fast path one more time to avoid duplicating block extraction logic
-    CacheBin* bins = fast_bins;
-    if (FAST_LIKELY(bins != nullptr)) {
-        CacheBin& bin = bins[class_index];
-        FreeBlock* block = bin.head;
-        if (FAST_LIKELY(block != nullptr)) {
-            bin.head = block->next;
-            bin.count--;
-#ifdef FAST_ALLOC_DEBUG
-            block->canary = FAST_ALLOC_DEBUG_CANARY;
-#endif
-            return reinterpret_cast<char*>(block) + USER_OFFSET;
-        }
-    }
-
-    FreeBlock* block = static_cast<FreeBlock*>(cache.AllocateBlockSlow(class_index));
+    std::size_t class_index = SizeToClassIndex(size + USER_OFFSET);
+    FreeBlock* block = static_cast<FreeBlock*>(TLSCache::GetFast().AllocateBlock(class_index));
     if (FAST_UNLIKELY(!block)) return nullptr;
-
-#ifdef FAST_ALLOC_DEBUG
-    block->canary = FAST_ALLOC_DEBUG_CANARY;
-#endif
 
     return reinterpret_cast<char*>(block) + USER_OFFSET;
 }
 
-void fast_free_slow(void* ptr) {
+void fast_free(void* ptr) {
     if (!ptr) return;
 
     FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
@@ -69,33 +47,12 @@ void fast_free_slow(void* ptr) {
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         std::size_t alloc_size = header->alloc_size;
         
-        // Return to large allocation cache
-        TLSCache::GetSlow().DeallocateLargeCached(header, alloc_size);
+        // Return to large allocation cache (TLS -> GlobalHeap)
+        TLSCache::GetFast().DeallocateLargeCached(header, alloc_size);
         return;
     }
 
-    bool was_uninitialized = (fast_bins == nullptr);
-    TLSCache& cache = TLSCache::GetSlow();
-    CacheBin* bins = fast_bins;
-    std::size_t class_index = block->class_index;
-
-    // The fast path in fast_alloc.h pushes the block if `fast_bins` was already initialized and count < limit.
-    // If it reached fast_free_slow, it's either because fast_bins was null (uninitialized) or count == limit.
-    
-    if (FAST_UNLIKELY(was_uninitialized)) {
-        // fast_bins is now initialized by GetSlow() above
-        bins = fast_bins;
-        if (FAST_LIKELY(bins != nullptr)) {
-            CacheBin& bin = bins[class_index];
-            block->next = bin.head;
-            bin.head = block;
-            bin.count++;
-            if (bin.count < bin.limit) return;
-        }
-    }
-
-    // It's definitely in the bin now (or already was), and count is >= limit.
-    cache.DeallocateBlockSlow(class_index);
+    TLSCache::GetFast().DeallocateBlock(block->class_index, block);
 }
 
 void* fast_calloc(std::size_t num, std::size_t size) {
@@ -126,13 +83,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
-        old_size = ((block->class_index + 1) * 16) - USER_OFFSET;
+        old_size = ClassIndexToSize(block->class_index) - USER_OFFSET;
     }
 
     if (new_size <= old_size) {
         bool should_shrink = false;
         if (FAST_LIKELY(slab != nullptr)) {
-            std::size_t new_class_index = (new_size + USER_OFFSET - 1) >> 4;
+            std::size_t new_class_index = SizeToClassIndex(new_size + USER_OFFSET);
             if (block->class_index > new_class_index + 1) should_shrink = true;
         } else {
             std::size_t page_size = PAGE_SIZE;
@@ -149,4 +106,29 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     return new_ptr;
 }
 
-} // namespace FastAlloc
+} // namespace FastAlloc 
+
+#ifdef FAST_ALLOC_OVERRIDE_NEW
+void* operator new(std::size_t size) {
+    void* ptr = FastAlloc::fast_malloc(size);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+void* operator new[](std::size_t size) {
+    void* ptr = FastAlloc::fast_malloc(size);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
+}
+void operator delete(void* ptr) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete[](void* ptr) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete(void* ptr, std::size_t) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete[](void* ptr, std::size_t) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+#endif

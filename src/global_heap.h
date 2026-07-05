@@ -12,29 +12,21 @@
 
 namespace FastAlloc {
 
-#if defined(_MSC_VER)
-#define FAST_PAUSE() _mm_pause()
-#elif defined(__i386__) || defined(__x86_64__)
-#define FAST_PAUSE() __builtin_ia32_pause()
-#elif defined(__aarch64__)
-#define FAST_PAUSE() __asm__ volatile("yield" ::: "memory")
-#else
-#define FAST_PAUSE() ((void)0)
-#endif
-
 class ScopedSpinLock {
     std::atomic_flag& flag_;
 public:
     explicit ScopedSpinLock(std::atomic_flag& f) : flag_(f) {
-        int spins = 1;
+        int spins = 0;
         while (flag_.test_and_set(std::memory_order_acquire)) {
-            for (int i = 0; i < spins; ++i) {
-                FAST_PAUSE();
-            }
-            if (spins < 1024) {
-                spins *= 2;
-            } else {
+            if (++spins > 64) {
                 std::this_thread::yield();
+                spins = 0;
+            } else {
+#if defined(_MSC_VER)
+                _mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
             }
         }
     }

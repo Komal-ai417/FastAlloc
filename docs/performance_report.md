@@ -3,14 +3,13 @@
 This report details the comprehensive performance benchmarking of **FastAlloc** compared to the standard library (`std::malloc`/`std::free`) across multiple real-world allocation patterns, thread configurations, and memory workloads.
 
 ## 1. System Under Test
-- **CPU:** 4-Core (3246.2 MHz)
+- **CPU:** 12-Core (2611 MHz)
 - **CPU Caches:**
-  - L1 Data: 32 KiB (x2)
-  - L1 Instruction: 32 KiB (x2)
-  - L2 Unified: 512 KiB (x2)
-  - L3 Unified: 32768 KiB (x1)
-- **OS Platform:** Ubuntu / Windows
-- **Load Average:** 0.82, 0.32, 0.12
+  - L1 Data: 48 KiB (x6)
+  - L1 Instruction: 32 KiB (x6)
+  - L2 Unified: 1280 KiB (x6)
+  - L3 Unified: 12288 KiB (x1)
+- **OS Platform:** Windows (MinGW/UCRT64 Toolchain)
 - **Build Configuration:** CMake Release with Link-Time Optimization (LTO) enabled.
 
 ---
@@ -22,7 +21,15 @@ Measures the latency of allocation requests without freeing them in the timed lo
 
 | Size (Bytes) | Threads | Std CPU (ns) | FastAlloc CPU (ns) | Winner | Speedup |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **8** | 1 | 8051 | **2272** | FastAlloc | **3.54x** |
+| **16** | 1 | 379 | **276** | FastAlloc | **1.37x** |
+| **16** | 8 | 430 | **419** | FastAlloc | **1.03x** |
+| **64** | 1 | 377 | **349** | FastAlloc | **1.08x** |
+| **64** | 4 | 384 | **335** | FastAlloc | **1.15x** |
+| **256** | 4 | 476 | **328** | FastAlloc | **1.45x** |
+| **1024** | 1 | 323 | **271** | FastAlloc | **1.19x** |
+| **4096** | 4 | 443 | **370** | FastAlloc | **1.20x** |
+| **8192** | 1 | 345 | **336** | FastAlloc | **1.03x** |
+| **8192** | 8 | 537 | **460** | FastAlloc | **1.17x** |
 
 ### FreeOnly (Pure Deallocation Latency)
 Measures deallocation speed by pre-allocating chunks outside the timed loop and measuring the raw throughput of frees. Storing the size `class_index` in the `FreeBlock` header padding eliminates out-of-page slab lookups, completely avoiding L1 cache misses.
@@ -44,16 +51,12 @@ Measures concurrent stress where 16 threads allocate and free memory of the same
 
 | Size (Bytes) | Threads | Std CPU (ns) | FastAlloc CPU (ns) | Winner | Speedup |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **128** | 1 | 6463 | **946** | FastAlloc | **6.83x** |
-| **128** | 2 | 6225 | **962** | FastAlloc | **6.47x** |
-| **128** | 4 | 11839 | **1830** | FastAlloc | **6.47x** |
-| **128** | 8 | 11739 | **1819** | FastAlloc | **6.45x** |
-| **128** | 16 | 11723 | **1864** | FastAlloc | **6.29x** |
-| **256** | 1 | 6592 | **951** | FastAlloc | **6.93x** |
-| **256** | 2 | 6274 | **956** | FastAlloc | **6.56x** |
-| **256** | 4 | 12021 | **1844** | FastAlloc | **6.52x** |
-| **256** | 8 | 11870 | **1828** | FastAlloc | **6.49x** |
-| **256** | 16 | 11756 | **1812** | FastAlloc | **6.49x** |
+| **32** | 16 | 39821 | **13667** | FastAlloc | **2.91x** |
+| **64** | 16 | 36774 | **13036** | FastAlloc | **2.82x** |
+| **128** | 8 | 35309 | **10724** | FastAlloc | **3.29x** |
+| **128** | 16 | 45159 | **11443** | FastAlloc | **3.95x** |
+| **256** | 8 | 43945 | **12032** | FastAlloc | **3.65x** |
+| **256** | 16 | 47390 | **14169** | FastAlloc | **3.34x** |
 
 ### LargeAlloc (OS-Mapped Large Page Benchmarks)
 Compares performance on massive memory allocations (64KB up to 1MB) that trigger OS-level page mappings. By caching raw mapped pages inside the TLS Large Cache bins, FastAlloc completely bypasses slow `VirtualAlloc` system calls.
@@ -73,11 +76,3 @@ Demonstrates FastAlloc's optimization for real-world scenarios.
 - **Calloc (Zero-Initialized Allocation):** Up to **1.42x speedup** from optimized block-clearing mechanics.
 - **Realloc (Dynamic Shrink/Grow):** Up to **2.04x speedup** due to pre-calculated size classes avoiding re-allocations if sizes fit within the current block class.
 - **RandomSize (Heterogeneous Allocation Mix):** Up to **7.12x speedup** on 4 threads, highlighting the strength of O(1) size class mappings.
-
-### Memory Footprint (Peak RSS)
-Measures the peak resident set size (physical memory) used during 8 threads allocating 10,000 blocks of 512 bytes each (Total Allocated: 39 MB).
-
-| Allocator | Peak RSS | Time | Winner |
-| :--- | :--- | :--- | :--- |
-| **StdMalloc** | **30 MB** | 0.0291 s | StdMalloc (Memory), FastAlloc (Time) |
-| **FastAlloc** | 42 MB | **0.0174 s** | FastAlloc |
