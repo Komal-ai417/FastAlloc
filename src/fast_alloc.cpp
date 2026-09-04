@@ -29,6 +29,10 @@ static_assert(sizeof(FreeBlock) == 24, "FreeBlock layout contract");
 namespace {
 constexpr std::uintptr_t ALIGN_MAGIC = 0xA1A2A3A4A5A6A701ull; // odd, never a real Slab*
 
+inline bool IsAlignedBlock(FreeBlock* block) {
+    return reinterpret_cast<std::uintptr_t>(block->slab) == ALIGN_MAGIC;
+}
+
 inline std::size_t EffectivePageSize() {
     // Audit N1 fix: the large-allocation rounding must use the RUNTIME page
     // size, not the compile-time constant. On 64KB-page systems the old code
