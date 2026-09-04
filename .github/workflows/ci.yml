@@ -5,13 +5,17 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build & test matrix: release + debug-instrumented on all three platforms
+  # Build & run ALL unit tests: release + debug-instrumented, Linux + Windows.
+  # The single gtest binary (fast_alloc_tests) registers every test case via
+  # ctest, so "Test" below runs the full suite (~69 cases Release / ~80 with
+  # FASTALLOC_DEBUG=ON) on every platform/compiler combination.
   # ---------------------------------------------------------------------------
   build-test:
-    name: ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
+    name: ${{ matrix.os }}-${{ matrix.compiler || 'default' }}-${{ matrix.config }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -36,12 +40,12 @@ jobs:
       - name: Configure (Linux, ${{ matrix.compiler }})
         if: runner.os == 'Linux'
         run: |
+          CC=gcc CXX=g++
+          if [ "${{ matrix.compiler }}" = "clang" ]; then CC=clang CXX=clang++; fi
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX \
                 -DFASTALLOC_BUILD_TESTS=ON \
                 -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            cmake -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-          fi
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
@@ -57,7 +61,28 @@ jobs:
         run: ctest --test-dir build --build-config Release --output-on-failure
 
   # ---------------------------------------------------------------------------
-  # Sanitizer jobs (Linux only; MSVC ASan runs in the windows debug job)
+  # MSVC AddressSanitizer (Linux sanitizers live in the jobs below; MSVC has
+  # no TSan/LSan, so Windows gets an ASan-only job).
+  # ---------------------------------------------------------------------------
+  windows-asan:
+    name: windows-msvc-asan
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug `
+                -DFASTALLOC_BUILD_TESTS=ON `
+                -DFASTALLOC_SANITIZE=address
+      - name: Build
+        run: cmake --build build --config Debug -j
+      - name: Test
+        run: ctest --test-dir build --build-config Debug --output-on-failure
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer jobs (Linux only; MSVC ASan runs in the windows-asan job above)
   # ---------------------------------------------------------------------------
   sanitizers:
     name: sanitizer-${{ matrix.sanitizer }}
@@ -108,16 +133,159 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
 
   # ---------------------------------------------------------------------------
-  # Benchmarks: build only (running them in CI produces noise-dominated data)
+  # EVERY benchmark, on BOTH Linux and Windows, executed (not just built):
+  #
+  #   1. fast_alloc_bench          — every google-benchmark case (filter '.*')
+  #   2. fast_alloc_bench_extended — every google-benchmark case (filter '.*')
+  #   3. fast_alloc_bench_memory   — full config sweep: threads {1,2,4}
+  #                                  x sizes {64, 256, 4096}
+  #   4. bench_suite               — FULL matrix: all 11 workloads
+  #                                  x allocators {std, fast}
+  #                                  x threads {1, 2, 4}
+  #                                  = 66 runs per OS, every one
+  #                                  checksum-verified (exit 42 = corruption
+  #                                  -> red CI). std = glibc on Linux, UCRT
+  #                                  on Windows.
+  #
+  # Release mode is mandatory (CMAKE_BUILD_TYPE=Release switches on the
+  # -O3/-march=native / /Ox/GL-LTCG paths). Op counts are CI-scaled (the full
+  # 66-run sweep is ~seconds locally; the checksums exercise every size class,
+  # slab, cross-thread queue and realloc path). Cross-allocator timing
+  # comparisons live in the benchmark-matrix job below.
   # ---------------------------------------------------------------------------
   benchmarks:
-    name: benchmarks-build
-    runs-on: ubuntu-latest
+    name: benchmarks-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -S . -B build -DFASTALLOC_BUILD_BENCHMARKS=ON -DFASTALLOC_BUILD_TESTS=OFF
-      - name: Build
-        run: cmake --build build -j
-      - name: Smoke-run memory benchmark
-        run: ./build/fast_alloc_bench_memory --threads 2 --allocs 2000 --size 256
+
+      - name: Configure (Release)
+        shell: bash
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_BENCHMARKS=ON
+
+      - name: Build all benchmark targets
+        shell: bash
+        run: |
+          cmake --build build --config Release -j --target \
+            fast_alloc_bench fast_alloc_bench_extended \
+            fast_alloc_bench_memory bench_suite
+
+      - name: Locate binaries
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN="build/Release"; EXT=".exe"
+          else
+            BIN="build"; EXT=""
+          fi
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "EXT=$EXT" >> "$GITHUB_ENV"
+
+      # --- google/benchmark binaries: run every registered benchmark ---
+      - name: Run fast_alloc_bench (every benchmark)
+        shell: bash
+        run: >
+          "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*'
+          --benchmark_min_time=0.05s --benchmark_repetitions=1
+          --benchmark_report_aggregates_only=false
+
+      - name: Run fast_alloc_bench_extended (every benchmark)
+        shell: bash
+        run: >
+          "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*'
+          --benchmark_min_time=0.05s --benchmark_repetitions=1
+          --benchmark_report_aggregates_only=false
+
+      # --- custom memory benchmark: full threads x sizes sweep ---
+      - name: Run fast_alloc_bench_memory (threads 1/2/4 x sizes 64/256/4096)
+        shell: bash
+        run: |
+          rc=0
+          for th in 1 2 4; do
+            for sz in 64 256 4096; do
+              echo "== bench_memory T=$th size=$sz =="
+              "$BIN/fast_alloc_bench_memory$EXT" --threads "$th" \
+                --allocs 20000 --size "$sz" || rc=$?
+            done
+          done
+          exit $rc
+
+      # --- bench_suite: the FULL matrix — every workload, every allocator
+      #     path (std AND fast), every thread count (1/2/4). Checksums are
+      #     verified on every free; rc=42 fails the step. ---
+      - name: Run bench_suite (all 11 workloads x std+fast x threads 1/2/4)
+        shell: bash
+        run: |
+          rc=0
+          for wl in tiny small-mixed random-1-4096 ramp churn cache-thrash \
+                    cross-thread thread-churn large realloc-grow overhead; do
+            # 'large' moves 64KB..512KB blocks -> keep its op count lower
+            OPS=30000; [ "$wl" = "large" ] && OPS=3000
+            for th in 1 2 4; do
+              echo "== std $wl T=$th ops=$OPS =="
+              "$BIN/bench_suite$EXT" --alloc std --label std \
+                --workload "$wl" --threads "$th" --ops "$OPS" --reps 1 || rc=$?
+              echo "== FastAlloc $wl T=$th ops=$OPS =="
+              "$BIN/bench_suite$EXT" --alloc fast --label FastAlloc \
+                --workload "$wl" --threads "$th" --ops "$OPS" --reps 1 || rc=$?
+            done
+          done
+          exit $rc
+
+  # ---------------------------------------------------------------------------
+  # Cross-allocator matrix (glibc + jemalloc + FastAlloc): the same bench_suite
+  # workloads again, but with LD_PRELOAD'd allocators for allocator-vs-allocator
+  # comparisons. Runs on every push to main and on manual dispatch (not on PRs,
+  # which already run the full std+fast sweep above). mimalloc is auto-skipped
+  # unless MIMALLOC_SO points at a prebuilt libmimalloc.so. Results are noise
+  # on shared runners — treat them as smoke/regression data, not publishable
+  # numbers.
+  # ---------------------------------------------------------------------------
+  benchmark-matrix:
+    name: benchmark-matrix
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jemalloc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjemalloc2
+
+      - name: Configure (Release)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_BENCHMARKS=ON
+
+      - name: Build bench_suite
+        run: cmake --build build -j --target bench_suite
+
+      - name: Run reduced cross-allocator matrix
+        run: |
+          cd benchmarks/benchsuite
+          BENCH_SUITE="$PWD/../../build/bench_suite" \
+            OPS=300000 THREADS="1 2" ./run_matrix.sh ci_matrix.jsonl 3
+          python3 analyze.py ci_matrix.jsonl | tee ci_matrix_summary.md
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-matrix-results
+          path: |
+            benchmarks/benchsuite/ci_matrix.jsonl
+            benchmarks/benchsuite/ci_matrix_summary.md
+            benchmarks/benchsuite/matrix_failures.txt
+          if-no-files-found: ignore
