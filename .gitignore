@@ -1,33 +1,49 @@
-# CMake artifacts
+# Build directories
 build/
-cmake-build-debug/
-cmake-build-release/
-CMakeCache.txt
-CMakeFiles/
-CPackConfig.cmake
-CPackSourceConfig.cmake
-_deps/
-Testing/
-Test/
+build-*/
+cmake-build-*/
+out/
+bin/
+lib/
+obj/
 
-# Compiled object files
+# IDE
+.vscode/
+.idea/
+.vs/
+*.user
+*.suo
+
+# Compilers / tooling
 *.o
-*.obj
-*.exe
-*.dll
+*.a
 *.so
 *.dylib
-*.a
+*.dll
+*.exe
 *.lib
+*.pdb
+*.ilk
 
-# IDEs
-.idea/
-.vscode/
-*.sln
-*.vcxproj
-*.vcxproj.user
-*.vcxproj.filters
+# Coverage & profiling artifacts
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+coverage/
+lcov/
 
-# Temporary/Backup files
-*~
-*.swp
+# Sanitizer outputs
+*.asan.*
+*.tsan.*
+*.lsan.*
+*.ubsan.*
+core
+core.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FetchContent leaves nothing behind in-tree, but guard anyway
+_deps/

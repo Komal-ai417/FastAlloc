@@ -25,6 +25,18 @@ public:
      * @return The system page size.
      */
     static std::size_t GetPageSize();
+
+    /**
+     * @brief True if 'ptr' lies inside a pooled span chunk (Linux span pool).
+     *
+     * Spans carved from 4 MB pool chunks are released with
+     * madvise(MADV_DONTNEED) instead of munmap, so in-place mremap
+     * grow/shrink must NOT be attempted on them (it could consume or punch
+     * holes in bump-allocator space the pool does not track). Callers fall
+     * back to the copy path for pooled spans. Always false where no pool
+     * exists (non-Linux).
+     */
+    static bool IsPoolBacked(void* ptr);
 };
 
 } // namespace FastAlloc

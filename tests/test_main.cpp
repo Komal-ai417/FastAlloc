@@ -3,6 +3,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 using namespace FastAlloc;
 
@@ -56,12 +57,16 @@ TEST(FastAllocTest, ReallocAndCalloc) {
 }
 
 TEST(FastAllocTest, MultiThreading) {
-    // Tests thread-local caches and global heap sync
-    auto thread_func = []() {
+    // Tests thread-local caches and global heap sync.
+    // NOTE: Google Test assertions are NOT thread-safe; workers record
+    // failures locally and the main thread asserts on the results.
+    std::atomic<int> null_allocs{0};
+
+    auto thread_func = [&null_allocs]() {
         std::vector<void*> ptrs;
         for (int i = 0; i < 10000; ++i) {
             void* ptr = fast_malloc(32); // Trigger slab allocations rapidly
-            EXPECT_NE(ptr, nullptr);
+            if (!ptr) { ++null_allocs; continue; }
             ptrs.push_back(ptr);
         }
         for (void* ptr : ptrs) {
@@ -70,10 +75,12 @@ TEST(FastAllocTest, MultiThreading) {
     };
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < 8; ++i) {
+    const int n = 8;
+    for (int i = 0; i < n; ++i) {
         threads.emplace_back(thread_func);
     }
     for (auto& t : threads) {
         t.join();
     }
+    EXPECT_EQ(null_allocs.load(), 0);
 }

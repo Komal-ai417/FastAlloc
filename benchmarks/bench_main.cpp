@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 #include "fast_alloc.h"
 #include <cstdlib>
+#include <vector>
 
 using namespace FastAlloc;
 

@@ -1,54 +1,123 @@
-name: FastAlloc CI
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
 jobs:
-  build-and-test:
-    name: Build & Test on ${{ matrix.os }}
+  # ---------------------------------------------------------------------------
+  # Build & test matrix: release + debug-instrumented on all three platforms
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        build_type: [Debug, Release]
+        os: [ ubuntu-latest, windows-latest ]
+        compiler: [ default ]
+        config: [ release, debug ]
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            config: release
+          - os: ubuntu-latest
+            compiler: clang
+            config: release
+          - os: ubuntu-latest
+            compiler: clang
+            config: debug
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-
-    - name: Build Project
-      run: cmake --build build --config ${{ matrix.build_type }}
-
-    - name: Run Correctness Tests (Google Test)
-      run: ctest --test-dir build -C ${{ matrix.build_type }} -V
-
-    - name: Run Benchmarks (Validation)
-      if: matrix.build_type == 'Release'
-      # We run the benchmark for a brief period to ensure no runtime crashes and valid timings.
-      shell: bash
-      run: |
-        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-          # On Windows (MSVC), executables are often in build/Release/ or build/Debug/
-          if [ -f "./build/${{ matrix.build_type }}/fast_alloc_bench.exe" ]; then
-            ./build/${{ matrix.build_type }}/fast_alloc_bench.exe --benchmark_min_time=0.1
-            ./build/${{ matrix.build_type }}/fast_alloc_bench_extended.exe --benchmark_min_time=0.1
-            ./build/${{ matrix.build_type }}/fast_alloc_bench_memory.exe
-            ./build/${{ matrix.build_type }}/fast_alloc_bench_memory.exe --fast
-          else
-            ./build/fast_alloc_bench.exe --benchmark_min_time=0.1
-            ./build/fast_alloc_bench_extended.exe --benchmark_min_time=0.1
-            ./build/fast_alloc_bench_memory.exe
-            ./build/fast_alloc_bench_memory.exe --fast
+      - name: Configure (Linux, ${{ matrix.compiler }})
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            cmake -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           fi
-        else
-          ./build/fast_alloc_bench --benchmark_min_time=0.1
-          ./build/fast_alloc_bench_extended --benchmark_min_time=0.1
-          ./build/fast_alloc_bench_memory
-          ./build/fast_alloc_bench_memory --fast
-        fi
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+                -DFASTALLOC_BUILD_TESTS=ON `
+                -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer jobs (Linux only; MSVC ASan runs in the windows debug job)
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: sanitizer-${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ address-undefined, thread ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          SAN=""
+          case "${{ matrix.sanitizer }}" in
+            address-undefined) SAN="address,undefined" ;;
+            thread)            SAN="thread" ;;
+          esac
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_SANITIZE="$SAN"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+
+  # ---------------------------------------------------------------------------
+  # LSan-specific job (leak detection on the full suite)
+  # ---------------------------------------------------------------------------
+  leaks:
+    name: leak-sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFASTALLOC_SANITIZE=leak
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+
+  # ---------------------------------------------------------------------------
+  # Benchmarks: build only (running them in CI produces noise-dominated data)
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: benchmarks-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DFASTALLOC_BUILD_BENCHMARKS=ON -DFASTALLOC_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build build -j
+      - name: Smoke-run memory benchmark
+        run: ./build/fast_alloc_bench_memory --threads 2 --allocs 2000 --size 256
