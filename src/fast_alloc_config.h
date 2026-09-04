@@ -15,6 +15,9 @@
 #if !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0600
 #endif
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #endif
 
 #if defined(_MSC_VER)

@@ -48,6 +48,9 @@
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #pragma comment(lib, "psapi")
 #endif
 
@@ -67,9 +70,6 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #include <psapi.h>
 #else
@@ -796,7 +796,6 @@ static RepResult run_realloc_grow(uint64_t ops) {
     RepResult r;
     r.rss_start_mb = mb((double)current_rss_bytes());
     std::atomic<uint64_t> bad_tags{0};
-    uint64_t steps = 0;
 
     uint64_t t0 = now_ns();
     uint64_t done = 0;
@@ -805,6 +804,7 @@ static RepResult run_realloc_grow(uint64_t ops) {
     void* p = g_api.malloc(init);
     std::size_t cur = init;
     tag_store(p, cur, 0xDEADBEEFull);
+
     while (done < ops) {
         std::size_t want = cur + (cur >> 1) + 16;           // 1.5x geometric
         if (want > 8192) {                                   // restart the string
@@ -820,7 +820,7 @@ static RepResult run_realloc_grow(uint64_t ops) {
         tag_store(p, std::min(cur, (std::size_t)8), 0xDEADBEEFull + done);
         if (!tag_verify(p, std::min(cur, (std::size_t)8), 0xDEADBEEFull + done))
             bad_tags.fetch_add(1);
-        ++done; ++steps;
+        ++done;
     }
     g_api.free(p);
     uint64_t t1 = now_ns();
