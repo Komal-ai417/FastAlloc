@@ -31,7 +31,7 @@ constexpr std::size_t PAGE_CACHE_PER_BIN_BYTES = 2 * 1024 * 1024;
 
 std::size_t PageCacheTotalLimit() {
     static const std::size_t limit = []() {
-        const char* env = std::getenv("FASTALLOC_PAGE_CACHE_MB");
+        const char* env = fast_getenv("FASTALLOC_PAGE_CACHE_MB");
         std::size_t mb = 64;
         if (env && *env) {
             long v = std::atol(env);
@@ -78,7 +78,7 @@ inline std::size_t FirstNonEmptyAbove(std::size_t pages) {
         }
     }
     if (word == 0) return 0;
-    std::size_t p = (w << 6) + (std::size_t)__builtin_ctzll(word);
+    std::size_t p = (w << 6) + (std::size_t)fast_ctzll(word);
     return (p <= MAX_CACHED_PAGES && p > pages) ? p : 0;
 }
 
@@ -116,7 +116,7 @@ void* PageHeapAllocate(std::size_t size) {
         ViolationInfo info{};
         info.kind = Violation::InternalInvariant;
         info.where = "PageHeapAllocate: size is not page-aligned";
-        info.caller = __builtin_return_address(0);
+        info.caller = FAST_RETURN_ADDRESS();
         ReportViolation(info);
     }
 #endif
@@ -197,7 +197,7 @@ void PageHeapFree(void* ptr, std::size_t size) {
         ViolationInfo info{};
         info.kind = Violation::InternalInvariant;
         info.where = "PageHeapFree: size is not page-aligned";
-        info.caller = __builtin_return_address(0);
+        info.caller = FAST_RETURN_ADDRESS();
         ReportViolation(info);
     }
 #endif
@@ -376,7 +376,7 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
             info.kind = Violation::BadSlabMagic;
             info.ptr = pending;
             info.where = "DrainPendingReturns: pending block has corrupt slab";
-            info.caller = __builtin_return_address(0);
+            info.caller = FAST_RETURN_ADDRESS();
             ReportViolation(info);
         }
 #endif

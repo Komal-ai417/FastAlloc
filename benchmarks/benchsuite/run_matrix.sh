@@ -6,6 +6,8 @@
 # Env:    BENCH_SUITE  (path to the bench_suite binary; default: ../../build*/bench_suite)
 #         JEMALLOC_SO  (path to libjemalloc; default: system libjemalloc.so.2)
 #         MIMALLOC_SO  (path to libmimalloc;  default: skip mimalloc if absent)
+#         OPS          (override per-run op count;      default: workload default)
+#         THREADS      (space-separated thread list;    default: "1 2 4")
 #
 # Methodology safeguards:
 #   * one allocator per process (RSS / ru_maxrss isolation)
@@ -22,6 +24,8 @@ OUT="${1:-bench_results.jsonl}"
 REPS="${2:-5}"
 JEM="${JEMALLOC_SO:-/lib/x86_64-linux-gnu/libjemalloc.so.2}"
 MI="${MIMALLOC_SO:-}"
+OPS="${OPS:-0}"
+THREADS_L="${THREADS:-1 2 4}"
 
 if [ -z "$BENCH" ] || [ ! -x "$BENCH" ]; then
     echo "bench_suite binary not found; build it first:" >&2
@@ -37,14 +41,15 @@ run_one() {  # alloc label preload workload threads
     local alloc="$1" label="$2" preload="$3" wl="$4" th="$5"
     have "$label" "$wl" "$th" && return 0
     echo ">>> $label $wl T=$th"
-    local rc=0 attempt
+    local rc=0 attempt ops_arg=""
+    [ "$OPS" != "0" ] && ops_arg="--ops $OPS"
     for attempt in 1 2; do
         if [ -n "$preload" ]; then
             LD_PRELOAD="$preload" "$BENCH" --alloc "$alloc" --label "$label" \
-                --workload "$wl" --threads "$th" --reps "$REPS" --json "$OUT"
+                --workload "$wl" --threads "$th" --reps "$REPS" $ops_arg --json "$OUT"
         else
             "$BENCH" --alloc "$alloc" --label "$label" \
-                --workload "$wl" --threads "$th" --reps "$REPS" --json "$OUT"
+                --workload "$wl" --threads "$th" --reps "$REPS" $ops_arg --json "$OUT"
         fi
         rc=$?
         [ $rc -eq 0 ] && break
@@ -58,7 +63,7 @@ WORKLOADS=(tiny small-mixed random-1-4096 ramp churn cache-thrash cross-thread t
 ALLOCS=(glibc jemalloc mimalloc fast)   # mimalloc auto-skipped if MIMALLOC_SO empty
 IDX=0
 for wl in "${WORKLOADS[@]}"; do
-    for th in 1 2 4; do
+    for th in $THREADS_L; do
         case $(( IDX % 4 )) in   # rotate start order per workload
             0) ORDER=(glibc jemalloc mimalloc fast) ;;
             1) ORDER=(jemalloc mimalloc fast glibc) ;;

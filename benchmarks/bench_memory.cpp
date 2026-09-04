@@ -9,6 +9,11 @@
 //   fast_alloc_bench_memory --fast         -> FastAlloc only
 //   fast_alloc_bench_memory --threads N --allocs N --size N
 // ============================================================================
+// MSVC: GetProcessMemoryInfo resolves to psapi.lib on some SDK configs;
+// embed the dependency so the link works regardless of CMake wiring.
+#if defined(_MSC_VER)
+#pragma comment(lib, "psapi")
+#endif
 #include <iostream>
 #include <vector>
 #include <thread>

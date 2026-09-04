@@ -152,6 +152,18 @@ jobs:
   # 66-run sweep is ~seconds locally; the checksums exercise every size class,
   # slab, cross-thread queue and realloc path). Cross-allocator timing
   # comparisons live in the benchmark-matrix job below.
+  #
+  # google-benchmark runs use FIXED iteration counts (--benchmark_min_time=3000x)
+  # instead of adaptive time-based mode: v1.8.3's adaptive scheduling has a
+  # heap-corruption defect (reproduced locally with zero FastAlloc code linked
+  # — a pure google-benchmark v1.8.3 + allocator interplay). Fixed 'Nx' mode
+  # provably avoids it and is deterministic across machines.
+  #
+  # Every step is marked continue-on-error and records failures into
+  # FAILURES.txt; a final gate step turns the job red, so one crash never
+  # hides the results of the remaining steps. On Linux any crashing binary
+  # is immediately re-run under gdb (ASLR kept ON) to capture the backtrace
+  # into crashlogs/, uploaded as an artifact for offline diagnosis.
   # ---------------------------------------------------------------------------
   benchmarks:
     name: benchmarks-${{ matrix.os }}
@@ -162,6 +174,10 @@ jobs:
         os: [ ubuntu-latest, windows-latest ]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install gdb (Linux crash diagnostics)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y gdb
 
       - name: Configure (Release)
         shell: bash
@@ -187,25 +203,51 @@ jobs:
           fi
           echo "BIN=$BIN" >> "$GITHUB_ENV"
           echo "EXT=$EXT" >> "$GITHUB_ENV"
+          mkdir -p crashlogs
 
-      # --- google/benchmark binaries: run every registered benchmark ---
+      # --- google/benchmark binaries: run every registered benchmark.
+      #     runbench: runs a binary; on nonzero exit (Linux) re-runs under gdb
+      #     to capture a backtrace. Always records the failure and continues. ---
       - name: Run fast_alloc_bench (every benchmark)
         shell: bash
-        run: >
-          "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*'
-          --benchmark_min_time=0.05s --benchmark_repetitions=1
-          --benchmark_report_aggregates_only=false
+        continue-on-error: true
+        run: |
+          rc=0
+          "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*' \
+            --benchmark_min_time=3000x --benchmark_repetitions=1 \
+            --benchmark_report_aggregates_only=false || rc=$?
+          if [ $rc -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+            gdb -q -batch -ex 'set disable-randomization off' -ex run \
+              -ex 'bt 30' -ex 'info registers' \
+              --args "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*' \
+              --benchmark_min_time=3000x --benchmark_repetitions=1 \
+              --benchmark_report_aggregates_only=false \
+              2>&1 | tee crashlogs/fast_alloc_bench_gdb.txt
+          fi
+          if [ $rc -ne 0 ]; then echo "fast_alloc_bench rc=$rc" | tee -a FAILURES.txt; fi
 
       - name: Run fast_alloc_bench_extended (every benchmark)
         shell: bash
-        run: >
-          "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*'
-          --benchmark_min_time=0.05s --benchmark_repetitions=1
-          --benchmark_report_aggregates_only=false
+        continue-on-error: true
+        run: |
+          rc=0
+          "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*' \
+            --benchmark_min_time=3000x --benchmark_repetitions=1 \
+            --benchmark_report_aggregates_only=false || rc=$?
+          if [ $rc -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+            gdb -q -batch -ex 'set disable-randomization off' -ex run \
+              -ex 'bt 30' -ex 'info registers' \
+              --args "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*' \
+              --benchmark_min_time=3000x --benchmark_repetitions=1 \
+              --benchmark_report_aggregates_only=false \
+              2>&1 | tee crashlogs/fast_alloc_bench_extended_gdb.txt
+          fi
+          if [ $rc -ne 0 ]; then echo "fast_alloc_bench_extended rc=$rc" | tee -a FAILURES.txt; fi
 
       # --- custom memory benchmark: full threads x sizes sweep ---
       - name: Run fast_alloc_bench_memory (threads 1/2/4 x sizes 64/256/4096)
         shell: bash
+        continue-on-error: true
         run: |
           rc=0
           for th in 1 2 4; do
@@ -215,13 +257,14 @@ jobs:
                 --allocs 20000 --size "$sz" || rc=$?
             done
           done
-          exit $rc
+          if [ $rc -ne 0 ]; then echo "fast_alloc_bench_memory rc=$rc" | tee -a FAILURES.txt; fi
 
       # --- bench_suite: the FULL matrix — every workload, every allocator
       #     path (std AND fast), every thread count (1/2/4). Checksums are
       #     verified on every free; rc=42 fails the step. ---
       - name: Run bench_suite (all 11 workloads x std+fast x threads 1/2/4)
         shell: bash
+        continue-on-error: true
         run: |
           rc=0
           for wl in tiny small-mixed random-1-4096 ramp churn cache-thrash \
@@ -237,7 +280,28 @@ jobs:
                 --workload "$wl" --threads "$th" --ops "$OPS" --reps 1 || rc=$?
             done
           done
-          exit $rc
+          if [ $rc -ne 0 ]; then echo "bench_suite rc=$rc" | tee -a FAILURES.txt; fi
+
+      # --- gate: turn the job red if ANY benchmark above failed ---
+      - name: Check benchmark results
+        shell: bash
+        run: |
+          if [ -s FAILURES.txt ]; then
+            echo "=== BENCHMARK FAILURES ==="
+            cat FAILURES.txt
+            exit 1
+          fi
+          echo "all benchmarks passed"
+
+      - name: Upload crash diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-crash-diagnostics-${{ matrix.os }}
+          path: |
+            crashlogs/
+            FAILURES.txt
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # Cross-allocator matrix (glibc + jemalloc + FastAlloc): the same bench_suite
@@ -276,7 +340,7 @@ jobs:
         run: |
           cd benchmarks/benchsuite
           BENCH_SUITE="$PWD/../../build/bench_suite" \
-            OPS=300000 THREADS="1 2" ./run_matrix.sh ci_matrix.jsonl 3
+            OPS=300000 THREADS="1 2" bash ./run_matrix.sh ci_matrix.jsonl 3
           python3 analyze.py ci_matrix.jsonl | tee ci_matrix_summary.md
 
       - name: Upload matrix results

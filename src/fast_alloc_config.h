@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <array>
 
 // ============================================================================
@@ -27,6 +28,47 @@
 #define FAST_LIKELY(x) (x)
 #define FAST_UNLIKELY(x) (x)
 #endif
+
+// ---------------------------------------------------------------------------
+// Cross-compiler builtins (MSVC has no __builtin_*; these shims keep every
+// translation unit portable across GCC/Clang/MSVC. All are release-path.)
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+#define FAST_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define FAST_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+
+// Count trailing zeros of a NONZERO 64-bit word.
+inline unsigned fast_ctzll(unsigned long long v) {
+#if defined(_MSC_VER) && defined(_WIN64)
+    unsigned long i = 0;
+    _BitScanForward64(&i, v);
+    return static_cast<unsigned>(i);
+#elif defined(_MSC_VER)
+    unsigned long i = 0;
+    unsigned long lo = static_cast<unsigned long>(v);
+    if (lo) { _BitScanForward(&i, lo); return static_cast<unsigned>(i); }
+    _BitScanForward(&i, static_cast<unsigned long>(v >> 32));
+    return static_cast<unsigned>(i) + 32u;
+#else
+    return static_cast<unsigned>(__builtin_ctzll(v));
+#endif
+}
+
+// Read-only getenv without MSVC C4996 deprecation noise (C4996 is a hard
+// error under /W4 /WX). MSVC's _dupenv_s alternative hands back a malloc'd
+// copy the caller must free - pointless for a read of a tunable.
+inline const char* fast_getenv(const char* name) {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    return std::getenv(name);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
 
 // ============================================================================
 // Debug instrumentation framework

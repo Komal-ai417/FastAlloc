@@ -38,6 +38,19 @@
 //   FastAlloc : --alloc fast
 // ============================================================================
 
+// ============================================================================
+// bench_suite — deterministic cross-allocator benchmark workload driver.
+// ============================================================================
+
+// MSVC: fopen/fscanf trigger C4996 deprecation warnings that are hard errors
+// under /W4 /WX; GetProcessMemoryInfo lives in psapi.lib on some SDKs.
+#if defined(_MSC_VER)
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#pragma comment(lib, "psapi")
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>

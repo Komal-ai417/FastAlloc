@@ -15,7 +15,7 @@ void Slab::assert_fast(bool cond, const char* msg) {
         info.ptr = nullptr;
         info.size = 0;
         info.where = msg;
-        info.caller = __builtin_return_address(0);
+        info.caller = FAST_RETURN_ADDRESS();
         info.has_record = 0;
         ReportViolation(info);
     }

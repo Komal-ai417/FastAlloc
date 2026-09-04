@@ -57,7 +57,7 @@ inline std::size_t PageRoundUp(std::size_t n) {
     info.ptr = ptr;
     info.size = size;
     info.where = where;
-    info.caller = __builtin_return_address(0);
+    info.caller = FAST_RETURN_ADDRESS();
     info.has_record = 0;
     ReportViolation(info);
 }
@@ -100,7 +100,7 @@ void RegistryInsertOrFail(void* user, std::size_t size, std::size_t usable, bool
         info.ptr = user;
         info.size = size;
         info.where = where;
-        info.caller = __builtin_return_address(0);
+        info.caller = FAST_RETURN_ADDRESS();
         info.record = existing;
         info.has_record = 1;
         ReportViolation(info);

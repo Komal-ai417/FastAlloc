@@ -40,6 +40,9 @@ endif()
 
 # Compiler-specific optimizations
 if(MSVC)
+    # fopen/fscanf/getenv trigger C4996 deprecation on MSVC; under /W4 /WX
+    # they become hard errors, so silence the CRT deprecation noise globally.
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
     set(WARNING_FLAGS /W4 /WX)
     if(NOT FASTALLOC_SANITIZE)
         add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
@@ -157,7 +160,9 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     if(NOT WIN32)
         target_link_libraries(bench_suite PRIVATE fast_alloc ${CMAKE_DL_LIBS})
     else()
-        target_link_libraries(bench_suite PRIVATE fast_alloc)
+        # GetProcessMemoryInfo (psapi.h) resolves to Psapi.lib on some
+        # MinGW/MSVC SDK configurations; harmless when already in kernel32.
+        target_link_libraries(bench_suite PRIVATE fast_alloc psapi)
     endif()
     target_link_libraries(bench_suite PRIVATE Threads::Threads)
 

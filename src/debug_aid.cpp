@@ -56,7 +56,7 @@ unsigned long CurrentTid() {
 }
 
 int InitialLogLevel() {
-    const char* env = std::getenv("FASTALLOC_LOG_LEVEL");
+    const char* env = fast_getenv("FASTALLOC_LOG_LEVEL");
     if (env && *env) {
         int v = std::atoi(env);
         if (v < 0) v = 0;

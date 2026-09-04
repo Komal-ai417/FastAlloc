@@ -301,7 +301,7 @@ void TLSCache::AuditBin(std::size_t class_index) const {
         info.kind = Violation::RegistryInconsistency;
         info.where = "TLSCache bin count does not match list length";
         info.size = class_index;
-        info.caller = __builtin_return_address(0);
+        info.caller = FAST_RETURN_ADDRESS();
         ReportViolation(info);
     }
 }
@@ -322,7 +322,8 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     std::size_t hard_cap = max_cache / 2;
     if (hard_cap == 0) hard_cap = 1;
     if (target_count > hard_cap) target_count = hard_cap;
-    bin.next_refill = (target_count * 2 <= hard_cap) ? target_count * 2 : hard_cap;
+    bin.next_refill = static_cast<uint32_t>(
+            (target_count * 2 <= hard_cap) ? target_count * 2 : hard_cap);
 
     std::size_t actual_count = 0;
     FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(class_index, target_count, actual_count, arena_index_);
