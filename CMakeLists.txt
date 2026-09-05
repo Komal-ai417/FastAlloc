@@ -42,8 +42,10 @@ endif()
 if(MSVC)
     # fopen/fscanf/getenv trigger C4996 deprecation on MSVC; under /W4 /WX
     # they become hard errors, so silence the CRT deprecation noise globally.
+    # Also disable C4702 (unreachable code) which LTCG /GL can emit on inlined
+    # template or terminating paths under /W4.
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-    set(WARNING_FLAGS /W4 /WX)
+    set(WARNING_FLAGS /W4 /WX /wd4702)
     if(NOT FASTALLOC_SANITIZE)
         add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
         add_link_options("$<$<CONFIG:Release>:/LTCG>")
