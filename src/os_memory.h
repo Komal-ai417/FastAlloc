@@ -21,6 +21,17 @@ public:
     static void FreePages(void* ptr, std::size_t size);
 
     /**
+     * @brief Partial in-place release (realloc shrink path).
+     *
+     * Windows: VirtualFree(ptr, size, MEM_DECOMMIT) - drops the physical
+     * pages but keeps the VA reserved (touch faults until re-committed).
+     * Other platforms: no-op (the shrink falls back to the copy path).
+     * Under FASTALLOC_WINVA_EMULATION this routes through the emulator so
+     * the same code path is exercised on Linux.
+     */
+    static void DecommitPages(void* ptr, std::size_t size);
+
+    /**
      * @brief Retrieves the OS page size (typically 4096 bytes).
      * @return The system page size.
      */

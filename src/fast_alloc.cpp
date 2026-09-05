@@ -503,7 +503,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
             if (needed >= header->alloc_size) return ptr; // rounding ate the gain
             char* base = reinterpret_cast<char*>(header);
-#if defined(__linux__)
+#if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
             if (OSMemory::IsPoolBacked(base)) return ptr; // pooled: keep span
             // mremap shrink: releases the tail pages, never moves the base.
             std::size_t released = header->alloc_size - needed;
@@ -512,11 +512,9 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // shrunk == base for non-MAYMOVE calls.
             header->alloc_size = needed;
             stats::CountOsFree(released);
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(FASTALLOC_WINVA_EMULATION)
             std::size_t released = header->alloc_size - needed;
-            if (!VirtualFree(base + needed, released, MEM_DECOMMIT)) {
-                return ptr;
-            }
+            OSMemory::DecommitPages(base + needed, released);
             stats::CountOsFree(released);
             header->alloc_size = needed;
 #else
@@ -546,7 +544,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
         if (needed > header->alloc_size) {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
             // Pooled spans skip mremap growth: the kernel could grow the
             // mapping in place into bump space the pool will hand out again
             // later (overlap hazard), or move it (leaving a hole in the

@@ -423,7 +423,19 @@ void SetViolationHandler(ViolationHandler handler) {
         h(info); // test hook; must terminate the process or longjmp out
     }
     DefaultViolationHandler(info);
-    std::abort(); // unreachable if handler behaved; belt and suspenders
+    // Unreachable when the default handler behaves (it ends in std::abort),
+    // but a [[noreturn]] function that could fall off the end would be UB,
+    // so keep the belt-and-suspenders terminator. MSVC /W4 flags this as
+    // C4702 (unreachable code) in some configurations - it is INTENTIONALLY
+    // unreachable, hence the local suppression.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4702)
+#endif
+    std::abort();
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 }
 
 // ===========================================================================
