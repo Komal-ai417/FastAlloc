@@ -185,6 +185,10 @@ TEST(ApiTest, ReallocGrowsAndShrinksData) {
 }
 
 TEST(ApiTest, ReallocFailurePreservesOriginal) {
+    // Drop thread and page caches so the large allocation must hit the OS.
+    fast_alloc_purge_thread_cache();
+    FastAllocTestPurgePageCache();
+
     // OOM on realloc: original block must stay valid and unfreed.
     void* p = fast_malloc(64);
     ASSERT_NE(p, nullptr);

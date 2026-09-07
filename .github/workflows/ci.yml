@@ -63,16 +63,6 @@ jobs:
   # ---------------------------------------------------------------------------
   # MSVC AddressSanitizer (Linux sanitizers live in the jobs below; MSVC has
   # no TSan/LSan, so Windows gets an ASan-only job).
-  #
-  # ASan runs in the RELEASE config: MSVC ASan on top of a Debug build
-  # (/Od, no inlining, _ITERATOR_DEBUG_LEVEL=2) is pathologically slow —
-  # the full suite blew past ctest's default 1500 s timeout on the runner
-  # without completing, while the same suite passes the non-ASan Debug
-  # build-test job in normal time. Release keeps every ASan shadow check
-  # on the allocator + test code; the debug battery (incl. 11 death tests)
-  # remains covered by build-test's debug matrix entry. An explicit
-  # --timeout 1800 gives Release+ASan generous headroom over the observed
-  # ~minutes runtime.
   # ---------------------------------------------------------------------------
   windows-asan:
     name: windows-msvc-asan
@@ -81,13 +71,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug `
                 -DFASTALLOC_BUILD_TESTS=ON `
                 -DFASTALLOC_SANITIZE=address
       - name: Build
-        run: cmake --build build --config Release -j --target fast_alloc_tests
+        run: cmake --build build --config Debug -j --target fast_alloc_tests
       - name: Test
-        run: ctest --test-dir build --build-config Release --output-on-failure --timeout 1800
+        run: ctest --test-dir build --build-config Debug --output-on-failure
         env:
           ASAN_OPTIONS: halt_on_error=1
 
@@ -204,15 +194,7 @@ jobs:
   # instead of adaptive time-based mode: v1.8.3's adaptive scheduling has a
   # heap-corruption defect (reproduced locally with zero FastAlloc code linked
   # — a pure google-benchmark v1.8.3 + allocator interplay). Fixed 'Nx' mode
-  # provably avoids it and is deterministic across machines. The library is
-  # pinned to v1.9.4 (reworked scheduler), and the benchmark binaries are
-  # registered SINGLE-THREADED: google-benchmark's ->Threads(N) worker pool
-  # nondeterministically SIGSEGVs on shared runners (observed: Threads(8)
-  # crashed twice in one job while Threads(16) passed in the same job —
-  # FastAlloc exonerated by the passing checksum-verified multithreaded
-  # bench_suite sweep). Multithreaded performance coverage is NOT reduced:
-  # bench_suite runs all 11 workloads at T=1/2/4 for both allocators, and
-  # bench_memory sweeps threads 1/2/4 — both with their own threading.
+  # provably avoids it and is deterministic across machines.
   #
   # Every step is marked continue-on-error and records failures into
   # FAILURES.txt; a final gate step turns the job red, so one crash never
