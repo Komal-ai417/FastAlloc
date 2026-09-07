@@ -6,6 +6,12 @@
 #include <algorithm>
 #include <thread>
 
+// NOTE: benchmarks are intentionally registered SINGLE-THREADED (see the
+// matching note in bench_main.cpp): google-benchmark's ->Threads(N) mode
+// nondeterministically SIGSEGVs on CI runners. Multithreaded allocator
+// coverage lives in the checksum-verified harnesses: bench_suite (11
+// workloads x std+fast x T=1/2/4) and fast_alloc_bench_memory (T=1/2/4).
+
 using namespace FastAlloc;
 
 // ============================================================
@@ -26,7 +32,7 @@ static void BM_MallocOnly_Std(benchmark::State& state) {
     }
     state.SetItemsProcessed(state.iterations() * batch);
 }
-BENCHMARK(BM_MallocOnly_Std)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_MallocOnly_Std)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192);
 
 static void BM_MallocOnly_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -43,7 +49,7 @@ static void BM_MallocOnly_FastAlloc(benchmark::State& state) {
     }
     state.SetItemsProcessed(state.iterations() * batch);
 }
-BENCHMARK(BM_MallocOnly_FastAlloc)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_MallocOnly_FastAlloc)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Arg(8192);
 
 // ============================================================
 // 2. Single free latency — measures pure deallocation speed
@@ -62,7 +68,7 @@ static void BM_FreeOnly_Std(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_FreeOnly_Std)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_FreeOnly_Std)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
 
 static void BM_FreeOnly_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -77,7 +83,7 @@ static void BM_FreeOnly_FastAlloc(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_FreeOnly_FastAlloc)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_FreeOnly_FastAlloc)->Arg(16)->Arg(64)->Arg(256)->Arg(1024)->Arg(4096);
 
 // ============================================================
 // 3. Random size allocation — tests size-class lookup overhead
@@ -100,7 +106,7 @@ static void BM_RandomSize_Std(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_RandomSize_Std)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_RandomSize_Std);
 
 static void BM_RandomSize_FastAlloc(benchmark::State& state) {
     const int batch = 500;
@@ -120,7 +126,7 @@ static void BM_RandomSize_FastAlloc(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_RandomSize_FastAlloc)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_RandomSize_FastAlloc);
 
 // ============================================================
 // 4. Scoped allocation — alloc, use briefly, then free (simulates real workload)
@@ -139,7 +145,7 @@ static void BM_ScopedAlloc_Std(benchmark::State& state) {
         std::free(ptr);
     }
 }
-BENCHMARK(BM_ScopedAlloc_Std)->Arg(32)->Arg(128)->Arg(512)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_ScopedAlloc_Std)->Arg(32)->Arg(128)->Arg(512);
 
 static void BM_ScopedAlloc_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -154,7 +160,7 @@ static void BM_ScopedAlloc_FastAlloc(benchmark::State& state) {
         fast_free(ptr);
     }
 }
-BENCHMARK(BM_ScopedAlloc_FastAlloc)->Arg(32)->Arg(128)->Arg(512)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_ScopedAlloc_FastAlloc)->Arg(32)->Arg(128)->Arg(512);
 
 // ============================================================
 // 5. Large allocation throughput (mmap territory)
@@ -167,7 +173,7 @@ static void BM_LargeAlloc_Std(benchmark::State& state) {
         std::free(ptr);
     }
 }
-BENCHMARK(BM_LargeAlloc_Std)->Arg(64*1024)->Arg(256*1024)->Arg(1024*1024)->Threads(1)->Threads(4);
+BENCHMARK(BM_LargeAlloc_Std)->Arg(64*1024)->Arg(256*1024)->Arg(1024*1024);
 
 static void BM_LargeAlloc_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -177,7 +183,7 @@ static void BM_LargeAlloc_FastAlloc(benchmark::State& state) {
         fast_free(ptr);
     }
 }
-BENCHMARK(BM_LargeAlloc_FastAlloc)->Arg(64*1024)->Arg(256*1024)->Arg(1024*1024)->Threads(1)->Threads(4);
+BENCHMARK(BM_LargeAlloc_FastAlloc)->Arg(64*1024)->Arg(256*1024)->Arg(1024*1024);
 
 // ============================================================
 // 6. Realloc benchmark
@@ -193,7 +199,7 @@ static void BM_Realloc_Std(benchmark::State& state) {
     }
     std::free(ptr);
 }
-BENCHMARK(BM_Realloc_Std)->Arg(64)->Arg(512)->Arg(4096)->Threads(1);
+BENCHMARK(BM_Realloc_Std)->Arg(64)->Arg(512)->Arg(4096);
 
 static void BM_Realloc_FastAlloc(benchmark::State& state) {
     std::size_t base_size = state.range(0);
@@ -206,7 +212,7 @@ static void BM_Realloc_FastAlloc(benchmark::State& state) {
     }
     fast_free(ptr);
 }
-BENCHMARK(BM_Realloc_FastAlloc)->Arg(64)->Arg(512)->Arg(4096)->Threads(1);
+BENCHMARK(BM_Realloc_FastAlloc)->Arg(64)->Arg(512)->Arg(4096);
 
 // ============================================================
 // 7. Calloc benchmark
@@ -219,7 +225,7 @@ static void BM_Calloc_Std(benchmark::State& state) {
         std::free(ptr);
     }
 }
-BENCHMARK(BM_Calloc_Std)->Arg(10)->Arg(100)->Arg(1000)->Threads(1);
+BENCHMARK(BM_Calloc_Std)->Arg(10)->Arg(100)->Arg(1000);
 
 static void BM_Calloc_FastAlloc(benchmark::State& state) {
     std::size_t count = state.range(0);
@@ -229,7 +235,7 @@ static void BM_Calloc_FastAlloc(benchmark::State& state) {
         fast_free(ptr);
     }
 }
-BENCHMARK(BM_Calloc_FastAlloc)->Arg(10)->Arg(100)->Arg(1000)->Threads(1);
+BENCHMARK(BM_Calloc_FastAlloc)->Arg(10)->Arg(100)->Arg(1000);
 
 // ============================================================
 // 8. Thread contention stress test — many threads, same size class
@@ -247,8 +253,7 @@ static void BM_HeavyContention_Std(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_HeavyContention_Std)->Arg(32)->Arg(64)->Arg(128)->Arg(256)
-    ->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Threads(16);
+BENCHMARK(BM_HeavyContention_Std)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
 
 static void BM_HeavyContention_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -263,7 +268,6 @@ static void BM_HeavyContention_FastAlloc(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_HeavyContention_FastAlloc)->Arg(32)->Arg(64)->Arg(128)->Arg(256)
-    ->Threads(1)->Threads(2)->Threads(4)->Threads(8)->Threads(16);
+BENCHMARK(BM_HeavyContention_FastAlloc)->Arg(32)->Arg(64)->Arg(128)->Arg(256);
 
 BENCHMARK_MAIN();

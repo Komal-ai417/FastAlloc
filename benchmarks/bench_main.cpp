@@ -3,6 +3,14 @@
 #include <cstdlib>
 #include <vector>
 
+// NOTE: benchmarks are intentionally registered SINGLE-THREADED.
+// google-benchmark's ->Threads(N) mode (its only OS-thread-spawning path)
+// exhibited nondeterministic SIGSEGV on CI runners — reproducible with ZERO
+// FastAlloc code linked, and in one run bench Threads(8) crashed while
+// Threads(16) passed. Multithreaded allocator coverage lives in the rigorous,
+// checksum-verified harnesses instead: bench_suite (11 workloads x std+fast
+// x T=1/2/4, 66 runs) and fast_alloc_bench_memory (--threads 1/2/4).
+
 using namespace FastAlloc;
 
 static void BM_MallocFree_Std(benchmark::State& state) {
@@ -23,7 +31,7 @@ static void BM_MallocFree_Std(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_MallocFree_Std)->Range(8, 8192)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_MallocFree_Std)->Range(8, 8192);
 
 static void BM_MallocFree_FastAlloc(benchmark::State& state) {
     std::size_t size = state.range(0);
@@ -44,6 +52,6 @@ static void BM_MallocFree_FastAlloc(benchmark::State& state) {
         ptrs.clear();
     }
 }
-BENCHMARK(BM_MallocFree_FastAlloc)->Range(8, 8192)->Threads(1)->Threads(4)->Threads(8);
+BENCHMARK(BM_MallocFree_FastAlloc)->Range(8, 8192);
 
 BENCHMARK_MAIN();

@@ -42,10 +42,8 @@ endif()
 if(MSVC)
     # fopen/fscanf/getenv trigger C4996 deprecation on MSVC; under /W4 /WX
     # they become hard errors, so silence the CRT deprecation noise globally.
-    # Also disable C4702 (unreachable code) which LTCG /GL can emit on inlined
-    # template or terminating paths under /W4.
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-    set(WARNING_FLAGS /W4 /WX /wd4702)
+    set(WARNING_FLAGS /W4 /WX)
     if(NOT FASTALLOC_SANITIZE)
         add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
         add_link_options("$<$<CONFIG:Release>:/LTCG>")
@@ -126,7 +124,12 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     FetchContent_Declare(
         googlebenchmark
         GIT_REPOSITORY https://github.com/google/benchmark.git
-        GIT_TAG v1.8.3
+        # v1.9.4 (2025-05): the 1.9.x series reworked the timing scheduler
+        # that v1.8.3's adaptive mode corrupted the heap with (reproduced
+        # locally with zero FastAlloc code linked). Flags/API used here
+        # (--benchmark_min_time=3000x, repetitions, report_aggregates_only,
+        # BENCHMARK_MAIN) are unchanged in 1.9.x.
+        GIT_TAG v1.9.4
     )
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
