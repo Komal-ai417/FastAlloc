@@ -3,6 +3,11 @@
 #include <cstdlib>
 #include <vector>
 
+// Multithreaded registrations (->Threads) require google-benchmark >= v1.9.x
+// (CMake pins v1.9.4): v1.8.3's ThreadManager condition-variable machinery
+// crashes nondeterministically on Linux (upstream issue #1672: segfault in
+// StartStopBarrier/notify_all; the machinery was removed entirely in 1.9.x).
+
 using namespace FastAlloc;
 
 static void BM_MallocFree_Std(benchmark::State& state) {

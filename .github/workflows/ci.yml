@@ -63,6 +63,16 @@ jobs:
   # ---------------------------------------------------------------------------
   # MSVC AddressSanitizer (Linux sanitizers live in the jobs below; MSVC has
   # no TSan/LSan, so Windows gets an ASan-only job).
+  #
+  # ASan runs in the RELEASE config: MSVC ASan on top of a Debug build
+  # (/Od, no inlining, _ITERATOR_DEBUG_LEVEL=2) is pathologically slow —
+  # the full suite blew past ctest's default 1500 s timeout on the runner
+  # without completing, while the same suite passes the non-ASan Debug
+  # build-test job in normal time. Release keeps every ASan shadow check
+  # on the allocator + test code; the debug battery (incl. 11 death tests)
+  # remains covered by build-test's debug matrix entry. An explicit
+  # --timeout 1800 gives Release+ASan generous headroom over the observed
+  # ~minutes runtime.
   # ---------------------------------------------------------------------------
   windows-asan:
     name: windows-msvc-asan
@@ -71,13 +81,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug `
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
                 -DFASTALLOC_BUILD_TESTS=ON `
                 -DFASTALLOC_SANITIZE=address
       - name: Build
-        run: cmake --build build --config Debug -j --target fast_alloc_tests
+        run: cmake --build build --config Release -j --target fast_alloc_tests
       - name: Test
-        run: ctest --test-dir build --build-config Debug --output-on-failure
+        run: ctest --test-dir build --build-config Release --output-on-failure --timeout 1800
         env:
           ASAN_OPTIONS: halt_on_error=1
 
@@ -196,6 +206,25 @@ jobs:
   # — a pure google-benchmark v1.8.3 + allocator interplay). Fixed 'Nx' mode
   # provably avoids it and is deterministic across machines.
   #
+  # The library is pinned to v1.9.4 — this is the actual crash correction,
+  # NOT a workaround: v1.8.3's ThreadManager ends each threaded benchmark via
+  # a condition-variable machinery (alive_threads_ + end_condition_.
+  # notify_all()) that segfaults nondeterministically on Linux (upstream
+  # issue #1672, still open, GCC 9-12; also the barrier memory-ordering
+  # defect of issue #1963 — "multithreaded benchmarks fail during TearDown").
+  # The 1.9.x series REMOVED that machinery entirely (verified by direct
+  # source diff: NotifyThreadComplete is now a bare barrier removeThread).
+  # ALL multithreaded ->Threads(N) registrations are kept as-is: the buggy
+  # code they used to run through no longer exists.
+  #
+  # Each google-benchmark binary runs its benchmark FAMILIES in separate
+  # process invocations (family list discovered via --benchmark_list_tests,
+  # so coverage is exactly the '.*' filter). Family isolation means a crash
+  # in one family can never silently skip the remaining families — with a
+  # single '.*' invocation, a SIGSEGV aborts the whole binary and every
+  # later registration is lost. It also names the exact failing family in
+  # FAILURES.txt and captures a per-family gdb backtrace.
+  #
   # Every step is marked continue-on-error and records failures into
   # FAILURES.txt; a final gate step turns the job red, so one crash never
   # hides the results of the remaining steps. On Linux any crashing binary
@@ -251,67 +280,79 @@ jobs:
           echo "EXT=$EXT" >> "$GITHUB_ENV"
           mkdir -p crashlogs
 
-      # --- google/benchmark binaries: run every registered benchmark.
-      #     runbench: runs a binary; on nonzero exit (Linux) re-runs under gdb
-      #     to capture a backtrace. Always records the failure and continues. ---
-      - name: Run fast_alloc_bench (every benchmark)
+      # --- google/benchmark binaries: every registered benchmark, executed
+      #     family-by-family in separate processes (full '.*' coverage, but a
+      #     crash in one family cannot hide or abort the rest). Per family:
+      #     run -> (Linux) gdb backtrace if it crashed -> one retry ->
+      #     FLAKES.txt (transient, stays green) or FAILURES.txt (gate red). ---
+      - name: Run fast_alloc_bench (every benchmark, family-isolated)
         shell: bash
         continue-on-error: true
         run: |
-          rc=0
-          "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*' \
-            --benchmark_min_time=3000x --benchmark_repetitions=1 \
-            --benchmark_report_aggregates_only=false || rc=$?
-          if [ $rc -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
-            gdb -q -batch -ex 'set disable-randomization off' -ex run \
-              -ex 'bt 30' -ex 'info registers' \
-              --args "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*' \
+          FAMS=$("$BIN/fast_alloc_bench$EXT" --benchmark_list_tests=true \
+                 | sed 's|/.*||' | uniq)
+          echo "fast_alloc_bench families: $FAMS"
+          for fam in $FAMS; do
+            r1=0
+            "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
               --benchmark_min_time=3000x --benchmark_repetitions=1 \
-              --benchmark_report_aggregates_only=false \
-              2>&1 | tee crashlogs/fast_alloc_bench_gdb.txt
-          fi
-          if [ $rc -ne 0 ]; then
-            # transient runner kill? retry once: pass -> FLAKES, fail -> gate
-            sleep 5
-            rc2=0
-            "$BIN/fast_alloc_bench$EXT" --benchmark_filter='.*' \
-              --benchmark_min_time=3000x --benchmark_repetitions=1 \
-              --benchmark_report_aggregates_only=false || rc2=$?
-            if [ $rc2 -eq 0 ]; then
-              echo "fast_alloc_bench rc=$rc -> retry PASS (transient)" | tee -a FLAKES.txt
-            else
-              echo "fast_alloc_bench rc=$rc2 (failed twice)" | tee -a FAILURES.txt
+              --benchmark_report_aggregates_only=false || r1=$?
+            if [ $r1 -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+              gdb -q -batch -ex 'set disable-randomization off' -ex run \
+                -ex 'bt 30' -ex 'info registers' \
+                --args "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_${fam}_gdb.txt"
             fi
-          fi
+            if [ $r1 -ne 0 ]; then
+              # transient runner kill? retry once: pass -> FLAKES, fail -> gate
+              sleep 5
+              r2=0
+              "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r2=$?
+              if [ $r2 -eq 0 ]; then
+                echo "fast_alloc_bench/$fam rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+              else
+                echo "fast_alloc_bench/$fam rc=$r2 (failed twice)" | tee -a FAILURES.txt
+              fi
+            fi
+          done
 
-      - name: Run fast_alloc_bench_extended (every benchmark)
+      - name: Run fast_alloc_bench_extended (every benchmark, family-isolated)
         shell: bash
         continue-on-error: true
         run: |
-          rc=0
-          "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*' \
-            --benchmark_min_time=3000x --benchmark_repetitions=1 \
-            --benchmark_report_aggregates_only=false || rc=$?
-          if [ $rc -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
-            gdb -q -batch -ex 'set disable-randomization off' -ex run \
-              -ex 'bt 30' -ex 'info registers' \
-              --args "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*' \
+          FAMS=$("$BIN/fast_alloc_bench_extended$EXT" --benchmark_list_tests=true \
+                 | sed 's|/.*||' | uniq)
+          echo "fast_alloc_bench_extended families: $FAMS"
+          for fam in $FAMS; do
+            r1=0
+            "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
               --benchmark_min_time=3000x --benchmark_repetitions=1 \
-              --benchmark_report_aggregates_only=false \
-              2>&1 | tee crashlogs/fast_alloc_bench_extended_gdb.txt
-          fi
-          if [ $rc -ne 0 ]; then
-            sleep 5
-            rc2=0
-            "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter='.*' \
-              --benchmark_min_time=3000x --benchmark_repetitions=1 \
-              --benchmark_report_aggregates_only=false || rc2=$?
-            if [ $rc2 -eq 0 ]; then
-              echo "fast_alloc_bench_extended rc=$rc -> retry PASS (transient)" | tee -a FLAKES.txt
-            else
-              echo "fast_alloc_bench_extended rc=$rc2 (failed twice)" | tee -a FAILURES.txt
+              --benchmark_report_aggregates_only=false || r1=$?
+            if [ $r1 -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+              gdb -q -batch -ex 'set disable-randomization off' -ex run \
+                -ex 'bt 30' -ex 'info registers' \
+                --args "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_extended_${fam}_gdb.txt"
             fi
-          fi
+            if [ $r1 -ne 0 ]; then
+              sleep 5
+              r2=0
+              "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r2=$?
+              if [ $r2 -eq 0 ]; then
+                echo "fast_alloc_bench_extended/$fam rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+              else
+                echo "fast_alloc_bench_extended/$fam rc=$r2 (failed twice)" | tee -a FAILURES.txt
+              fi
+            fi
+          done
 
       # --- custom memory benchmark: full threads x sizes sweep ---
       - name: Run fast_alloc_bench_memory (threads 1/2/4 x sizes 64/256/4096)
