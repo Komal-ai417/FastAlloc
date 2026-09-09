@@ -6,6 +6,8 @@
 #include "debug_aid.h"
 
 #include <cstring>
+#include <cerrno>
+#include <atomic>
 #include <new>
 #include <limits>
 #include <cstdio>
@@ -40,18 +42,61 @@ inline std::size_t EffectivePageSize() {
 
 // v8 hardening telemetry (see fast_free): one-shot stderr on the first
 // out-of-range class index observed per process, silent afterwards.
+//
+// v9: compiled ONLY when its (release-path) call site exists. FASTALLOC_DEBUG
+// builds validate provenance through the registry instead and never call
+// this function, which left it unreferenced - Clang treats an unused static
+// inline function as -Wunused-function (a hard error under our -Werror) and
+// failed the ubuntu-latest-clang-debug CI job (Sep 2026). GCC does not warn
+// for unused static inline functions, which is why only the Clang job saw
+// it. Guarding the definition with the same condition as the call site is
+// the structural fix; no [[maybe_unused]] band-aid that would outlive the
+// call site it protects.
+#if !FASTALLOC_DEBUG_ENABLED
 inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 #if defined(__GNUC__) || defined(__clang__)
     if (__builtin_expect(class_index < NUM_SIZE_CLASSES, 1)) return;
 #endif
-    static bool reported = false;
-    if (!reported) {
-        reported = true;
+    // Atomic one-shot: two threads can observe the same corruption; the
+    // exchange guarantees exactly one full report line, race-free (TSan).
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
                      "[fastalloc-invariant] corrupt block header at %p: "
                      "class_index=%u >= %zu; block dropped (leaked), allocator "
                      "state protected\n",
                      ptr, class_index, NUM_SIZE_CLASSES);
+        std::fflush(stderr);
+    }
+}
+#endif // !FASTALLOC_DEBUG_ENABLED
+
+// v9 crash-survival guard: the lowest address any FastAlloc user pointer can
+// ever have. Blocks live inside mmap'd / pooled spans (multi-MB regions far
+// above this line); Linux keeps [0, 64KB) unmapped and Windows reserves the
+// first 64 KB as the null-pointer zone, so nothing below 64 KB can be a
+// valid block in either world.
+constexpr std::uintptr_t kMinCanonicalUserAddress = 0x10000;
+
+// One-shot telemetry for the v9 guard: the Sep-2026 runner crash faulted
+// exactly on this class of value - the benchmark's pointer array held 0x10
+// and the inlined fast_free read its header at [0x10 - 16] = 0x0, a SIGSEGV
+// at the NULL page (si_addr = 0, r12 = 0x10, fault in BM_MallocFree_FastAlloc
+// + 716, reproduced 3/3 on the runner and 0/700+ locally). The guard drops
+// the poisoned pointer (a one-block leak, once) so the run completes and the
+// event lands in the CI job log; the benchmark-side shadow guard (bench_main
+// .cpp) distinguishes "allocator returned it" from "slot overwritten after
+// the store" on the same occurrence.
+inline void ReportNonCanonicalFree(void* ptr) {
+    // Atomic one-shot: exactly one report line even when several threads
+    // trip the guard simultaneously (race-free under TSan).
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] free of non-canonical pointer %p "
+                     "(< 64 KB; never a FastAlloc block). Pointer dropped, "
+                     "allocator state protected.\n",
+                     ptr);
         std::fflush(stderr);
     }
 }
@@ -305,6 +350,16 @@ void* fast_malloc(std::size_t size) {
 void fast_free(void* ptr) {
     if (!ptr) return;
 
+    // v9 guard (see ReportNonCanonicalFree): reject a non-canonical pointer
+    // BEFORE the header read can fault. Any value below 64 KB is provably
+    // not one of our blocks; the old code dereferenced it immediately
+    // (ptr - 16 -> the NULL page) and killed the process.
+    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
+                      kMinCanonicalUserAddress)) {
+        ReportNonCanonicalFree(ptr);
+        return;
+    }
+
     FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);
     void* slab_field = block->slab;
 
@@ -391,6 +446,14 @@ void fast_free(void* ptr) {
 void fast_free_sized(void* ptr, std::size_t size) {
     if (!ptr) return;
 
+    // v9 guard: same non-canonical rejection as fast_free before the header
+    // read (this path also loads block->slab first).
+    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
+                      kMinCanonicalUserAddress)) {
+        ReportNonCanonicalFree(ptr);
+        return;
+    }
+
     if (FAST_UNLIKELY(size > MaxSmallRequest())) {
         fast_free(ptr); // large or aligned: full path
         return;
@@ -443,6 +506,15 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     }
     if (!ptr) {
         return fast_malloc(new_size);
+    }
+
+    // v9 guard: fast_realloc reads block->slab immediately below; reject a
+    // non-canonical pointer instead of faulting on its "header".
+    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
+                      kMinCanonicalUserAddress)) {
+        ReportNonCanonicalFree(ptr);
+        errno = EINVAL;
+        return nullptr;
     }
 
     FreeBlock* block = reinterpret_cast<FreeBlock*>(static_cast<char*>(ptr) - USER_OFFSET);

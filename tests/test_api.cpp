@@ -28,6 +28,23 @@ TEST(ApiTest, FreeNullIsNoop) {
     SUCCEED();
 }
 
+// v9 guard: a freed pointer below 64 KB can never be a FastAlloc block
+// (Linux keeps the first 64 KB unmapped, Windows reserves it). The old code
+// dereferenced ptr-16 immediately and faulted at the NULL page - the exact
+// signature of the Sep-2026 CI runner crash (ptr = 0x10, si_addr = 0x0).
+// The guard must drop the pointer and keep serving instead of crashing,
+// in release AND debug builds.
+TEST(ApiTest, FreeNonCanonicalPointerIsDroppedNotFatal) {
+    fast_free(reinterpret_cast<void*>(0x10));           // the runner-crash value
+    fast_free(reinterpret_cast<void*>(0x1000));        // anywhere in the null page
+    fast_free_sized(reinterpret_cast<void*>(0x20), 8); // sized path, same guard
+    void* live = fast_malloc(32);                       // allocator still serviceable
+    ASSERT_NE(live, nullptr);
+    std::memset(live, 0x5A, 32);
+    fast_free(live);
+    SUCCEED();
+}
+
 TEST(ApiTest, MallocZeroReturnsUniqueNonNull) {
     // Documented policy (glibc-compatible): unique non-null pointer.
     void* a = fast_malloc(0);

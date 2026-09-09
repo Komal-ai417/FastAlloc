@@ -211,22 +211,26 @@ jobs:
   # and is the correct modern pin. ALL multithreaded ->Threads(N)
   # registrations are kept: coverage is never reduced to work around a crash.
   #
-  # STATUS (Sep 2026, v8 - FIXED): the SIGSEGV in the BM_MallocFree_FastAlloc
-  # family (twice per attempt, faulting address 0x10 = [nullptr +
-  # offsetof(FreeBlock, next)], everything LTO-inlined into the benchmark
-  # frame) is root-caused and fixed in src/tls_cache.cpp + slab.h +
-  # global_heap.cpp + fast_alloc.cpp. Chain: one duplicate hand-out/free ->
-  # TLS-bin freelist cycle -> uint32 bin.count underflow -> the flush's
-  # UNGUARDED batch walk ran off the list end. The walk is now bounded and
-  # null-guarded with a self-healing path (count re-derived from the real
-  # list), duplicate pushes/returns are absorbed idempotently at the TLS and
-  # slab level, corrupted headers are bounded, and recycled thread caches
-  # reset every bin field. First occurrence per process prints one
-  # [fastalloc-invariant] line to stderr - visible in these tee'd logs and
-  # the bench-crash-diagnostics artifact. The deterministic local repro
-  # (old code: SIGSEGV at 0x10; new code: survives + heals) lives in the v8
-  # commit message. bench_crash_reporter.h + the gdb rerun stay as the
-  # independent safety net for any NEW crash class.
+  # STATUS (Sep 2026, v9 - GUARDED + INSTRUMENTED): two distinct crash
+  # signatures were observed on the runners. v8 fixed the first (faulting
+  # address 0x10 = [nullptr + offsetof(FreeBlock, next)]: the flush batch
+  # walk, guarded + self-healing in tls_cache.cpp, with idempotent duplicate
+  # push/return absorption and unconditional bin resets). The v8-era second
+  # signature is different: the free sweep faults at si_addr = 0x0 because a
+  # pointer-array slot holds 0x10 (inlined fast_free reads its header at
+  # [0x10 - 16] = 0x0); it reproduced 3/3 on the runner (tee'd run + gdb
+  # rerun + retry) and 0/700+ locally across release/ASan/TSan/isolated-case
+  # loops. v9 makes that class impossible to crash on AND decisive to
+  # diagnose: fast_free/fast_free_sized/fast_realloc now reject non-canonical
+  # pointers (< 64 KB - provably never a FastAlloc block) BEFORE the header
+  # read, with one-shot [fastalloc-invariant] stderr, and the benchmark keeps
+  # a provenance SHADOW of its pointer array whose comparison on violation
+  # prints [bench-guard] with the slot index, value and verdict
+  # (allocator-returned vs overwritten-after-store). The healed events are
+  # surfaced by the 'Surface healed invariant telemetry' step below, so the
+  # next occurrence prints its provenance directly in the job log. The
+  # v8 [fastalloc-invariant] channels, bench_crash_reporter.h and the gdb
+  # rerun stay as the independent safety net for any NEW crash class.
   #
   # Each google-benchmark binary runs its benchmark FAMILIES in separate
   # process invocations (family list discovered via --benchmark_list_tests,
@@ -446,6 +450,26 @@ jobs:
             done
           done
           if [ $rc -ne 0 ]; then echo "bench_suite rc=$rc (see FAILURES.txt above)"; fi
+
+      # --- v9: surface HEALED invariant events. The guards above keep the
+      #     benchmarks alive when the (Sep-2026) corruption class recurs, so
+      #     the event would otherwise only live inside the tee'd crashlog
+      #     files. This step greps every capture for the one-shot telemetry
+      #     lines and prints them into the job log - a green run with healed
+      #     events is visible as such, with full provenance. ---
+      - name: Surface healed invariant telemetry (v9)
+        shell: bash
+        run: |
+          if ls crashlogs/*.txt >/dev/null 2>&1; then
+            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]' crashlogs/*.txt >/dev/null 2>&1; then
+              echo "=== HEALED INVARIANT EVENTS (benchmarks survived; provenance below) ==="
+              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]' crashlogs/*.txt || true
+            else
+              echo "No invariant events: allocator ran clean."
+            fi
+          else
+            echo "No crashlogs captured: allocator ran clean."
+          fi
 
       # --- gate: turn the job red if ANY benchmark failed twice above ---
       - name: Check benchmark results
