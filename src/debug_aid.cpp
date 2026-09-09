@@ -377,7 +377,11 @@ void AllocRegistry::ResetForTesting() {
 namespace {
 std::atomic<ViolationHandler> g_handler{ nullptr };
 
-void DefaultViolationHandler(const ViolationInfo& info) {
+// Marked [[noreturn]] (it always ends in std::abort()): ReportViolation can
+// then call it unconditionally as its final statement without any code after
+// the call, so no unreachable statement ever exists for MSVC /W4 to flag
+// (see the note inside ReportViolation).
+[[noreturn]] void DefaultViolationHandler(const ViolationInfo& info) {
     const char* what = "unknown";
     switch (info.kind) {
         case Violation::DoubleFree:        what = "DOUBLE FREE"; break;
@@ -420,22 +424,23 @@ void SetViolationHandler(ViolationHandler handler) {
 [[noreturn]] void ReportViolation(const ViolationInfo& info) {
     ViolationHandler h = g_handler.load(std::memory_order_acquire);
     if (h) {
-        h(info); // test hook; must terminate the process or longjmp out
+        h(info); // test hook; contract: terminate the process or longjmp out
     }
+    // Reached both when no handler is installed and when a misbehaving
+    // custom handler RETURNS: the [[noreturn]] default handler then still
+    // terminates the process, so this [[noreturn]] function can never fall
+    // off the end.
+    //
+    // Structure note (MSVC /W4 /WX + /O2 /GL): the old code kept a literal
+    // std::abort() HERE, after a call that always aborts - provably
+    // unreachable code, which C4702 flags. A #pragma warning(disable:4702)
+    // around it worked on the older MSVC backends, but the /GL-affected
+    // backend started re-raising the diagnostic regardless (CI, Sep 2026:
+    // error C2220 + LNK1257 on windows-latest). The function is therefore
+    // structured with NO statement after the last call at all: both
+    // [[noreturn]] annotations hold, control cannot escape, and there is
+    // nothing for any compiler version to flag as unreachable.
     DefaultViolationHandler(info);
-    // Unreachable when the default handler behaves (it ends in std::abort),
-    // but a [[noreturn]] function that could fall off the end would be UB,
-    // so keep the belt-and-suspenders terminator. MSVC /W4 flags this as
-    // C4702 (unreachable code) in some configurations - it is INTENTIONALLY
-    // unreachable, hence the local suppression.
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4702)
-#endif
-    std::abort();
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 }
 
 // ===========================================================================

@@ -206,16 +206,21 @@ jobs:
   # — a pure google-benchmark v1.8.3 + allocator interplay). Fixed 'Nx' mode
   # provably avoids it and is deterministic across machines.
   #
-  # The library is pinned to v1.9.4 — this is the actual crash correction,
-  # NOT a workaround: v1.8.3's ThreadManager ends each threaded benchmark via
-  # a condition-variable machinery (alive_threads_ + end_condition_.
-  # notify_all()) that segfaults nondeterministically on Linux (upstream
-  # issue #1672, still open, GCC 9-12; also the barrier memory-ordering
-  # defect of issue #1963 — "multithreaded benchmarks fail during TearDown").
-  # The 1.9.x series REMOVED that machinery entirely (verified by direct
-  # source diff: NotifyThreadComplete is now a bare barrier removeThread).
-  # ALL multithreaded ->Threads(N) registrations are kept as-is: the buggy
-  # code they used to run through no longer exists.
+  # The library is pinned to v1.9.4: the 1.9.x series removed v1.8.3's
+  # ThreadManager teardown machinery and its adaptive-mode heap corruption,
+  # and is the correct modern pin. ALL multithreaded ->Threads(N)
+  # registrations are kept: coverage is never reduced to work around a crash.
+  #
+  # STATUS (Sep 2026): a SIGSEGV in the BM_MallocFree_FastAlloc family
+  # reproduces ONLY on ubuntu-latest runners (twice per attempt). The
+  # identical binary and flags pass 25+ local runs (release, TSan, ASan,
+  # CPU-hog preemption pressure, per-size isolated family reruns) and the
+  # allocator's cross-thread return path passed a line-by-line audit, so the
+  # failure is runner-environment-specific. Both google-benchmark binaries
+  # therefore install bench_crash_reporter.h: a SIGSEGV handler that prints
+  # the faulting address and a raw backtrace into THIS log at crash time
+  # (symbolize with addr2line). The gdb rerun below is the second,
+  # independent channel.
   #
   # Each google-benchmark binary runs its benchmark FAMILIES in separate
   # process invocations (family list discovered via --benchmark_list_tests,
@@ -223,7 +228,8 @@ jobs:
   # in one family can never silently skip the remaining families — with a
   # single '.*' invocation, a SIGSEGV aborts the whole binary and every
   # later registration is lost. It also names the exact failing family in
-  # FAILURES.txt and captures a per-family gdb backtrace.
+  # FAILURES.txt and captures a per-family gdb backtrace, and the final gate
+  # step prints those captures into the job log.
   #
   # Every step is marked continue-on-error and records failures into
   # FAILURES.txt; a final gate step turns the job red, so one crash never
@@ -428,6 +434,16 @@ jobs:
           if [ -s FAILURES.txt ]; then
             echo "=== BENCHMARK FAILURES ==="
             cat FAILURES.txt
+            # Surface the captured forensics (the in-binary [bench-crash]
+            # backtraces and the gdb reruns) directly in the job log so the
+            # failure cause is visible without opening the artifact.
+            if ls crashlogs/*.txt >/dev/null 2>&1; then
+              echo "=== CRASH FORENSICS (last 80 lines per capture) ==="
+              for f in crashlogs/*.txt; do
+                echo "--- $f ---"
+                tail -n 80 "$f" || true
+              done
+            fi
             exit 1
           fi
           echo "all benchmarks passed"

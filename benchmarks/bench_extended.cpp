@@ -1,15 +1,18 @@
 #include <benchmark/benchmark.h>
 #include "fast_alloc.h"
+#include "bench_crash_reporter.h" // self-diagnosing crash backtraces in the CI log
 #include <cstdlib>
 #include <vector>
 #include <random>
 #include <algorithm>
 #include <thread>
 
-// Multithreaded registrations (->Threads) require google-benchmark >= v1.9.x
-// (CMake pins v1.9.4): v1.8.3's ThreadManager condition-variable machinery
-// crashes nondeterministically on Linux (upstream issue #1672: segfault in
-// StartStopBarrier/notify_all; the machinery was removed entirely in 1.9.x).
+// Multithreaded registrations (->Threads) are KEPT, per the project decision:
+// benchmark coverage is never reduced to work around a crash. google-benchmark
+// is pinned at v1.9.4 (CMake): the 1.9.x series removed v1.8.3's ThreadManager
+// teardown machinery and its adaptive-mode heap corruption, and is the correct
+// modern pin regardless. See bench_main.cpp for the runner-crash forensics
+// notes (bench_crash_reporter.h + CI gdb step).
 
 using namespace FastAlloc;
 
