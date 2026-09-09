@@ -211,16 +211,22 @@ jobs:
   # and is the correct modern pin. ALL multithreaded ->Threads(N)
   # registrations are kept: coverage is never reduced to work around a crash.
   #
-  # STATUS (Sep 2026): a SIGSEGV in the BM_MallocFree_FastAlloc family
-  # reproduces ONLY on ubuntu-latest runners (twice per attempt). The
-  # identical binary and flags pass 25+ local runs (release, TSan, ASan,
-  # CPU-hog preemption pressure, per-size isolated family reruns) and the
-  # allocator's cross-thread return path passed a line-by-line audit, so the
-  # failure is runner-environment-specific. Both google-benchmark binaries
-  # therefore install bench_crash_reporter.h: a SIGSEGV handler that prints
-  # the faulting address and a raw backtrace into THIS log at crash time
-  # (symbolize with addr2line). The gdb rerun below is the second,
-  # independent channel.
+  # STATUS (Sep 2026, v8 - FIXED): the SIGSEGV in the BM_MallocFree_FastAlloc
+  # family (twice per attempt, faulting address 0x10 = [nullptr +
+  # offsetof(FreeBlock, next)], everything LTO-inlined into the benchmark
+  # frame) is root-caused and fixed in src/tls_cache.cpp + slab.h +
+  # global_heap.cpp + fast_alloc.cpp. Chain: one duplicate hand-out/free ->
+  # TLS-bin freelist cycle -> uint32 bin.count underflow -> the flush's
+  # UNGUARDED batch walk ran off the list end. The walk is now bounded and
+  # null-guarded with a self-healing path (count re-derived from the real
+  # list), duplicate pushes/returns are absorbed idempotently at the TLS and
+  # slab level, corrupted headers are bounded, and recycled thread caches
+  # reset every bin field. First occurrence per process prints one
+  # [fastalloc-invariant] line to stderr - visible in these tee'd logs and
+  # the bench-crash-diagnostics artifact. The deterministic local repro
+  # (old code: SIGSEGV at 0x10; new code: survives + heals) lives in the v8
+  # commit message. bench_crash_reporter.h + the gdb rerun stay as the
+  # independent safety net for any NEW crash class.
   #
   # Each google-benchmark binary runs its benchmark FAMILIES in separate
   # process invocations (family list discovered via --benchmark_list_tests,
@@ -289,23 +295,41 @@ jobs:
       # --- google/benchmark binaries: every registered benchmark, executed
       #     family-by-family in separate processes (full '.*' coverage, but a
       #     crash in one family cannot hide or abort the rest). Per family:
-      #     run -> (Linux) gdb backtrace if it crashed -> one retry ->
-      #     FLAKES.txt (transient, stays green) or FAILURES.txt (gate red). ---
+      #     run (line-buffered, tee'd to crashlogs so the last COMPLETED case
+      #     line + the [bench-crash] handler output identify the exact
+      #     crashing case) -> (Linux) gdb rerun with backtrace, registers,
+      #     the faulting instruction window, $_siginfo (faulting address) and
+      #     the process mappings -> one retry -> FLAKES.txt (transient, stays
+      #     green) or FAILURES.txt (gate red). ---
       - name: Run fast_alloc_bench (every benchmark, family-isolated)
         shell: bash
         continue-on-error: true
         run: |
+          set -o pipefail
           FAMS=$("$BIN/fast_alloc_bench$EXT" --benchmark_list_tests=true \
                  | sed 's|/.*||' | uniq)
           echo "fast_alloc_bench families: $FAMS"
           for fam in $FAMS; do
             r1=0
-            "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
-              --benchmark_min_time=3000x --benchmark_repetitions=1 \
-              --benchmark_report_aggregates_only=false || r1=$?
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              stdbuf -oL "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_${fam}_raw.txt" || r1=$?
+            else
+              "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r1=$?
+            fi
             if [ $r1 -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
-              gdb -q -batch -ex 'set disable-randomization off' -ex run \
-                -ex 'bt 30' -ex 'info registers' \
+              gdb -q -batch \
+                -ex 'set disable-randomization off' \
+                -ex run \
+                -ex 'bt 30' \
+                -ex 'info registers' \
+                -ex 'x/12i $pc-32' \
+                -ex 'p $_siginfo' \
+                -ex 'info proc mappings' \
                 --args "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
                 --benchmark_min_time=3000x --benchmark_repetitions=1 \
                 --benchmark_report_aggregates_only=false \

@@ -10,13 +10,15 @@
 // teardown machinery and its adaptive-mode heap corruption, and is the correct
 // modern pin regardless.
 //
-// The Sep-2026 runner crash (BM_MallocFree_FastAlloc family, SIGSEGV, twice
-// per attempt) survived the v1.8.3 -> v1.9.4 upgrade and reproduces ONLY on
-// ubuntu-latest runners: the identical binary and flags pass 25+ local runs
-// (release / TSan / ASan / preemption-pressure, per-size isolated) and the
-// cross-thread return path passed a full audit. bench_crash_reporter.h (above)
-// plus the CI gdb forensics step make the next runner occurrence print its
-// backtrace directly into the job log, which pins the faulting frame.
+// The Sep-2026 runner crash (BM_MallocFree_FastAlloc family, SIGSEGV at
+// [nullptr + 16], twice per attempt) is FIXED in v8: one duplicate
+// hand-out/free built a TLS-bin freelist cycle, the bin count underflowed,
+// and the cache flush's unguarded batch walk ran off the list end. The walk
+// is now guarded and self-healing (src/tls_cache.cpp), duplicate pushes and
+// slab returns are absorbed idempotently (tls_cache.h, slab.h), and any
+// recurrence prints an [fastalloc-invariant] line into this log. The
+// bench_crash_reporter.h handler and the CI gdb forensics remain as the
+// independent safety net for any new crash class.
 
 using namespace FastAlloc;
 

@@ -2,6 +2,7 @@
 #include "global_heap.h"
 #include "os_memory.h"
 #include "debug_aid.h"
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 #include <new>
@@ -9,6 +10,53 @@
 namespace FastAlloc {
 
 FAST_THREAD_LOCAL TLSCache* fast_path_cache = nullptr;
+
+// ===========================================================================
+// Sep-2026 runner-crash forensics + self-healing (v8)
+//
+// The benchmarks-ubuntu-latest SIGSEGV (fast_alloc_bench /
+// BM_MallocFree_FastAlloc, rc=139 twice per attempt, faulting instruction at
+// [curr+16] with curr == nullptr, everything inlined by LTO) traced to
+// DeallocateBlockSlow's batch walk running UNguarded batch_size-1 steps and
+// dereferencing the result. That is only reachable when a bin's count
+// over-reports its list length - the fingerprint of the same block being
+// handed out twice (or freed twice): a duplicate push links block->next onto
+// the block itself or duplicates a node in the list, count/list diverge, and
+// a later flush walks past the end. The two guards below make the failure
+// impossible AND observable: the duplicate-push of a bin head is turned into
+// an idempotent no-op, and a short list is flushed whole with count
+// re-derived from reality. First occurrence per process prints one line to
+// stderr (-> CI job log via the tee'd crashlogs); the allocator keeps
+// serving - no benchmark is ever killed.
+// ===========================================================================
+namespace {
+
+std::atomic<std::uint64_t> g_double_push_guard_hits{0};
+std::atomic<std::uint64_t> g_bin_heal_events{0};
+
+void PrintInvariantEvent(const char* kind, std::size_t class_index,
+                          std::uint32_t claimed, std::size_t actual) {
+    std::fprintf(stderr,
+                 "[fastalloc-invariant] %s: class=%zu count=%u list=%zu "
+                 "(duplicate hand-out/free upstream); guarded, self-healed. "
+                 "Total guard=%llu heal=%llu\n",
+                 kind, class_index, claimed, actual,
+                 (unsigned long long)g_double_push_guard_hits.load(
+                     std::memory_order_relaxed),
+                 (unsigned long long)g_bin_heal_events.load(
+                     std::memory_order_relaxed));
+    std::fflush(stderr);
+}
+
+} // namespace
+
+void ReportDoublePushGuard() {
+    std::uint64_t n =
+        g_double_push_guard_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1) {
+        PrintInvariantEvent("double-push guard", 0, 0, 0);
+    }
+}
 
 // ===========================================================================
 // TLSCache recycling pool (thread-lifecycle optimization)
@@ -265,17 +313,24 @@ void TLSCache::FlushToGlobalHeap() {
             } else {
                 GlobalHeap::GetInstance().DeallocateBatchClass(i, bins_[i].head);
             }
-            bins_[i].head = nullptr;
-            bins_[i].count = 0;
-            // Reset the adaptive refill ramp: the next owner of this (recycled
-            // or fresh) cache starts from the initial small batch. Without
-            // this, next_refill doubles on every thread's miss and each
-            // short-lived thread carves hundreds of virgin slab blocks
-            // (first-touch page faults) it will only hand back at exit.
-            // Long-lived threads ramp back up within a few misses, so steady
-            // throughput is unaffected.
-            bins_[i].next_refill = 0;
         }
+        // UNCONDITIONAL reset (v8): previously only bins with a non-null
+        // head were cleared, so a bin whose count had diverged from its
+        // (empty) list carried the stale count into the recycling pool and
+        // detonated in the cache's next owner (the next push saw a count
+        // already over CACHE_LIMITS and the flush walk ran off the list).
+        // Clearing every bin field - head, count AND the refill ramp -
+        // matches the documented intent: the next owner starts clean.
+        bins_[i].head = nullptr;
+        bins_[i].count = 0;
+        // Reset the adaptive refill ramp: the next owner of this (recycled
+        // or fresh) cache starts from the initial small batch. Without
+        // this, next_refill doubles on every thread's miss and each
+        // short-lived thread carves hundreds of virgin slab blocks
+        // (first-touch page faults) it will only hand back at exit.
+        // Long-lived threads ramp back up within a few misses, so steady
+        // throughput is unaffected.
+        bins_[i].next_refill = 0;
     }
     for (std::size_t i = 0; i < NUM_LARGE_CLASSES; ++i) {
         LargeFreeEntry* entry = large_free_bins_[i];
@@ -352,9 +407,35 @@ void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
 
     CacheBin& bin = bins_[class_index];
     FreeBlock* head = bin.head;
+
+    // Guarded batch walk (v8 fix for the Sep-2026 runner SIGSEGV): the old
+    // loop ran batch_size-1 UNGUARDED 'curr = curr->next' steps and then
+    // dereferenced curr, faulting at [nullptr + offsetof(FreeBlock, next)]
+    // whenever the list was shorter than the count claimed. The walk is
+    // bounded AND null-guarded now; the null-exit takes the self-healing
+    // path below instead of faulting.
     FreeBlock* curr = head;
-    for (std::size_t i = 1; i < batch_size; ++i) {
+    std::size_t walked = 1; // nodes in [head, curr]
+    while (walked < batch_size && curr != nullptr) {
         curr = curr->next;
+        ++walked;
+    }
+
+    if (FAST_UNLIKELY(curr == nullptr)) {
+        // Invariant broken: the real list length is walked-1 while bin.count
+        // claimed >= CACHE_LIMITS[class_index]. Heal: flush the ENTIRE real
+        // list, re-derive count from reality, reset the refill ramp, keep
+        // this thread cache fully serviceable. (The next refill rewrites
+        // count from the batch's true length, so the bin is exact again.)
+        if (g_bin_heal_events.fetch_add(1, std::memory_order_relaxed) == 0) {
+            PrintInvariantEvent("bin count/list divergence", class_index,
+                                bin.count, walked - 1);
+        }
+        bin.head = nullptr;
+        bin.count = 0;
+        bin.next_refill = 0;
+        GlobalHeap::GetInstance().DeallocateBatchClass(class_index, head);
+        return;
     }
 
     bin.head = curr->next;

@@ -47,3 +47,6 @@ Thumbs.db
 
 # FetchContent leaves nothing behind in-tree, but guard anyway
 _deps/
+
+# Local verification build trees (v8 session)
+build_*/

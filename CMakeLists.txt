@@ -58,6 +58,23 @@ else()
         if(NOT WIN32)
             add_compile_options("$<$<CONFIG:Release>:-fno-plt>")
         endif()
+        # Clang >= 19 understands AVX10 and diagnoses -march=native feature
+        # sets that implicitly promote: on the new AVX10.1-256 Xeon-class
+        # CI runners it emits
+        #   "invalid feature combination: +avx10.1-256; will be promoted to
+        #    avx10.1-512"  [-Winvalid-feature-combination]
+        # The promoted target is exactly what the hardware supports, so the
+        # diagnostic is benign - but our global -Werror (which also reaches
+        # the googletest/google-benchmark subprojects via the directory
+        # scope) escalated it into a build failure (ubuntu-latest-clang-
+        # release, Sep 2026). Demote ONLY this one diagnostic to a warning,
+        # and only on Clang >= 19: older Clang does not know the option and
+        # would itself warn about the unknown flag (which -Werror would
+        # escalate). GCC never emits this diagnostic.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+           CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
+            add_compile_options(-Wno-error=invalid-feature-combination)
+        endif()
     endif()
 endif()
 

@@ -32,6 +32,11 @@ namespace FastAlloc {
 class TLSCache;
 extern FAST_THREAD_LOCAL TLSCache* fast_path_cache;
 
+// Sep-2026 runner-crash forensics: fired by the TLS bin guards below, defined
+// in tls_cache.cpp. One-shot stderr (first occurrence per process) so the
+// event lands in the CI job log; later occurrences are silent.
+void ReportDoublePushGuard();
+
 class TLSCache {
 public:
     static inline TLSCache& GetFast() {
@@ -55,6 +60,20 @@ public:
 
     inline void DeallocateBlock(std::size_t class_index, FreeBlock* block) {
         CacheBin& bin = bins_[class_index];
+        if (FAST_UNLIKELY(bin.head == block)) {
+            // Idempotent-free guard (Sep-2026 runner crash root):
+            // 'block' is already this bin's head - a double free, or the
+            // same block handed out twice upstream. Pushing it again would
+            // store block->next = block (a self-cycle) which corrupts the
+            // count/list invariant and eventually walks off the list end
+            // (SIGSEGV at [nullptr + 16]). A later push of a NON-head
+            // duplicate is absorbed by the guarded, self-healing flush in
+            // DeallocateBlockSlow. bin.head == block is only reachable via
+            // that duplicate push: the head always IS a list member, and a
+            // legitimate free never pushes an already-free block.
+            ReportDoublePushGuard();
+            return;
+        }
         block->next = bin.head;
         bin.head = block;
         bin.count++;

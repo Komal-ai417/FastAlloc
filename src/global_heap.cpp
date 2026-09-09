@@ -444,6 +444,18 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
 
     while (actual_count < target_count && !slab->IsFull()) {
         FreeBlock* block = static_cast<FreeBlock*>(slab->Allocate());
+        if (FAST_UNLIKELY(!block)) {
+            // v8 fix: Slab::Allocate() returned null although !IsFull() said
+            // the slab still had free blocks - its free_blocks counter is
+            // over-reporting (the fingerprint of a block double-return:
+            // free_blocks incremented twice for one physical block). The old
+            // code linked the nullptr into the batch: the first null was
+            // appended (silently corrupting actual_count), the second wrote
+            // through the null tail and faulted at [nullptr + 16] - the
+            // same fault signature as the Sep-2026 runner crash. Stop
+            // extracting instead and hand out only the real blocks taken.
+            break;
+        }
         if (!head) {
             head = block;
             tail = block;

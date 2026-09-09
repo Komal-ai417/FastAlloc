@@ -38,6 +38,24 @@ inline std::size_t EffectivePageSize() {
     return OSMemory::GetPageSize();
 }
 
+// v8 hardening telemetry (see fast_free): one-shot stderr on the first
+// out-of-range class index observed per process, silent afterwards.
+inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_expect(class_index < NUM_SIZE_CLASSES, 1)) return;
+#endif
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] corrupt block header at %p: "
+                     "class_index=%u >= %zu; block dropped (leaked), allocator "
+                     "state protected\n",
+                     ptr, class_index, NUM_SIZE_CLASSES);
+        std::fflush(stderr);
+    }
+}
+
 inline std::size_t PageRoundUp(std::size_t n) {
     std::size_t page = EffectivePageSize();
     return (n + page - 1) & ~(page - 1);
@@ -351,6 +369,16 @@ void fast_free(void* ptr) {
     TLSCache::GetFast().CountSmallFree(rec.size);
     TLSCache::GetFast().DeallocateBlock(rec.class_or_large, block);
 #else
+    // v8 hardening: the class index comes from the block header; a corrupted
+    // value >= NUM_SIZE_CLASSES would index past the 512-entry TLS bins_
+    // array (and CACHE_LIMITS) and silently corrupt the thread cache object.
+    // The debug registry catches provenance; this is the release-side bound.
+    // A corrupted header cannot be routed safely, so the block is dropped
+    // (a leak, once) instead of corrupting the allocator.
+    if (FAST_UNLIKELY(block->class_index >= NUM_SIZE_CLASSES)) {
+        ReportCorruptClassIndex(ptr, block->class_index);
+        return;
+    }
     TLSCache& tls = TLSCache::GetFast();
     tls.CountSmallFree(UsableSize(block->class_index));
     tls.DeallocateBlock(block->class_index, block);
