@@ -116,6 +116,34 @@ constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 // "pointer from the block universe" applies the SAME canonicity test.
 constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
 
+// v11 hardening constant: the UPPER canonicality bound. The Sep-2026 v10
+// runner run produced the closing datapoint: the benchmark's pointer array
+// held 0xd90b6085fe368400 - 16-byte aligned, above 64 KB, and therefore
+// PAST every v10 check - and the inlined fast_free dereferenced [ptr-16]
+// into the non-canonical half of the address space, which the CPU rejects
+// with #GP (SIGSEGV, si_code=SI_KERNEL=128, si_addr=0: the "faulting
+// address (nil)" red herring). x86-64 canonical addresses are strictly
+// below 0x0000_8000_0000_0000; no FastAlloc block, span or stash can ever
+// live there, and Windows/ARM64-usermode pointers stay below it too.
+constexpr std::uintptr_t kMaxCanonicalUserPtr = 0x0000800000000000ull;
+
+// v11: the ONE shared plausibility predicate for every value that is about
+// to be dereferenced as, or returned as, a FastAlloc pointer (block, user
+// pointer, freelist link, stash raw pointer). Three fused tests:
+//   * >= 64 KB          (null page / small-int garbage: the v9 0x10 class)
+//   * <  2^47           (non-canonical garbage: the v10 0xd90b... class -
+//                        #GP kills the process with faulting address (nil))
+//   * 16-byte aligned   (every block/user/large/span pointer FastAlloc
+//                        produces is 16-aligned by construction; a
+//                        misaligned value is a forged or shifted pointer)
+// fast_aligned_alloc clamps alignment to >= 16, so no legitimate return is
+// ever rejected by the alignment test.
+inline bool IsPlausibleHeapPtr(const void* p) {
+    const std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
+    return v >= kMinCanonicalUserPtr && v < kMaxCanonicalUserPtr &&
+           (v & (std::uintptr_t)0xF) == 0;
+}
+
 // Effective maximum request size served by the slab path (audit M4 fix:
 // this named constant now documents what the code actually does).
 constexpr std::size_t USER_OFFSET = 16;

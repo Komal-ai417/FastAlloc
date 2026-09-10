@@ -41,6 +41,11 @@ void ReportDoublePushGuard();
 // non-canonical value (small integer). Same one-shot discipline.
 void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head);
 
+// v11: fired when a freelist link or batch head fails the full plausibility
+// predicate (non-canonical, sub-64KB or misaligned). One-shot.
+void ReportWildFreelistLink(const char* where, std::size_t class_index,
+                             std::uintptr_t bad_link);
+
 // v10 forensics: audit the calling thread's TLSCache AND the cross-thread
 // cache-recycling pool for pointers into [lo, hi). Returns hit count.
 std::size_t AuditCurrentThreadCache(const void* lo, const void* hi);
@@ -56,8 +61,14 @@ public:
     inline void* AllocateBlock(std::size_t class_index) {
         CacheBin& bin = bins_[class_index];
         FreeBlock* block = bin.head;
-        if (FAST_LIKELY(reinterpret_cast<std::uintptr_t>(block) >=
-                        kMinCanonicalUserPtr)) {
+        // v11: the FULL plausibility predicate (>=64KB, <2^47, 16-aligned).
+        // The v10 pop guard only rejected sub-64KB heads; the runner's v10
+        // run proved the missing class: a non-canonical 16-aligned value
+        // (0xd90b6085fe368400) sailed through and 'block->next' dereferenced
+        // the non-canonical half -> #GP -> SIGSEGV(si_code=128, faulting
+        // address (nil)). Both bounds plus alignment are now enforced before
+        // ANY dereference of a head.
+        if (FAST_LIKELY(IsPlausibleHeapPtr(block))) {
             bin.head = block->next;
             bin.count--;
             return block;
@@ -83,6 +94,18 @@ public:
     void* AllocateBlockSlow(std::size_t class_index);
 
     inline void DeallocateBlock(std::size_t class_index, FreeBlock* block) {
+        // v11 push guard: the store below writes through 'block' (its 'next'
+        // field at block+16). A wild block pointer - non-canonical,
+        // misaligned or sub-64KB - would turn the push itself into the wild
+        // write that corrupts whatever the pointer happens to target (on the
+        // runner: foreign pages). The v10 run showed freed wild pointers are
+        // the vector by which slot-adjacent memory gets scribbled; the guard
+        // drops them instead, one leak instead of one corruption.
+        if (FAST_UNLIKELY(!IsPlausibleHeapPtr(block))) {
+            ReportWildFreelistLink("DeallocateBlock(push)", class_index,
+                                   reinterpret_cast<std::uintptr_t>(block));
+            return;
+        }
         CacheBin& bin = bins_[class_index];
         if (FAST_UNLIKELY(bin.head == block)) {
             // Idempotent-free guard (Sep-2026 runner crash root):

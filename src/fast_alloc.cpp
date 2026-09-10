@@ -76,8 +76,8 @@ inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 // above this line); Linux keeps [0, 64KB) unmapped and Windows reserves the
 // first 64 KB as the null-pointer zone, so nothing below 64 KB can be a
 // valid block in either world. (v10: moved to fast_alloc_config.h as
-// kMinCanonicalUserPtr so the TLS pop guard applies the SAME test.)
-constexpr std::uintptr_t kMinCanonicalUserAddress = kMinCanonicalUserPtr;
+// kMinCanonicalUserPtr; v11: the local alias was superseded entirely by
+// IsPlausibleHeapPtr and removed - one predicate, one home.)
 
 // v10 hardening: is 'alloc_size' a value the large path can trust? A live
 // large header always carries the page-rounded SPAN size (>= one page, a
@@ -109,24 +109,48 @@ inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
     }
 }
 
-// One-shot telemetry for the v9 guard: the Sep-2026 runner crash faulted
-// exactly on this class of value - the benchmark's pointer array held 0x10
-// and the inlined fast_free read its header at [0x10 - 16] = 0x0, a SIGSEGV
-// at the NULL page (si_addr = 0, r12 = 0x10, fault in BM_MallocFree_FastAlloc
-// + 716, reproduced 3/3 on the runner and 0/700+ locally). The guard drops
-// the poisoned pointer (a one-block leak, once) so the run completes and the
-// event lands in the CI job log; the benchmark-side shadow guard (bench_main
-// .cpp) distinguishes "allocator returned it" from "slot overwritten after
-// the store" on the same occurrence.
+// One-shot telemetry for the v9/v11 guard: the Sep-2026 runner crashes
+// faulted exactly on this class of value. v9: the benchmark's pointer array
+// held 0x10 and the inlined fast_free read its header at [0x10 - 16] = 0x0,
+// a SIGSEGV at the NULL page. v10 (closing datapoint): the array held
+// 0xd90b6085fe368400 - 16-aligned, >= 64 KB, NON-CANONICAL - which passed
+// every v10 check, and [ptr-16] landed in the non-canonical half: the CPU
+// raises #GP and the kernel reports si_code=SI_KERNEL(128) with
+// si_addr=0 ("faulting address (nil)", reproduced 3/3 on the runner,
+// 0/650+ locally). The guard now applies the FULL plausibility predicate
+// (>= 64 KB, < 2^47, 16-aligned) and drops the poisoned pointer (a
+// one-block leak, once) so the run completes and the event lands in the
+// CI job log; the benchmark-side store-time witness (bench_main.cpp)
+// distinguishes "allocator returned it" from "slot overwritten after the
+// store" on the same occurrence.
 inline void ReportNonCanonicalFree(void* ptr) {
     // Atomic one-shot: exactly one report line even when several threads
     // trip the guard simultaneously (race-free under TSan).
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
-                     "[fastalloc-invariant] free of non-canonical pointer %p "
-                     "(< 64 KB; never a FastAlloc block). Pointer dropped, "
-                     "allocator state protected.\n",
+                     "[fastalloc-invariant] free of non-plausible pointer %p "
+                     "(fails <64KB / <2^47 / 16-aligned; never a FastAlloc "
+                     "block). Pointer dropped, allocator state protected.\n",
+                     ptr);
+        std::fflush(stderr);
+    }
+}
+
+// v11: one-shot telemetry when fast_malloc/fast_aligned_alloc is about to
+// RETURN a value that fails the plausibility predicate. Defense-in-depth:
+// the pop/batch guards upstream should make this unreachable, but the
+// runner's codegen surprises (the v10 binary even dropped the bench's
+// alignment check from the hot path) justify a final gate on every exit.
+// The block is leaked (once) and nullptr is returned instead of handing a
+// wild pointer to the caller.
+inline void ReportWildReturnValue(void* ptr) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] refusing to return non-plausible "
+                     "pointer %p from fast_malloc (leaked, nullptr returned "
+                     "instead).\n",
                      ptr);
         std::fflush(stderr);
     }
@@ -332,6 +356,12 @@ void* fast_malloc(std::size_t size) {
         TLSCache& tls = TLSCache::GetFast();
         void* cached_mem = tls.AllocateLargeCached(alloc_size);
         if (cached_mem) {
+            // v11 final gate (same rationale as the small path): never hand
+            // the caller a non-plausible pointer.
+            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(cached_mem))) {
+                ReportWildReturnValue(cached_mem);
+                return nullptr;
+            }
             // Count the span's usable bytes (header->alloc_size is the exact
             // page-rounded span): fast_free counts the same quantity, so
             // alloc/free stay balanced and current_live_bytes never
@@ -361,6 +391,15 @@ void* fast_malloc(std::size_t size) {
     if (FAST_UNLIKELY(!block)) return nullptr;
 
     void* user = reinterpret_cast<char*>(block) + USER_OFFSET;
+    // v11 final gate: never hand the caller a pointer that fails the full
+    // plausibility predicate. Upstream pop/batch guards make this belt-and-
+    // braces, but the v10 runner run proved codegen can defeat expectations;
+    // this is the last exit before the value escapes into user code (and
+    // into the benchmark's slot array, where the v10 crash was born).
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(user))) {
+        ReportWildReturnValue(user);
+        return nullptr;
+    }
 #if FASTALLOC_DEBUG_ENABLED
     DebugOnAllocSmall(user, size, class_index);
     // Exact requested bytes: the debug registry's free path counts rec.size.
@@ -381,12 +420,14 @@ void* fast_malloc(std::size_t size) {
 void fast_free(void* ptr) {
     if (!ptr) return;
 
-    // v9 guard (see ReportNonCanonicalFree): reject a non-canonical pointer
-    // BEFORE the header read can fault. Any value below 64 KB is provably
-    // not one of our blocks; the old code dereferenced it immediately
-    // (ptr - 16 -> the NULL page) and killed the process.
-    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
-                      kMinCanonicalUserAddress)) {
+    // v9/v11 guard (see ReportNonCanonicalFree): reject a non-plausible
+    // pointer BEFORE the header read can fault. v9 caught sub-64KB values
+    // (0x10 -> [ptr-16] = the NULL page); v11 completes the predicate with
+    // the upper canonicality bound and alignment - the v10 runner crash
+    // dereferenced 0xd90b6085fe368400-16 in the non-canonical half of the
+    // address space, which faults with #GP (si_code=SI_KERNEL=128,
+    // si_addr=0 - the "faulting address (nil)" signature).
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         return;
     }
@@ -486,10 +527,9 @@ void fast_free(void* ptr) {
 void fast_free_sized(void* ptr, std::size_t size) {
     if (!ptr) return;
 
-    // v9 guard: same non-canonical rejection as fast_free before the header
-    // read (this path also loads block->slab first).
-    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
-                      kMinCanonicalUserAddress)) {
+    // v9/v11 guard: same full-plausibility rejection as fast_free before
+    // the header read (this path also loads block->slab first).
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         return;
     }
@@ -559,10 +599,10 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         return fast_malloc(new_size);
     }
 
-    // v9 guard: fast_realloc reads block->slab immediately below; reject a
-    // non-canonical pointer instead of faulting on its "header".
-    if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(ptr) <
-                      kMinCanonicalUserAddress)) {
+    // v9/v11 guard: fast_realloc reads block->slab immediately below; reject
+    // a non-plausible pointer (full predicate: <64KB / >=2^47 / misaligned)
+    // instead of faulting on its "header".
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         errno = EINVAL;
         return nullptr;
@@ -577,6 +617,18 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             static_cast<char*>(ptr) - 32);
         std::size_t old_size = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 8);
+        // v11: the stash lives in the raw block's user area - user data can
+        // corrupt it (that is its threat model). A forged alignment would
+        // make fast_aligned_alloc return nullptr (it validates power-of-two
+        // range), but a forged old_size would drive the memcpy length below
+        // straight into unmapped memory. Reject absurd values outright.
+        if (FAST_UNLIKELY(alignment < ALIGNMENT || alignment > 4096 ||
+                          (alignment & (alignment - 1)) != 0 ||
+                          old_size > (1ull << 30))) {
+            ReportCorruptLargeHeader(ptr, old_size);
+            errno = EINVAL;
+            return nullptr;
+        }
         if (new_size <= old_size) {
             // Keep alignment; record the new logical size in the stash so a
             // later grow-copy moves exactly the live bytes.

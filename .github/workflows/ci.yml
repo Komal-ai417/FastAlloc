@@ -211,35 +211,50 @@ jobs:
   # and is the correct modern pin. ALL multithreaded ->Threads(N)
   # registrations are kept: coverage is never reduced to work around a crash.
   #
-  # STATUS (Sep 2026, v10 - HARDENED + WRITER-TRAPPING): three crash-
+  # STATUS (Sep 2026, v11 - CRASH CLASS CLOSED BY CONSTRUCTION): four crash
   # signature generations on the runners, each closed in turn. v8 fixed the
-  # batch-walk fault (0x10 = [nullptr+offsetof(next)]). v9 made non-canonical
-  # frees (si_addr = 0x0, pointer-array slot holding 0x10) heal instead of
-  # crash. The v9 CI run then produced the decisive datapoint: [bench-guard]
-  # ptrs[0..2]=0x10 DETERMINISTICALLY in both the tee'd run AND the gdb
-  # rerun (different ASLR) - 0/1000+ locally. v9's post-sweep shadow could
-  # not say WHO wrote it (a wild write during the sweep corrupted the array
-  # and the snapshot identically). v10:
-  #   1. Allocator hardening, three holes closed BY CONSTRUCTION: corrupt
-  #      TLS bin heads self-heal on pop (kMinCanonicalUserPtr test in
-  #      tls_cache.h); a zeroed/scribbled large header is rejected before
-  #      its bogus alloc_size can poison the TLS large cache
-  #      (LargeHeaderSizePlausible in fast_alloc.cpp); fast_free_sized
-  #      cross-checks the caller's size hint against the block's own
-  #      header, so a wrong hint can never route a block into a foreign
-  #      bin (the undersized-handout -> user-overflow -> next-header
-  #      corruption chain).
-  #   2. The benchmark's pointer array is now a TRAP: its own page with
-  #      PROT_NONE guard pages on both sides, mprotect(PROT_READ)-frozen
-  #      for the whole free sweep, and a store-time witness buffer. The
-  #      next occurrence of the runner-only wild write faults AT THE
-  #      WRITER'S INSTRUCTION (backtrace in the job log), and the audit
-  #      API (fast_alloc_audit_pointers) dumps every allocator head
-  #      pointer targeting the array's region.
-  #   3. The healed-event surfacing step below now also greps
-  #      [fastalloc-audit] and store-time [bench-guard] lines.
-  # The v8 [fastalloc-invariant] channels, bench_crash_reporter.h and the
-  # gdb rerun stay as the independent safety net for any NEW crash class.
+  # batch-walk fault (0x10 = [nullptr+offsetof(next)]). v9 made sub-64KB
+  # frees (slot holding 0x10) heal instead of crash. v10 turned the
+  # benchmark into a writer trap with a store-time witness. The v10 CI run
+  # then produced the CLOSING datapoints (full crashlogs, beyond the 80-line
+  # tails): (a) "fast_malloc returned non-canonical 0x10 (i=0)" on the very
+  # first allocation, (b) ~3000 per-sweep audit pairs = the audit firing
+  # every iteration because the slots re-corrupt during the ALLOC phase
+  # (page writable, trap blind) - none were signal faults; the 10x row-time
+  # inflation was pure audit cost, (c) the fatal SIGSEGV's gdb register
+  # dump: rbx = slots[i] = 0xd90b6085fe368400 - 16-byte aligned, >= 64 KB,
+  # NON-CANONICAL - past every v10 check (>= 64 KB only) - and the inlined
+  # fast_free loaded block->slab at [ptr-16] in the non-canonical half:
+  # #GP -> si_code=SI_KERNEL(128), si_addr=0 ("faulting address (nil)"),
+  # 3/3 on the runner, 0/650+ locally (the runner's GCC also emitted the
+  # free loop without the alignment test the local build has - codegen
+  # differences are real, so guards must not rely on source shape).
+  # v11:
+  #   1. ONE shared full plausibility predicate, IsPlausibleHeapPtr
+  #      (fast_alloc_config.h): >= 64 KB AND < 2^47 AND 16-aligned. Applied
+  #      at EVERY dereference/return site: fast_free / fast_free_sized /
+  #      fast_realloc entry, the TLS pop guard, the batch-head validation,
+  #      the fast_malloc return gates, and every freelist walk in
+  #      tls_cache.cpp / global_heap.cpp (pending queues, arena splits,
+  #      slab extraction). The #GP class is unreachable in any codegen.
+  #   2. DeallocateBlock (push) guard: a wild block pointer can no longer
+  #      turn a freelist push into the wild write itself.
+  #   3. The benchmark frees ONLY witness-proven pointers (value == the
+  #      recorded store-time fast_malloc return); anything else is dropped
+  #      with full provenance (slot overwritten vs allocator-returned), so
+  #      no forged value can reach the allocator from the bench, and the
+  #      freelist-corruption cycle is starved instead of sustained.
+  #   4. Multi-shot rate-limited telemetry (first 8 in full detail, then
+  #      every 1024th, totals at instance end) - the v10 one-shot design
+  #      had already been consumed by the 0x10 event and blinded exactly
+  #      the crash datapoint. The audit is capped at 3 per instance (the
+  #      per-sweep audit was the 10x row-time inflation).
+  #   5. The crash handler now prints si_code with the faulting address and
+  #      the faulting RIP, and HEALS write faults inside the registered
+  #      trap pages (mprotect RW + retry) with the writer's backtrace - a
+  #      free-s-phase writer can no longer kill the run either.
+  # The [fastalloc-invariant] channels, the [bench-trap] heal reports and
+  # the gdb rerun stay as the independent safety net for any NEW class.
   #
   # Each google-benchmark binary runs its benchmark FAMILIES in separate
   # process invocations (family list discovered via --benchmark_list_tests,
@@ -474,13 +489,14 @@ jobs:
       #     lines and prints them into the job log - a green run with healed
       #     events is visible as such, with full provenance (v10 adds the
       #     store-time witness verdicts and the [fastalloc-audit] dumps). ---
-      - name: Surface healed invariant telemetry (v10)
+      - name: Surface healed invariant telemetry (v11)
         shell: bash
         run: |
           if ls crashlogs/*.txt >/dev/null 2>&1; then
-            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]' crashlogs/*.txt >/dev/null 2>&1; then
+            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]|\[bench-trap\]' crashlogs/*.txt >/dev/null 2>&1; then
               echo "=== HEALED INVARIANT EVENTS (benchmarks survived; provenance below) ==="
-              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]' crashlogs/*.txt || true
+              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]|\[bench-trap\]' crashlogs/*.txt | head -80 || true
+              echo "--- (truncated to first 80 lines; full logs in the artifact) ---"
             else
               echo "No invariant events: allocator ran clean."
             fi

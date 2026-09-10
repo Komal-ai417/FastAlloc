@@ -72,6 +72,24 @@ void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
     }
 }
 
+// v11: one-shot telemetry for any freelist link / batch head / push target
+// that fails the full plausibility predicate. This is the class the v10
+// runner crash proved: 16-aligned, >=64KB, NON-CANONICAL values passed every
+// v10 check and were dereferenced. The guard sites drop the wild value
+// instead (leak-once discipline); this line lands in the CI job log.
+void ReportWildFreelistLink(const char* where, std::size_t class_index,
+                             std::uintptr_t bad_link) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] wild freelist value at %s: "
+                     "class=%zu value=%#zx (fails <64KB / <2^47 / 16-aligned "
+                     "plausibility). Dropped, allocator state protected.\n",
+                     where, class_index, bad_link);
+        std::fflush(stderr);
+    }
+}
+
 // ===========================================================================
 // TLSCache recycling pool (thread-lifecycle optimization)
 //
@@ -399,16 +417,42 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
 
     if (!batch_head) return nullptr;
 
+    // v11: the batch head is dereferenced immediately below (pop + prefetch
+    // walk). A corrupt global-side list could hand a wild head here; the
+    // full plausibility predicate stops it before any dereference. The bin
+    // stays empty and the caller sees a miss - the next refill retries.
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(batch_head))) {
+        ReportWildFreelistLink("AllocateBlockSlow(batch head)", class_index,
+                               reinterpret_cast<std::uintptr_t>(batch_head));
+        return nullptr;
+    }
+
 #if defined(__GNUC__) || defined(__clang__)
     FreeBlock* curr = batch_head;
     for (int i = 0; i < 4 && curr; ++i) {
         __builtin_prefetch(curr, 0, 1);
-        curr = curr->next;
+        // v11: the prefetch walk chases 'curr->next' through the batch's
+        // user-area links; a wild link would fault the read. Stop the walk
+        // at the first implausible value (prefetch itself never faults, the
+        // load does).
+        FreeBlock* nxt = curr->next;
+        curr = IsPlausibleHeapPtr(nxt) ? nxt : nullptr;
     }
 #endif
 
     FreeBlock* block = batch_head;
-    bins_[class_index].head = block->next;
+    // v11: same guard for the pop's 'block->next' read - a wild tail link
+    // would be parked as the new bin head (and dereferenced on the next
+    // pop). Park nullptr instead: the bin count below is then re-derived on
+    // the next refill (count was unknowable either way).
+    FreeBlock* rest = block->next;
+    if (FAST_UNLIKELY(rest != nullptr && !IsPlausibleHeapPtr(rest))) {
+        ReportWildFreelistLink("AllocateBlockSlow(pop rest)", class_index,
+                               reinterpret_cast<std::uintptr_t>(rest));
+        rest = nullptr;
+        if (actual_count > 1) actual_count = 1;
+    }
+    bins_[class_index].head = rest;
     bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
 
     return block;
@@ -428,10 +472,20 @@ void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
     // whenever the list was shorter than the count claimed. The walk is
     // bounded AND null-guarded now; the null-exit takes the self-healing
     // path below instead of faulting.
+    // v11: each link is additionally validated with the FULL plausibility
+    // predicate before it is dereferenced again - the v10 runner crash
+    // class (non-canonical 16-aligned garbage in a link) would otherwise
+    // survive the null guard and fault with #GP (faulting address (nil)).
     FreeBlock* curr = head;
     std::size_t walked = 1; // nodes in [head, curr]
     while (walked < batch_size && curr != nullptr) {
-        curr = curr->next;
+        FreeBlock* nxt = curr->next;
+        if (FAST_UNLIKELY(nxt != nullptr && !IsPlausibleHeapPtr(nxt))) {
+            ReportWildFreelistLink("DeallocateBlockSlow(walk)", class_index,
+                                   reinterpret_cast<std::uintptr_t>(nxt));
+            nxt = nullptr; // treat as list end -> self-heal path flushes
+        }
+        curr = nxt;
         ++walked;
     }
 
@@ -469,6 +523,17 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
     std::size_t cls = LargeSizeToClass(size);
     LargeFreeEntry** pp = &large_free_bins_[cls];
     while (*pp) {
+        // v11: the walk dereferences each entry (alloc_size read, ->next
+        // chase). Validate the entry with the full plausibility predicate
+        // first; a wild entry is cut off at the node BEFORE it (this node's
+        // ->next was already validated when we advanced here) - never
+        // dereferenced, one leak, once.
+        if (FAST_UNLIKELY(!IsPlausibleHeapPtr(*pp))) {
+            ReportWildFreelistLink("AllocateLargeCached(walk)", cls,
+                                   reinterpret_cast<std::uintptr_t>(*pp));
+            *pp = nullptr; // wild tail: cut the bin here, rest is dropped
+            continue;
+        }
         if ((*pp)->alloc_size >= size) {
             LargeFreeEntry* entry = *pp;
             *pp = entry->next;

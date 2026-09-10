@@ -106,6 +106,79 @@ TEST(ApiTest, FreeWithCorruptLargeHeaderIsDroppedNotCached) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// v11 guards: the closing datapoint of the Sep-2026 runner crash was a slot
+// holding 0xd90b6085fe368400 - 16-byte aligned, >= 64 KB, NON-CANONICAL. It
+// passed every v10 check (>= 64 KB only) and the inlined fast_free read its
+// header at [ptr-16] in the non-canonical half of the address space: the CPU
+// raises #GP and the kernel reports si_code=SI_KERNEL(128) with si_addr=0
+// ("faulting address (nil)"). The v11 predicate completes the checks with
+// the upper bound (< 2^47) and 16-alignment; all three free/resize entry
+// points must drop such values and keep serving, in release AND debug.
+// ---------------------------------------------------------------------------
+TEST(ApiTest, FreeNonCanonicalHighPointerIsDroppedNotFatal) {
+    // The exact runner-crash value class (16-aligned, >= 64 KB, >= 2^47).
+    fast_free(reinterpret_cast<void*>(0xd90b6085fe368400ull));
+    // The canonical boundary itself and beyond.
+    fast_free(reinterpret_cast<void*>(0x0000800000000000ull));
+    fast_free(reinterpret_cast<void*>(0xffffffffff600000ull));
+    // Same class through the sized and realloc paths.
+    fast_free_sized(reinterpret_cast<void*>(0xd90b6085fe368400ull), 8);
+    errno = 0;
+    void* r = fast_realloc(reinterpret_cast<void*>(0xd90b6085fe368400ull), 128);
+    EXPECT_EQ(r, nullptr);
+    EXPECT_EQ(errno, EINVAL);
+
+    // Allocator stays fully serviceable afterwards.
+    void* live = fast_malloc(64);
+    ASSERT_NE(live, nullptr);
+    std::memset(live, 0x5A, 64);
+    fast_free(live);
+    SUCCEED();
+}
+
+TEST(ApiTest, FreeMisalignedPointerIsDroppedNotFatal) {
+    // Canonical and above 64 KB but NOT 16-byte aligned: every real FastAlloc
+    // user pointer is 16-aligned by construction (fast_aligned_alloc clamps
+    // alignment to >= 16), so a misaligned value is forged or shifted.
+    fast_free(reinterpret_cast<void*>(0x00007f0000001008ull));
+    fast_free(reinterpret_cast<void*>(0x0000555555555555ull + 8));
+    fast_free_sized(reinterpret_cast<void*>(0x00007f0000001008ull), 16);
+    errno = 0;
+    void* r = fast_realloc(reinterpret_cast<void*>(0x00007f0000001008ull), 64);
+    EXPECT_EQ(r, nullptr);
+    EXPECT_EQ(errno, EINVAL);
+
+    void* live = fast_malloc(48);
+    ASSERT_NE(live, nullptr);
+    fast_free_sized(live, 48); // matching-hint fast path still works
+    SUCCEED();
+}
+
+// v11: every pointer the allocator hands out must satisfy the full shared
+// plausibility predicate (>= 64 KB, < 2^47, 16-aligned) - small, large and
+// aligned paths alike. This is the forward contract the free-side guards
+// rely on: a legitimate return is never rejected later.
+TEST(ApiTest, AllReturnsPassFullPlausibility) {
+    const std::size_t sizes[] = {1, 8, 16, 24, 64, 100, 256, 1024, 4096,
+                                 8192, 8193, 16 * 1024, 256 * 1024,
+                                 1024 * 1024};
+    for (std::size_t size : sizes) {
+        void* p = fast_malloc(size);
+        ASSERT_NE(p, nullptr);
+        EXPECT_TRUE(IsPlausibleHeapPtr(p)) << "size=" << size;
+        fast_free_sized(p, size);
+    }
+    for (std::size_t align : {16u, 32u, 64u, 4096u}) {
+        void* p = fast_aligned_alloc(align, 128);
+        ASSERT_NE(p, nullptr);
+        EXPECT_TRUE(IsPlausibleHeapPtr(p)) << "align=" << align;
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p) % align, 0u);
+        fast_free(p);
+    }
+    SUCCEED();
+}
+
 TEST(ApiTest, MallocZeroReturnsUniqueNonNull) {
     // Documented policy (glibc-compatible): unique non-null pointer.
     void* a = fast_malloc(0);

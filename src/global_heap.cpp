@@ -1,4 +1,5 @@
 #include "global_heap.h"
+#include "tls_cache.h" // v11: ReportWildFreelistLink (definition in tls_cache.cpp)
 #include "os_memory.h"
 #include "debug_aid.h"
 #include <algorithm>
@@ -363,11 +364,64 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
 // Returns memory, moves full->partial, frees empty slabs. Also the fallback
 // for over-long pending lists (which keeps the queues short and the slab
 // free lists warm with recently-faulted blocks).
+namespace {
+
+// v11 freelist-walk guard: validates one link before it is dereferenced.
+// Freelist links live in the USER AREA of blocks (FreeBlock::next @ +16), so
+// any stale-user-data / UAF / wild write lands exactly there - the v10
+// runner run carried non-canonical 16-aligned garbage (0xd90b6085fe368400)
+// through these lists and the old walks dereferenced it blindly. A link that
+// fails the full plausibility predicate (<64KB / <2^47 / 16-aligned) is
+// treated as end-of-list: the walk stops, the remainder is dropped (leak-
+// once discipline), the caller's existing self-healing paths absorb it.
+inline bool WalkLinkPlausible(FreeBlock* node, const char* where,
+                               std::size_t class_index) {
+    if (node == nullptr) return true; // list end: fine
+    if (IsPlausibleHeapPtr(node)) return true;
+    ReportWildFreelistLink(where, class_index,
+                           reinterpret_cast<std::uintptr_t>(node));
+    return false;
+}
+
+// v11 slab-field guard: every batch walk dereferences block->slab (IsFull /
+// Deallocate / arena_index). A wild-but-plausible slab with an out-of-range
+// arena_index would index past the 16-entry stack tables; validate both.
+// (kArenaCount mirrors GlobalHeap::NUM_ARENAS, which is private; a mismatch
+// would be caught by the arena tables' own bounds discipline and the test
+// suite's cross-thread coverage.)
+inline bool BlockSlabUsable(FreeBlock* node, const char* where,
+                            std::size_t class_index) {
+    constexpr uint32_t kArenaCount = 16; // == GlobalHeap::NUM_ARENAS
+    Slab* slab = node->slab;
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(slab) ||
+                      slab->arena_index >= kArenaCount)) {
+        ReportWildFreelistLink(where, class_index,
+                               reinterpret_cast<std::uintptr_t>(slab));
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* pending) {
     if (!pending) return;
     Arena& arena = arenas_[arena_index];
     while (pending) {
+        // v11: validate node + slab metadata before the dereferences below
+        // (the pending queue is fed by lock-free MPSC pushes; a corrupted
+        // link must not reach slab->IsFull / Deallocate).
+        if (FAST_UNLIKELY(!WalkLinkPlausible(pending, "ProcessPendingList",
+                                             class_index) ||
+                          !BlockSlabUsable(pending, "ProcessPendingList(slab)",
+                                           class_index))) {
+            return;
+        }
         FreeBlock* next = pending->next;
+        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "ProcessPendingList(next)",
+                                             class_index))) {
+            next = nullptr;
+        }
         Slab* slab = pending->slab;
 
 #if FASTALLOC_DEBUG_ENABLED
@@ -445,7 +499,7 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
 
     while (actual_count < target_count && !slab->IsFull()) {
         FreeBlock* block = static_cast<FreeBlock*>(slab->Allocate());
-        if (FAST_UNLIKELY(!block)) {
+        if (FAST_UNLIKELY(!block || !IsPlausibleHeapPtr(block))) {
             // v8 fix: Slab::Allocate() returned null although !IsFull() said
             // the slab still had free blocks - its free_blocks counter is
             // over-reporting (the fingerprint of a block double-return:
@@ -455,6 +509,12 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
             // through the null tail and faulted at [nullptr + 16] - the
             // same fault signature as the Sep-2026 runner crash. Stop
             // extracting instead and hand out only the real blocks taken.
+            // v11: a non-null but non-plausible block (wild slab freelist
+            // head) is treated the same way - never linked into the batch.
+            if (block) {
+                ReportWildFreelistLink("ExtractBlocksFromSlab", class_index,
+                                       reinterpret_cast<std::uintptr_t>(block));
+            }
             break;
         }
         if (!head) {
@@ -500,13 +560,37 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
         PendingList& pl = arena.pending_returns_[class_index];
         FreeBlock* pending = pl.head.exchange(nullptr, std::memory_order_acquire);
         if (pending) {
+            // v11: a popped pending head is dereferenced immediately; a wild
+            // head (corrupt MPSC queue) is rejected whole (leak, once) and
+            // the refill falls through to the slab paths below.
+            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(pending))) {
+                ReportWildFreelistLink("AllocateBatch(pending head)",
+                                       class_index,
+                                       reinterpret_cast<std::uintptr_t>(pending));
+                pending = nullptr;
+            }
+        }
+        if (pending) {
             FreeBlock* split = pending;
             std::size_t taken = 1;
             while (taken < target_count && split->next) {
-                split = split->next;
+                // v11: validate the link before chasing it - the walk below
+                // (and the 'split->next = nullptr' cut) dereference it.
+                FreeBlock* nxt = split->next;
+                if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt))) {
+                    ReportWildFreelistLink("AllocateBatch(feed walk)",
+                                           class_index,
+                                           reinterpret_cast<std::uintptr_t>(nxt));
+                    break;
+                }
+                split = nxt;
                 ++taken;
             }
             FreeBlock* rest_head = split->next;
+            if (FAST_UNLIKELY(rest_head != nullptr &&
+                              !IsPlausibleHeapPtr(rest_head))) {
+                rest_head = nullptr; // wild tail: cut here, drop the rest
+            }
             split->next = nullptr;
             result = pending;
             actual_count = taken;
@@ -515,6 +599,12 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
                 FreeBlock* tail = rest_head;
                 std::size_t len = 1;
                 while (tail->next && len < kFeedMaxList) {
+                    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(tail->next))) {
+                        ReportWildFreelistLink("AllocateBatch(remainder walk)",
+                                               class_index,
+                                               reinterpret_cast<std::uintptr_t>(tail->next));
+                        break;
+                    }
                     tail = tail->next;
                     ++len;
                 }
@@ -550,13 +640,32 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
                 PendingList& pl2 = arenas_[a2].pending_returns_[class_index];
                 FreeBlock* p2 = pl2.head.exchange(nullptr, std::memory_order_acquire);
                 if (p2) {
+                    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(p2))) {
+                        ReportWildFreelistLink("AllocateBatch(steal head)",
+                                               class_index,
+                                               reinterpret_cast<std::uintptr_t>(p2));
+                        p2 = nullptr;
+                    }
+                }
+                if (p2) {
                     FreeBlock* split2 = p2;
                     std::size_t taken2 = 1;
                     while (actual_count + taken2 < target_count && split2->next) {
-                        split2 = split2->next;
+                        FreeBlock* nxt2 = split2->next;
+                        if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt2))) {
+                            ReportWildFreelistLink("AllocateBatch(steal walk)",
+                                                   class_index,
+                                                   reinterpret_cast<std::uintptr_t>(nxt2));
+                            break;
+                        }
+                        split2 = nxt2;
                         ++taken2;
                     }
                     FreeBlock* rest2 = split2->next;
+                    if (FAST_UNLIKELY(rest2 != nullptr &&
+                                      !IsPlausibleHeapPtr(rest2))) {
+                        rest2 = nullptr; // wild tail: cut, drop the rest
+                    }
                     split2->next = nullptr;
                     // Append the stolen batch to the result (result is short).
                     if (!result) {
@@ -564,7 +673,18 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
                         actual_count = taken2;
                     } else {
                         FreeBlock* tailr = result;
-                        while (tailr->next) tailr = tailr->next;
+                        while (tailr->next) {
+                            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(tailr->next))) {
+                                ReportWildFreelistLink("AllocateBatch(append walk)",
+                                                       class_index,
+                                                       reinterpret_cast<std::uintptr_t>(tailr->next));
+                                break;
+                            }
+                            tailr = tailr->next;
+                        }
+                        // v11: if the append walk stopped on a wild link, cut
+                        // the result there and append the stolen batch after
+                        // the cut; the wild tail is dropped (leak, once).
                         tailr->next = p2;
                         actual_count += taken2;
                     }
@@ -600,6 +720,11 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
 void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
     (void)slab;
     FreeBlock* block = static_cast<FreeBlock*>(ptr);
+    // v11: the stores below write through 'block'; never push a wild value.
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(block) || !BlockSlabUsable(
+            block, "GlobalHeap::DeallocateBlock(slab)", block->class_index))) {
+        return;
+    }
     block->next = nullptr;
     DeallocateBatchClass(block->class_index, block);
 }
@@ -617,7 +742,16 @@ void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
 void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails) {
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) { heads[i] = nullptr; tails[i] = nullptr; }
     while (head) {
+        // v11: stop at the first wild link (the rest of the list is dropped
+        // - one leak, once) and drop blocks whose slab metadata is unusable.
+        if (FAST_UNLIKELY(!WalkLinkPlausible(head, "SplitListByArena", 0) ||
+                          !BlockSlabUsable(head, "SplitListByArena(slab)", 0))) {
+            return;
+        }
         FreeBlock* next = head->next;
+        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "SplitListByArena(next)", 0))) {
+            next = nullptr;
+        }
         uint32_t arena_index = head->slab->arena_index;
         if (!heads[arena_index]) {
             heads[arena_index] = head;
@@ -697,7 +831,19 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
     Arena& arena = arenas_[arena_index];
     FreeBlock* curr = list;
     while (curr) {
+        // v11: validate the node and its slab metadata before dereferencing;
+        // a wild node or unusable slab ends the batch here (dropped, once).
+        if (FAST_UNLIKELY(!WalkLinkPlausible(curr, "ProcessBatchLocked",
+                                             class_index) ||
+                          !BlockSlabUsable(curr, "ProcessBatchLocked(slab)",
+                                           class_index))) {
+            return;
+        }
         FreeBlock* next = curr->next;
+        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "ProcessBatchLocked(next)",
+                                             class_index))) {
+            next = nullptr;
+        }
         Slab* slab = curr->slab;
         bool was_full = slab->IsFull();
         slab->Deallocate(curr);
@@ -726,7 +872,17 @@ void GlobalHeap::DeallocateBatch(FreeBlock* head) {
     std::array<FreeBlock*, NUM_ARENAS> arena_tails{};
 
     while (head) {
+        // v11: validate node + slab metadata (the phase split dereferences
+        // head->slab->arena_index and indexes the stack tables with it); a
+        // wild node ends the batch (dropped, once).
+        if (FAST_UNLIKELY(!WalkLinkPlausible(head, "DeallocateBatch", 0) ||
+                          !BlockSlabUsable(head, "DeallocateBatch(slab)", 0))) {
+            return;
+        }
         FreeBlock* next = head->next;
+        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "DeallocateBatch(next)", 0))) {
+            next = nullptr;
+        }
         uint32_t arena_index = head->slab->arena_index;
 
         if (!arena_heads[arena_index]) {
@@ -753,7 +909,17 @@ void GlobalHeap::DeallocateBatch(FreeBlock* head) {
 
         FreeBlock* curr = arena_heads[i];
         while (curr) {
+            // v11: same per-step validation for the class split (it indexes
+            // the 512-entry class tables with slab->block_size arithmetic).
+            if (FAST_UNLIKELY(!WalkLinkPlausible(curr, "DeallocateBatch(class)", 0) ||
+                              !BlockSlabUsable(curr, "DeallocateBatch(class slab)", 0))) {
+                curr = nullptr;
+                break;
+            }
             FreeBlock* next = curr->next; // save: we rewire curr below
+            if (FAST_UNLIKELY(!WalkLinkPlausible(next, "DeallocateBatch(class next)", 0))) {
+                next = nullptr;
+            }
             std::size_t cls = SizeToClassIndex(curr->slab->block_size);
             if (!cls_heads[cls]) {
                 cls_heads[cls] = curr;
