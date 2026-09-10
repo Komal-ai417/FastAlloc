@@ -107,6 +107,15 @@ constexpr std::size_t PAGE_SIZE = 4096;   // Minimum/typical OS page size (fallb
 constexpr std::size_t MAX_SLAB_SIZE = 8192;   // Allocations above this size bypass TLS/Slabs
 constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 
+// v10 hardening constant: the lowest address any FastAlloc user pointer (or
+// freelist node) can ever legitimately hold. Blocks live inside mmap'd /
+// pooled spans far above this line; Linux keeps [0, 64 KB) unmapped and
+// Windows reserves the first 64 KB, so nothing below it can be a valid
+// block in either world. Shared by the free-path guards (fast_alloc.cpp)
+// and the TLS freelist pop guard (tls_cache.h) so every consumer of a
+// "pointer from the block universe" applies the SAME canonicity test.
+constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
+
 // Effective maximum request size served by the slab path (audit M4 fix:
 // this named constant now documents what the code actually does).
 constexpr std::size_t USER_OFFSET = 16;

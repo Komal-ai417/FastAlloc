@@ -101,6 +101,19 @@ void fast_alloc_purge();
 void fast_alloc_purge_thread_cache();
 
 /**
+ * @brief Forensics: print every allocator-internal pointer that falls inside
+ *        [lo, hi), naming the structure that holds it.
+ *
+ * Called by instrumented clients (the benchmark guard) when they observe
+ * memory corruption, to answer "did a corrupted allocator pointer target my
+ * region?". Scans the calling thread's TLS bin heads, the thread-cache pool,
+ * every arena's partial/full/pending head arrays and the page-bin heads -
+ * pointer arrays only, no foreign dereferences, safe to call in any state.
+ * One call, one report block on stderr. Zero cost when never called.
+ */
+void fast_alloc_audit_pointers(const void* lo, const void* hi);
+
+/**
  * @brief Sets the runtime log level: 0=off 1=error 2=warning 3=info 4=debug 5=trace.
  * Requires a build with FASTALLOC_LOGGING (implied by FASTALLOC_DEBUG);
  * no-op otherwise. The initial level can also be set via the

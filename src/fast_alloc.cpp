@@ -75,8 +75,39 @@ inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 // ever have. Blocks live inside mmap'd / pooled spans (multi-MB regions far
 // above this line); Linux keeps [0, 64KB) unmapped and Windows reserves the
 // first 64 KB as the null-pointer zone, so nothing below 64 KB can be a
-// valid block in either world.
-constexpr std::uintptr_t kMinCanonicalUserAddress = 0x10000;
+// valid block in either world. (v10: moved to fast_alloc_config.h as
+// kMinCanonicalUserPtr so the TLS pop guard applies the SAME test.)
+constexpr std::uintptr_t kMinCanonicalUserAddress = kMinCanonicalUserPtr;
+
+// v10 hardening: is 'alloc_size' a value the large path can trust? A live
+// large header always carries the page-rounded SPAN size (>= one page, a
+// page multiple, sane magnitude). A block whose header was zeroed
+// (madvise'd span) or scribbled reads 0 / garbage here; the OLD code
+// trusted it unconditionally, then pushed the bogus entry into the TLS
+// large cache, from which AllocateLargeCached could later hand it out as
+// fresh memory - a silent cross-arena aliasing machine. The check is one
+// compare on an already-loaded word.
+inline bool LargeHeaderSizePlausible(std::size_t alloc_size) {
+    const std::size_t page = EffectivePageSize();
+    return alloc_size >= page && (alloc_size % page) == 0 &&
+           alloc_size < (1ull << 48);
+}
+
+// v10: one-shot telemetry when a forged/zeroed header is rejected on the
+// large path (fast_free / fast_realloc). Referenced from BOTH the debug and
+// release discrimination paths, so it is compiled unconditionally - no
+// -Wunused-function exposure under FASTALLOC_DEBUG (the v9 lesson).
+inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] corrupt large header at %p: "
+                     "alloc_size=%#zx (not a page-rounded span). Pointer "
+                     "dropped (leaked), large cache NOT poisoned.\n",
+                     ptr, alloc_size);
+        std::fflush(stderr);
+    }
+}
 
 // One-shot telemetry for the v9 guard: the Sep-2026 runner crash faulted
 // exactly on this class of value - the benchmark's pointer array held 0x10
@@ -373,6 +404,15 @@ void fast_free(void* ptr) {
         alloc_size = header->alloc_size; // header validated; size trustworthy
         TLSCache::GetFast().CountLargeFree(alloc_size - sizeof(LargeAllocHeader));
 #else
+        // v10 guard: a zeroed (madvise'd span) or scribbled header reads a
+        // non-span alloc_size here. Trusting it fed the TLS large cache a
+        // bogus entry (size 0 / garbage), which AllocateLargeCached could
+        // later serve - handing out a pointer into foreign memory. Dropping
+        // the pointer leaks one block once; the cache stays clean.
+        if (FAST_UNLIKELY(!LargeHeaderSizePlausible(alloc_size))) {
+            ReportCorruptLargeHeader(ptr, alloc_size);
+            return;
+        }
         TLSCache::GetFast().CountLargeFree(alloc_size - sizeof(LargeAllocHeader));
 #endif
 #if FASTALLOC_LOGGING_ENABLED
@@ -483,6 +523,17 @@ void fast_free_sized(void* ptr, std::size_t size) {
     // Release fast path: the size hint saves the header->class_index load
     // and its dependent-use latency (audit O1 / M3).
     std::size_t class_index = RequestToClass(size);
+    // v10: cross-check the hint against the block's OWN header (same
+    // already-touched 16 bytes, one 4-byte load + compare). A wrong hint
+    // used to push the block into a foreign TLS bin: the next allocation
+    // from that bin returned an undersized block, and the user's first
+    // write overflowed into the NEXT block's header - the canonical seed
+    // of freelist corruption (0x10-class garbage in pointers). A mismatch
+    // now routes through fast_free, which trusts only the header.
+    if (FAST_UNLIKELY(static_cast<std::size_t>(block->class_index) != class_index)) {
+        fast_free(ptr);
+        return;
+    }
     TLSCache::GetFast().DeallocateBlock(class_index, block);
 }
 
@@ -548,6 +599,16 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     if (is_large) {
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
+        // v10: reject a zeroed/scribbled header BEFORE its bogus size flows
+        // into copy lengths and shrink/grow decisions. (Common path, both
+        // configs: in DEBUG the slab==nullptr discrimination is normally
+        // only reached with LARGE_MAGIC headers, so an implausible size
+        // here already means the header is corrupt.)
+        if (FAST_UNLIKELY(!LargeHeaderSizePlausible(header->alloc_size))) {
+            ReportCorruptLargeHeader(ptr, header->alloc_size);
+            errno = EINVAL;
+            return nullptr;
+        }
         old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
         old_size = UsableSize(block->class_index);
@@ -786,6 +847,31 @@ void fast_alloc_purge() {
 
 void fast_alloc_purge_thread_cache() {
     TLSCache::GetFast().FlushToGlobalHeap();
+}
+
+void fast_alloc_audit_pointers(const void* lo, const void* hi) {
+    if (!lo || !hi || lo >= hi) return;
+    std::fprintf(stderr,
+                 "[fastalloc-audit] scanning allocator head arrays for pointers "
+                 "into [%p, %p)\n",
+                 const_cast<void*>(lo), const_cast<void*>(hi));
+    std::fflush(stderr);
+    // Forensic reads only (fixed head arrays, no foreign dereferences):
+    // safe while the allocator is in any state. See fast_alloc.h.
+    std::size_t hits = AuditCurrentThreadCache(lo, hi);
+    hits += GlobalHeap::GetInstance().AuditPointers(lo, hi);
+    if (hits == 0) {
+        std::fprintf(stderr,
+                     "[fastalloc-audit] no allocator head pointer targets the "
+                     "region (writer held its pointer only transiently, e.g. "
+                     "register/stack, or the corrupted link is mid-list)\n");
+    } else {
+        std::fprintf(stderr,
+                     "[fastalloc-audit] %zu pointer(s) target the region - "
+                     "the listed structure(s) are the corruption carriers\n",
+                     hits);
+    }
+    std::fflush(stderr);
 }
 
 void fast_alloc_log_set_level(int level) {

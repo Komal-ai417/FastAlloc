@@ -58,6 +58,20 @@ void ReportDoublePushGuard() {
     }
 }
 
+// v10: one-shot telemetry for the AllocateBlock pop guard (tls_cache.h).
+void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[fastalloc-invariant] corrupt TLS bin head: class=%zu "
+                     "head=%#zx (< 64 KB; never a FastAlloc block). Bin "
+                     "re-derived from a fresh batch, allocator state "
+                     "protected.\n",
+                     class_index, bad_head);
+        std::fflush(stderr);
+    }
+}
+
 // ===========================================================================
 // TLSCache recycling pool (thread-lifecycle optimization)
 //
@@ -497,6 +511,67 @@ void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
     } else {
         GlobalHeap::GetInstance().DeallocateLarge(ptr, alloc_size);
     }
+}
+
+// ===========================================================================
+// v10 violation forensics: pointer-array audit
+//
+// Reads ONLY the fixed head arrays of this thread's cache (no freelist
+// walks, no foreign dereferences), so it is safe to call while the
+// allocator is in ANY state - including the corrupted state that triggered
+// it. Each pointer landing in [lo, hi) is printed with its container
+// identity; a hit means a corrupted allocator structure targeted the
+// audited region (the wild-write smoking gun).
+// ===========================================================================
+std::size_t TLSCache::AuditPointers(const void* lo, const void* hi) const {
+    std::size_t hits = 0;
+    for (std::size_t c = 0; c < NUM_SIZE_CLASSES; ++c) {
+        const FreeBlock* head = bins_[c].head;
+        if (reinterpret_cast<std::uintptr_t>(head) >=
+                reinterpret_cast<std::uintptr_t>(lo) &&
+            reinterpret_cast<std::uintptr_t>(head) <
+                reinterpret_cast<std::uintptr_t>(hi)) {
+            std::fprintf(stderr,
+                         "[fastalloc-audit] tls bin class=%zu head=%p -> IN RANGE\n",
+                         c, static_cast<void*>(const_cast<FreeBlock*>(head)));
+            ++hits;
+        }
+    }
+    for (std::size_t i = 0; i < NUM_LARGE_CLASSES; ++i) {
+        const LargeFreeEntry* entry = large_free_bins_[i];
+        if (reinterpret_cast<std::uintptr_t>(entry) >=
+                reinterpret_cast<std::uintptr_t>(lo) &&
+            reinterpret_cast<std::uintptr_t>(entry) <
+                reinterpret_cast<std::uintptr_t>(hi)) {
+            std::fprintf(stderr,
+                         "[fastalloc-audit] tls large bin %zu head=%p -> IN RANGE\n",
+                         i, static_cast<void*>(const_cast<LargeFreeEntry*>(entry)));
+            ++hits;
+        }
+    }
+    return hits;
+}
+
+std::size_t AuditCurrentThreadCache(const void* lo, const void* hi) {
+    std::size_t hits = TLSCache::GetFast().AuditPointers(lo, hi);
+    // The cross-thread recycling pool: retired TLSCache objects. A pool slot
+    // pointing into the audited range means a recycled cache was corrupted.
+    CachePool& pool = CachePoolInstance();
+    std::size_t n = pool.count.load(std::memory_order_relaxed);
+    if (n > kCachePoolCap) n = kCachePoolCap;
+    for (std::size_t i = 0; i < n; ++i) {
+        TLSCache* c = pool.slots[i];
+        if (reinterpret_cast<std::uintptr_t>(c) >=
+                reinterpret_cast<std::uintptr_t>(lo) &&
+            reinterpret_cast<std::uintptr_t>(c) <
+                reinterpret_cast<std::uintptr_t>(hi)) {
+            std::fprintf(stderr,
+                         "[fastalloc-audit] cache pool slot %zu = %p -> IN RANGE\n",
+                         i, static_cast<void*>(c));
+            ++hits;
+        }
+    }
+    return hits;
 }
 
 } // namespace FastAlloc

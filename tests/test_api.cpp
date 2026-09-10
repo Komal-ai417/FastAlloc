@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cerrno>
 #include <vector>
 #include <set>
 
@@ -43,6 +44,66 @@ TEST(ApiTest, FreeNonCanonicalPointerIsDroppedNotFatal) {
     std::memset(live, 0x5A, 32);
     fast_free(live);
     SUCCEED();
+}
+
+// v10: fast_free_sized with a WRONG size hint must route the block through
+// its TRUE class (from the block's own header), never into the hinted
+// class's TLS bin. Misrouting handed the next allocation from that bin an
+// undersized block - the seed of every downstream freelist corruption.
+TEST(ApiTest, FreeSizedWrongHintRoutesToTrueClass) {
+    void* p = fast_malloc(8); // true class: RequestToClass(8 + 16) -> 1
+    ASSERT_NE(p, nullptr);
+    // Free with a hint that maps to a DIFFERENT class (64 -> class 4).
+    fast_free_sized(p, 64);
+    // The block must come back from a class-1 allocation (its true bin),
+    // not be lost in the class-4 bin.
+    void* again = fast_malloc(8);
+    ASSERT_NE(again, nullptr);
+    EXPECT_EQ(again, p); // recycled through the correct bin
+    fast_free(again);
+
+    // Allocator stays fully serviceable afterwards.
+    for (int i = 0; i < 256; ++i) {
+        void* q = fast_malloc(48);
+        ASSERT_NE(q, nullptr);
+        fast_free_sized(q, 48); // matching hint: fast path
+    }
+    SUCCEED();
+}
+
+// v10: a block whose header was zeroed/scribbled (slab field 0, garbage
+// alloc_size) must be DROPPED on the large-discrimination path, never fed
+// into the large cache with its bogus size - a poisoned entry there can be
+// handed out later as fresh memory.
+TEST(ApiTest, FreeWithCorruptLargeHeaderIsDroppedNotCached) {
+#if FASTALLOC_DEBUG_ENABLED
+    GTEST_SKIP() << "debug build: the registry fatals on forged pointers by design";
+#else
+    // Forge a 16-byte header in writable memory: slab=0 (reads "large" on
+    // the release discrimination path), alloc_size=0xDD (not a page-rounded
+    // span). The user pointer follows the header.
+    alignas(16) unsigned char forged[64] = {};
+    forged[0] = forged[1] = forged[2] = forged[3] = 0;          // slab == nullptr
+    std::memset(forged + 8, 0xDD, 8);                          // alloc_size = garbage
+    void* user = forged + 16;
+    fast_free(user); // must be dropped, not cached, not crashed
+
+    // Same for fast_realloc: a bogus large header yields EINVAL/nullptr,
+    // never a copy through a garbage size.
+    errno = 0;
+    void* r = fast_realloc(user, 128);
+    EXPECT_EQ(r, nullptr);
+
+    // The allocator stays serviceable; the large path still works.
+    void* live = fast_malloc(64 * 1024);
+    ASSERT_NE(live, nullptr);
+    std::memset(live, 1, 64 * 1024);
+    fast_free(live);
+    void* small = fast_malloc(32);
+    ASSERT_NE(small, nullptr);
+    fast_free(small);
+    SUCCEED();
+#endif
 }
 
 TEST(ApiTest, MallocZeroReturnsUniqueNonNull) {

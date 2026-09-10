@@ -37,6 +37,14 @@ extern FAST_THREAD_LOCAL TLSCache* fast_path_cache;
 // event lands in the CI job log; later occurrences are silent.
 void ReportDoublePushGuard();
 
+// v10: fired by the AllocateBlock pop guard when a bin head holds a
+// non-canonical value (small integer). Same one-shot discipline.
+void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head);
+
+// v10 forensics: audit the calling thread's TLSCache AND the cross-thread
+// cache-recycling pool for pointers into [lo, hi). Returns hit count.
+std::size_t AuditCurrentThreadCache(const void* lo, const void* hi);
+
 class TLSCache {
 public:
     static inline TLSCache& GetFast() {
@@ -48,10 +56,26 @@ public:
     inline void* AllocateBlock(std::size_t class_index) {
         CacheBin& bin = bins_[class_index];
         FreeBlock* block = bin.head;
-        if (FAST_LIKELY(block != nullptr)) {
+        if (FAST_LIKELY(reinterpret_cast<std::uintptr_t>(block) >=
+                        kMinCanonicalUserPtr)) {
             bin.head = block->next;
             bin.count--;
             return block;
+        }
+        if (FAST_UNLIKELY(block != nullptr)) {
+            // v10 pop guard: the bin head holds a non-canonical value (a
+            // small integer such as 0x10 - the exact class of the Sep-2026
+            // runner corruption). The old code only null-checked, so a small
+            // non-null value sailed through and 'block->next' faulted at
+            // [0x10 + 16]. The corruption is dropped, the WHOLE bin is
+            // re-derived from a fresh batch (count was unknowable), and the
+            // allocator keeps serving. One-shot telemetry lands in the CI
+            // job log via tls_cache.cpp.
+            ReportBinHeadCorruption(class_index,
+                                    reinterpret_cast<std::uintptr_t>(block));
+            bin.head = nullptr;
+            bin.count = 0;
+            bin.next_refill = 0;
         }
         return AllocateBlockSlow(class_index);
     }
@@ -92,6 +116,11 @@ public:
     // Flush every cached block and large entry back to the global heap.
     // Used by fast_alloc_purge_thread_cache() and by the destructor.
     void FlushToGlobalHeap();
+
+    // v10 forensics: report (stderr) every bin/large-cache head pointing
+    // into [lo, hi); returns the number of hits. Pure pointer-array reads,
+    // no foreign dereferences - safe in any allocator state.
+    std::size_t AuditPointers(const void* lo, const void* hi) const;
 
     // ------------------------------------------------------------------
     // Hot-path statistics batching.

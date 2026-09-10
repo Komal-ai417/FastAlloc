@@ -211,26 +211,35 @@ jobs:
   # and is the correct modern pin. ALL multithreaded ->Threads(N)
   # registrations are kept: coverage is never reduced to work around a crash.
   #
-  # STATUS (Sep 2026, v9 - GUARDED + INSTRUMENTED): two distinct crash
-  # signatures were observed on the runners. v8 fixed the first (faulting
-  # address 0x10 = [nullptr + offsetof(FreeBlock, next)]: the flush batch
-  # walk, guarded + self-healing in tls_cache.cpp, with idempotent duplicate
-  # push/return absorption and unconditional bin resets). The v8-era second
-  # signature is different: the free sweep faults at si_addr = 0x0 because a
-  # pointer-array slot holds 0x10 (inlined fast_free reads its header at
-  # [0x10 - 16] = 0x0); it reproduced 3/3 on the runner (tee'd run + gdb
-  # rerun + retry) and 0/700+ locally across release/ASan/TSan/isolated-case
-  # loops. v9 makes that class impossible to crash on AND decisive to
-  # diagnose: fast_free/fast_free_sized/fast_realloc now reject non-canonical
-  # pointers (< 64 KB - provably never a FastAlloc block) BEFORE the header
-  # read, with one-shot [fastalloc-invariant] stderr, and the benchmark keeps
-  # a provenance SHADOW of its pointer array whose comparison on violation
-  # prints [bench-guard] with the slot index, value and verdict
-  # (allocator-returned vs overwritten-after-store). The healed events are
-  # surfaced by the 'Surface healed invariant telemetry' step below, so the
-  # next occurrence prints its provenance directly in the job log. The
-  # v8 [fastalloc-invariant] channels, bench_crash_reporter.h and the gdb
-  # rerun stay as the independent safety net for any NEW crash class.
+  # STATUS (Sep 2026, v10 - HARDENED + WRITER-TRAPPING): three crash-
+  # signature generations on the runners, each closed in turn. v8 fixed the
+  # batch-walk fault (0x10 = [nullptr+offsetof(next)]). v9 made non-canonical
+  # frees (si_addr = 0x0, pointer-array slot holding 0x10) heal instead of
+  # crash. The v9 CI run then produced the decisive datapoint: [bench-guard]
+  # ptrs[0..2]=0x10 DETERMINISTICALLY in both the tee'd run AND the gdb
+  # rerun (different ASLR) - 0/1000+ locally. v9's post-sweep shadow could
+  # not say WHO wrote it (a wild write during the sweep corrupted the array
+  # and the snapshot identically). v10:
+  #   1. Allocator hardening, three holes closed BY CONSTRUCTION: corrupt
+  #      TLS bin heads self-heal on pop (kMinCanonicalUserPtr test in
+  #      tls_cache.h); a zeroed/scribbled large header is rejected before
+  #      its bogus alloc_size can poison the TLS large cache
+  #      (LargeHeaderSizePlausible in fast_alloc.cpp); fast_free_sized
+  #      cross-checks the caller's size hint against the block's own
+  #      header, so a wrong hint can never route a block into a foreign
+  #      bin (the undersized-handout -> user-overflow -> next-header
+  #      corruption chain).
+  #   2. The benchmark's pointer array is now a TRAP: its own page with
+  #      PROT_NONE guard pages on both sides, mprotect(PROT_READ)-frozen
+  #      for the whole free sweep, and a store-time witness buffer. The
+  #      next occurrence of the runner-only wild write faults AT THE
+  #      WRITER'S INSTRUCTION (backtrace in the job log), and the audit
+  #      API (fast_alloc_audit_pointers) dumps every allocator head
+  #      pointer targeting the array's region.
+  #   3. The healed-event surfacing step below now also greps
+  #      [fastalloc-audit] and store-time [bench-guard] lines.
+  # The v8 [fastalloc-invariant] channels, bench_crash_reporter.h and the
+  # gdb rerun stay as the independent safety net for any NEW crash class.
   #
   # Each google-benchmark binary runs its benchmark FAMILIES in separate
   # process invocations (family list discovered via --benchmark_list_tests,
@@ -307,6 +316,10 @@ jobs:
       #     green) or FAILURES.txt (gate red). ---
       - name: Run fast_alloc_bench (every benchmark, family-isolated)
         shell: bash
+        # v10: bound the step so a hung inferior (or a slow gdb rerun on a
+        # busy shared runner) can never eat the whole job budget; the
+        # per-family FLAKES/FAILURES classification below still applies.
+        timeout-minutes: 10
         continue-on-error: true
         run: |
           set -o pipefail
@@ -356,6 +369,7 @@ jobs:
 
       - name: Run fast_alloc_bench_extended (every benchmark, family-isolated)
         shell: bash
+        timeout-minutes: 10
         continue-on-error: true
         run: |
           FAMS=$("$BIN/fast_alloc_bench_extended$EXT" --benchmark_list_tests=true \
@@ -391,6 +405,7 @@ jobs:
       # --- custom memory benchmark: full threads x sizes sweep ---
       - name: Run fast_alloc_bench_memory (threads 1/2/4 x sizes 64/256/4096)
         shell: bash
+        timeout-minutes: 10
         continue-on-error: true
         run: |
           rc=0
@@ -420,6 +435,7 @@ jobs:
       #     verified on every free; rc=42 fails the step. ---
       - name: Run bench_suite (all 11 workloads x std+fast x threads 1/2/4)
         shell: bash
+        timeout-minutes: 15
         continue-on-error: true
         run: |
           run2() {  # run2 <label> <cmd...>: run; retry a crash once; classify
@@ -451,19 +467,20 @@ jobs:
           done
           if [ $rc -ne 0 ]; then echo "bench_suite rc=$rc (see FAILURES.txt above)"; fi
 
-      # --- v9: surface HEALED invariant events. The guards above keep the
+      # --- v9/v10: surface HEALED invariant events. The guards above keep the
       #     benchmarks alive when the (Sep-2026) corruption class recurs, so
       #     the event would otherwise only live inside the tee'd crashlog
       #     files. This step greps every capture for the one-shot telemetry
       #     lines and prints them into the job log - a green run with healed
-      #     events is visible as such, with full provenance. ---
-      - name: Surface healed invariant telemetry (v9)
+      #     events is visible as such, with full provenance (v10 adds the
+      #     store-time witness verdicts and the [fastalloc-audit] dumps). ---
+      - name: Surface healed invariant telemetry (v10)
         shell: bash
         run: |
           if ls crashlogs/*.txt >/dev/null 2>&1; then
-            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]' crashlogs/*.txt >/dev/null 2>&1; then
+            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]' crashlogs/*.txt >/dev/null 2>&1; then
               echo "=== HEALED INVARIANT EVENTS (benchmarks survived; provenance below) ==="
-              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]' crashlogs/*.txt || true
+              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]' crashlogs/*.txt || true
             else
               echo "No invariant events: allocator ran clean."
             fi

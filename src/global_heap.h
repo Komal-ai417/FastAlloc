@@ -98,6 +98,12 @@ public:
     // bin lock in turn. Returns the number of bytes released.
     std::size_t PurgePageCache();
 
+    // v10 forensics: report (stderr) every arena slab-list head, pending
+    // queue head and page-bin head pointing into [lo, hi); returns the hit
+    // count. Pointer-array reads only - no foreign dereferences, safe in
+    // any allocator state.
+    std::size_t AuditPointers(const void* lo, const void* hi);
+
     // OOM-injection seam for tests: when set, the next N page allocations
     // fail. Default null. Only consulted on the slow path.
     static bool ShouldFailAllocationForTest();

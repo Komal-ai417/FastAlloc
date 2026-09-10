@@ -3,6 +3,7 @@
 #include "debug_aid.h"
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <thread>
 #include <cstdlib>
 
@@ -841,6 +842,60 @@ std::size_t GlobalHeap::PurgePageCache() {
     }
     // Step 2: drop every cached span back to the OS.
     return PurgePageCacheLocked();
+}
+
+// ===========================================================================
+// v10 violation forensics: pointer-array audit (see fast_alloc.h).
+// Reads only the fixed head arrays - arena slab lists, pending queues and
+// page bins - never dereferences a foreign pointer, so it is safe while
+// the allocator is in any state. A hit means some corrupted structure
+// currently targets the audited region.
+// ===========================================================================
+std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
+    const std::uintptr_t low = reinterpret_cast<std::uintptr_t>(lo);
+    const std::uintptr_t high = reinterpret_cast<std::uintptr_t>(hi);
+    std::size_t hits = 0;
+    for (uint32_t a = 0; a < NUM_ARENAS; ++a) {
+        Arena& arena = arenas_[a];
+        for (std::size_t c = 0; c < NUM_SIZE_CLASSES; ++c) {
+            const Slab* partial = arena.partial_slabs_[c];
+            if (reinterpret_cast<std::uintptr_t>(partial) >= low &&
+                reinterpret_cast<std::uintptr_t>(partial) < high) {
+                std::fprintf(stderr,
+                             "[fastalloc-audit] arena %u class %zu partial_slabs head=%p -> IN RANGE\n",
+                             a, c, const_cast<Slab*>(partial));
+                ++hits;
+            }
+            const Slab* full = arena.full_slabs_[c];
+            if (reinterpret_cast<std::uintptr_t>(full) >= low &&
+                reinterpret_cast<std::uintptr_t>(full) < high) {
+                std::fprintf(stderr,
+                             "[fastalloc-audit] arena %u class %zu full_slabs head=%p -> IN RANGE\n",
+                             a, c, const_cast<Slab*>(full));
+                ++hits;
+            }
+            const FreeBlock* pending =
+                arena.pending_returns_[c].head.load(std::memory_order_relaxed);
+            if (reinterpret_cast<std::uintptr_t>(pending) >= low &&
+                reinterpret_cast<std::uintptr_t>(pending) < high) {
+                std::fprintf(stderr,
+                             "[fastalloc-audit] arena %u class %zu pending head=%p -> IN RANGE\n",
+                             a, c, static_cast<void*>(const_cast<FreeBlock*>(pending)));
+                ++hits;
+            }
+        }
+    }
+    for (std::size_t p = 1; p <= MAX_CACHED_PAGES; ++p) {
+        const PageNode* node = page_bins_[p].head;
+        if (reinterpret_cast<std::uintptr_t>(node) >= low &&
+            reinterpret_cast<std::uintptr_t>(node) < high) {
+            std::fprintf(stderr,
+                         "[fastalloc-audit] page bin %zu head=%p -> IN RANGE\n",
+                         p, static_cast<void*>(const_cast<PageNode*>(node)));
+            ++hits;
+        }
+    }
+    return hits;
 }
 
 } // namespace FastAlloc
