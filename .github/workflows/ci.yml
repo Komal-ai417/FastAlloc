@@ -73,10 +73,36 @@ jobs:
   # remains covered by build-test's debug matrix entry. An explicit
   # --timeout 1800 gives Release+ASan generous headroom over the observed
   # ~minutes runtime.
+  #
+  # v12 (Sep 2026): the v11 push failed this job with ctest stuck at
+  # "Start 1: fast_alloc_validate_tests" and NO test output. The v11 suite
+  # is clean under Linux ASan (full suite + 64k thread-teardown cycles, 0
+  # errors), and the v11 guards are value-only checks ordered before every
+  # dereference. The failure class that matches a previously-green job
+  # turning red with zero output is OPERATIONAL: /fsanitize=address + /MD
+  # makes the exe import clang_rt.asan_dynamic-x86_64.dll from the MSVC
+  # toolset; if the runner's PATH does not resolve it after an image
+  # refresh (windows-latest rolls new MSVC toolset versions), the process
+  # dies at launch (0xC0000135) and ctest shows a bare failure with no
+  # output. v12 closes every silent class by construction:
+  #   1. The CMake build copies the ASan DLL next to the exe (self-
+  #      contained load, PATH-independent).
+  #   2. The staging step below re-verifies the DLL, puts the MSVC-bundled
+  #      llvm-symbolizer on PATH (any ASan report prints a full symbolized
+  #      stack in the job log), and echoes the toolset paths for provenance.
+  #   3. ctest runs -V: gtest output streams live, so a hang shows the last
+  #      [ RUN ] line instead of 30 minutes of silence.
+  #   4. On failure, a bounded post-mortem rerun under cdb (Windows SDK
+  #      debugger, abort_on_error so ASan deaths are catchable) prints the
+  #      last event + stack - the Windows analog of the ubuntu gdb rerun.
+  #   5. A green suite is repeated up to 3x (ctest --repeat until-fails:3)
+  #      so a transient/image-drift failure cannot pass as green; a
+  #      deterministic failure still stops at the first occurrence.
   # ---------------------------------------------------------------------------
   windows-asan:
     name: windows-msvc-asan
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -86,10 +112,72 @@ jobs:
                 -DFASTALLOC_SANITIZE=address
       - name: Build
         run: cmake --build build --config Release -j --target fast_alloc_tests
+      - name: Stage MSVC ASan runtime + symbolizer (v12)
+        shell: pwsh
+        run: |
+          # Belt-and-braces for the build-time DLL staging (CMake copies
+          # clang_rt.asan_dynamic-x86_64.dll next to the exe): re-locate it
+          # via vswhere and copy it into build\Release again if needed, so
+          # the loader resolves it from the exe dir regardless of PATH.
+          # Also put the MSVC-bundled llvm-symbolizer on PATH so any ASan
+          # report is fully symbolized in the job log.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * `
+                        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                        -property installationPath
+          Write-Host "VS installation: $vsRoot"
+          $dll = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC" -Recurse `
+                        -Filter clang_rt.asan_dynamic-x86_64.dll `
+                        -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'Hostx64\\x64' } |
+                 Select-Object -First 1
+          if ($dll) {
+            Copy-Item $dll.FullName build\Release -Force
+            Write-Host "staged ASan runtime: $($dll.FullName)"
+          } else {
+            Write-Host "WARN: clang_rt.asan_dynamic-x86_64.dll not found under $vsRoot\VC\Tools\MSVC"
+          }
+          $llvm = Join-Path $vsRoot 'VC\Tools\Llvm\x64\bin'
+          if (Test-Path (Join-Path $llvm 'llvm-symbolizer.exe')) {
+            Add-Content $env:GITHUB_ENV "PATH=$llvm;$env:PATH"
+            Write-Host "llvm-symbolizer on PATH: $llvm"
+          } else {
+            Write-Host "llvm-symbolizer not found at $llvm (reports will show raw addresses)"
+          }
       - name: Test
-        run: ctest --test-dir build --build-config Release --output-on-failure --timeout 1800
+        # -V streams gtest output live (a hang shows the last [ RUN ] line);
+        # --repeat until-fail:3 requires three consecutive green runs of the
+        # suite so a transient/image-drift failure is not waved through as
+        # green, while a deterministic failure still stops at the first one.
+        run: ctest --test-dir build --build-config Release --output-on-failure -V --repeat until-fail:3 --timeout 1800
         env:
           ASAN_OPTIONS: halt_on_error=1
+      - name: Post-mortem rerun under cdb (failure only)
+        if: failure()
+        shell: pwsh
+        run: |
+          # Windows analog of the ubuntu gdb rerun. Runs the suite under the
+          # Windows SDK debugger with abort_on_error=1 so an ASan death is a
+          # catchable second-chance exception (__fastfail); cdb then prints
+          # the last event and the stack. Bounded at 15 minutes (a rerun of a
+          # hanging test would otherwise hang the step too).
+          $cdb = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+          if (-not (Test-Path $cdb)) {
+            Write-Host "cdb.exe not found on this image - skipping post-mortem"
+            exit 0
+          }
+          $env:ASAN_OPTIONS = "halt_on_error=1:abort_on_error=1:symbolize=1"
+          $out = Join-Path $env:RUNNER_TEMP "cdb-rerun.txt"
+          $exe = Join-Path $PWD "build\Release\fast_alloc_tests.exe"
+          $p = Start-Process -FilePath $cdb -PassThru -NoNewWindow `
+                -RedirectStandardOutput $out `
+                -ArgumentList '-g','-G','-lines','-c','g; .lastevent; k 50; q', "$exe"
+          # WaitForExit(ms) returns $true iff the process exited on its own.
+          if (-not $p.WaitForExit(900000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "cdb rerun exceeded 15 minutes (the failure reproduces as a hang); killed"
+          }
+          if (Test-Path $out) { Get-Content $out | Select-Object -Last 80 }
 
   # ---------------------------------------------------------------------------
   # Sanitizer jobs (Linux only; MSVC ASan runs in the windows-asan job above)

@@ -38,6 +38,48 @@ elseif(FASTALLOC_SANITIZE AND MSVC)
     add_link_options(/INCREMENTAL:NO)
 endif()
 
+# ---------------------------------------------------------------------------
+# MSVC ASan runtime staging (v12)
+#
+# /fsanitize=address + the dynamic CRT (/MD, the default - and forced for
+# gtest via gtest_force_shared_crt) makes every executable IMPORT
+# clang_rt.asan_dynamic-x86_64.dll. The DLL ships INSIDE the MSVC toolset
+# (next to cl.exe in bin\Hostx64\x64), which is on PATH only inside a
+# vcvars/developer shell. A plain `ctest` run from the CI job environment
+# inherits the runner image's PATH: when the image's PATH entries lag a
+# toolset update (windows-latest refreshes its MSVC versions continuously),
+# the loader fails the process AT LAUNCH with 0xC0000135 - which ctest
+# reports as a failed test with NO output at all (the Sep-2026 v11
+# windows-msvc-asan failure signature). Copying the DLL next to each
+# executable at build time makes the exe self-contained: load always
+# succeeds regardless of the environment's PATH.
+# ---------------------------------------------------------------------------
+set(FASTALLOC_ASAN_DLL "")
+if(MSVC AND FASTALLOC_SANITIZE)
+    get_filename_component(FASTALLOC_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(FASTALLOC_ASAN_DLL_CANDIDATE
+        "${FASTALLOC_MSVC_BIN_DIR}/clang_rt.asan_dynamic-x86_64.dll")
+    if(EXISTS "${FASTALLOC_ASAN_DLL_CANDIDATE}")
+        set(FASTALLOC_ASAN_DLL "${FASTALLOC_ASAN_DLL_CANDIDATE}")
+    else()
+        message(STATUS "FastAlloc: clang_rt.asan_dynamic-x86_64.dll not "
+                       "found at ${FASTALLOC_ASAN_DLL_CANDIDATE} - runtime "
+                       "staging skipped (the CI job stages it / PATH)")
+    endif()
+endif()
+
+# Copies the ASan runtime DLL into the target's output directory when
+# building with MSVC + sanitizers; a no-op everywhere else (including the
+# static-runtime / cross-compile cases, where the import does not exist).
+macro(fastalloc_stage_asan_runtime target)
+    if(FASTALLOC_ASAN_DLL)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${FASTALLOC_ASAN_DLL}" $<TARGET_FILE_DIR:${target}>
+            COMMENT "Staging clang_rt.asan_dynamic-x86_64.dll for ${target}")
+    endif()
+endmacro()
+
 # Compiler-specific optimizations
 if(MSVC)
     # fopen/fscanf/getenv trigger C4996 deprecation on MSVC; under /W4 /WX
@@ -125,6 +167,7 @@ if(FASTALLOC_BUILD_TESTS)
     )
     target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
+    fastalloc_stage_asan_runtime(fast_alloc_tests)
 
     include(CTest)
     add_test(NAME fast_alloc_validate_tests COMMAND fast_alloc_tests)
@@ -159,14 +202,17 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     add_executable(fast_alloc_bench benchmarks/bench_main.cpp)
     target_compile_options(fast_alloc_bench PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench PRIVATE fast_alloc benchmark::benchmark)
+    fastalloc_stage_asan_runtime(fast_alloc_bench)
 
     add_executable(fast_alloc_bench_extended benchmarks/bench_extended.cpp)
     target_compile_options(fast_alloc_bench_extended PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench_extended PRIVATE fast_alloc benchmark::benchmark)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_extended)
 
     add_executable(fast_alloc_bench_memory benchmarks/bench_memory.cpp)
     target_compile_options(fast_alloc_bench_memory PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_bench_memory PRIVATE fast_alloc)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_memory)
     if(WIN32)
         # GetProcessMemoryInfo (psapi.h) resolves to Psapi.lib on some
         # MinGW/MSVC SDK configurations; harmless when already in kernel32.
@@ -179,6 +225,7 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     # rep/warmup control are the methodology here.
     add_executable(bench_suite benchmarks/benchsuite/bench_suite.cpp)
     target_compile_options(bench_suite PRIVATE ${WARNING_FLAGS})
+    fastalloc_stage_asan_runtime(bench_suite)
     if(NOT WIN32)
         target_link_libraries(bench_suite PRIVATE fast_alloc ${CMAKE_DL_LIBS})
     else()

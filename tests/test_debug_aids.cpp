@@ -40,8 +40,17 @@ TEST(DebugAidsDeathTest, InvalidFreeStackPointerIsDetected) {
     // A pointer FastAlloc never allocated must be rejected loudly instead of
     // corrupting the arena (audit C3). Under ASan, the sanitizer itself may
     // catch the wild access first - both diagnostics are acceptable proof.
+    //
+    // v12: the stack slot is deliberately 16-ALIGNED so the v11 plausibility
+    // guard (misaligned values are dropped as forged, by design) lets this
+    // pointer THROUGH to the registry check - that fatal path is what this
+    // test exists to prove. The misaligned-drop behavior itself is covered
+    // by ApiTest.FreeMisalignedPointerIsDroppedNotFatal. Without the explicit
+    // alignment the test's outcome depended on where the compiler happened
+    // to place the slot in the frame (flaky across builds and platforms:
+    // the Sep-2026 v11 debug run failed it when the slot landed misaligned).
     EXPECT_DEATH({
-        int stack_var = 0;
+        alignas(16) int stack_var = 0;
         fast_free(&stack_var);
     }, "not live|stack-buffer|FATAL");
 }
