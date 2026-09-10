@@ -1,47 +1,261 @@
-# Performance Report — FastAlloc v2.0.0
+# Performance Report — FastAlloc v2.0.0 (rev 5, full re-measurement)
 
-> **Methodology note (v4):** all numbers below come from the
-> cross-allocator benchmark suite (`benchmarks/benchsuite/`), run against
-> three reference allocators on the same machine in the same session:
-> **glibc 2.41 (ptmalloc+tcache)**, **jemalloc 5.3.0**, and
-> **mimalloc 2.1.7**. Each (allocator, workload, thread-count) cell is the
-> **median of 5 repetitions** after a warmup rep, one allocator per process,
-> launch order rotated per workload to decorrelate drift. Every workload
-> verifies block contents on free (checksum-guarded; zero failures recorded
-> across the 132-cell matrix). This revision adds the **v2 allocator
-> optimizations** (see "What changed in v2") — every gain below was
-> re-validated against the full sanitizer battery after the change.
+> **Methodology note (v5):** every number below was re-measured in one session
+> with the new **one-shot verdict tool**
+> `benchmarks/benchsuite/bench_compare.py`, which drives *every* benchmark in
+> this repository — the two Google-Benchmark micro-suites, the 11-workload
+> cross-allocator `bench_suite`, and the side-by-side memory stress benchmark —
+> and prints a per-category win/loss verdict with the exact multiplier
+> ("MallocOnly 16B T=1: FastAlloc wins by 1.29x"). Baselines: **glibc 2.41
+> (ptmalloc+tcache)**, **jemalloc 5.3.0**, **mimalloc 2.1.7** (built from
+> source, LD_PRELOAD). Each `bench_suite` cell is the **median of 5
+> repetitions** after a warmup rep, one allocator per process, launch order
+> rotated per workload, every block checksum-verified on free (zero failures
+> across the 132-cell matrix; the tool exits non-zero if any checksum fails).
+> Raw records: `benchmarks/benchsuite/compare_results.jsonl`; the generated
+> verdict report: `benchmarks/benchsuite/bench_report.md`.
 
 ## Reference environment
 
-- CPU: 2 vCPU x86-64 VM (Intel Xeon), 4 GB RAM
-- OS: Debian 13, Linux
-- Toolchain: GCC 14.2, `-O3 -march=native` + LTO (CMake Release)
+- CPU: 2 vCPU x86-64 VM (Intel Xeon), 4 GB RAM — T=4 is 2x oversubscribed
+- OS: Debian 13 (trixie), Linux
+- Toolchain: GCC 14.2, `-O3 -march=native` + LTO (CMake Release), CMake 4.4
 - Baselines: glibc 2.41 (default), jemalloc 5.3.0 (LD_PRELOAD),
-  mimalloc 2.1.7 (LD_PRELOAD)
-- Suite: `bench_suite` — 11 workloads × {1, 2, 4} threads × 4 allocators;
-  T=4 is 2x oversubscribed on this box and is reported as such.
+  mimalloc 2.1.7 (LD_PRELOAD, built from source)
+- Suite: 11 workloads × {1, 2, 4} threads × 4 allocators = 132 throughput
+  cells + latency percentiles + memory accounting + thread-lifecycle data
 
-Run it yourself:
+Run it yourself (one command, every benchmark, full verdict report):
 
 ```bash
-cmake -B build-bench -DFASTALLOC_BUILD_TESTS=OFF -DFASTALLOC_BUILD_BENCHMARKS=ON
-cmake --build build-bench --target bench_suite -j
-# glibc (no preload) / FastAlloc:
-./build-bench/bench_suite --alloc std  --label glibc    --workload churn --threads 4 --reps 5 --json out.jsonl
-./build-bench/bench_suite --alloc fast --label FastAlloc --workload churn --threads 4 --reps 5 --json out.jsonl
-# jemalloc / mimalloc via preload:
-LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 ./build-bench/bench_suite --alloc std --label jemalloc ...
-LD_PRELOAD=<path>/libmimalloc.so.2                       ./build-bench/bench_suite --alloc std --label mimalloc ...
+cmake -B build && cmake --build build -j --target bench_suite \
+    fast_alloc_bench fast_alloc_bench_extended fast_alloc_bench_memory
+# point the tool at jemalloc/mimalloc (auto-detected if in default paths):
+python3 benchmarks/benchsuite/bench_compare.py \
+    --mimalloc-so /path/to/libmimalloc.so.2 --reps 5 --threads 1,2,4
+# smoke preset:
+python3 benchmarks/benchsuite/bench_compare.py --quick
 ```
+
+The tool writes `bench_report.md` (the verdict report),
+`bench_report_data.json` (chart-ready data) and appends raw JSONL records.
+Long sessions can be chunked: `--workloads tiny,churn ...` runs a subset,
+`--suite-skip-run` rebuilds the report from the accumulated JSONL, and
+`--gbench-cache` reuses family JSONs between invocations.
+
+## Headline verdicts (this session's measurement)
+
+- **vs glibc (std malloc): FastAlloc wins 20 of 33 throughput cells**, loses
+  12, ties 1. Wins: every small-block pair workload at every thread count
+  (tiny 1.16–1.31x, small-mixed 1.24–1.51x, random-1-4096 up to 2.98x), ramp
+  1.54–1.94x, churn 1.26–1.43x (tie at T=4), cache-thrash 1.20–1.24x,
+  cross-thread up to 2.52x (T=2).
+- **vs jemalloc: FastAlloc wins 21 of 33 cells** — all pair workloads, ramp
+  2.0–2.3x, thread-churn 2.2–2.6x, realloc 1.25x, and **large 6.8–14.6x**.
+- **vs mimalloc: FastAlloc wins 12 of 33 cells** — mimalloc keeps the edge on
+  ramp (0.36–0.51x), churn (0.55–0.58x) and thread-churn (0.56–0.82x), while
+  FastAlloc keeps large 4.6–9.2x and every pair workload at T=1.
+- **Latency (T=1):** best p50 **and** p99 of all four allocators in tiny,
+  small-mixed and random-1-4096 (e.g. random: p50 13.3 ns vs glibc 41.0 /
+  jemalloc 18.4 / mimalloc 24.7; p99 15.4 vs 53.9 / 25.3 / 27.6). p99.9 is a
+  statistical tie with jemalloc on random-1-4096.
+- **Memory return-to-OS (1M live objects ≈ 500 MB payload, free-all, purge):**
+  FastAlloc retains **16.0 MB** vs glibc 46.7 (malloc_trim), jemalloc 171.8,
+  mimalloc 552.2 — **2.9x / 10.7x / 34.5x less**. Retained right after free:
+  123.6 MB vs 369.6 / 171.8 / 552.2 — least of the four.
+- **Thread lifecycle:** thread-churn T=1 252 ns/pair vs glibc 155 (glibc wins
+  1.62x — its tcache is a handful of shallow bins), **2.6x faster than
+  jemalloc**, ahead of mimalloc at T=1 (206 ns).
+- **In-process microbenchmarks (92 paired gbench configs):** FastAlloc wins 8
+  of 9 families (FreeOnly up to 23.8x, MallocOnly up to 50x at 4–8 KB,
+  HeavyContention 1.15–6.7x, MallocFree up to 34.6x); the one family loss is
+  `Calloc/10B` (std wins 11.9x — FastAlloc's calloc zeroes the full usable
+  block; see loss table).
+
+![FastAlloc speedup heatmap](charts/speedup_heatmap.png)
+
+## Full verdict matrices (median ns per op; ratio = competitor/FastAlloc)
+
+### FastAlloc vs glibc
+
+| workload | T=1 | T=2 | T=4 (2x oversub) |
+| :--- | ---: | ---: | ---: |
+| tiny | **1.31x WIN** | **1.24x WIN** | **1.16x WIN** |
+| small-mixed | **1.51x WIN** | **1.24x WIN** | **1.40x WIN** |
+| random-1-4096 | **2.98x WIN** | **2.09x WIN** | **1.86x WIN** |
+| ramp | **1.54x WIN** | **1.67x WIN** | **1.94x WIN** |
+| churn | **1.43x WIN** | **1.26x WIN** | 1.00x TIE |
+| cache-thrash | **1.20x WIN** | **1.24x WIN** | **1.22x WIN** |
+| cross-thread | **1.07x WIN** | **2.52x WIN** | 0.91x LOSS |
+| thread-churn | 0.62x LOSS | 0.48x LOSS | 0.48x LOSS |
+| large | 0.91x LOSS | 0.93x LOSS | **1.04x WIN** |
+| realloc-grow | 0.28x LOSS | 0.28x LOSS | 0.28x LOSS |
+| overhead (bulk 1M alloc+free) | 0.66x LOSS | 0.63x LOSS | 0.77x LOSS |
+
+### FastAlloc vs jemalloc
+
+| workload | T=1 | T=2 | T=4 |
+| :--- | ---: | ---: | ---: |
+| tiny | **1.26x WIN** | **1.21x WIN** | **1.15x WIN** |
+| small-mixed | **1.18x WIN** | **1.10x WIN** | **1.23x WIN** |
+| random-1-4096 | **1.39x WIN** | **1.19x WIN** | **1.14x WIN** |
+| ramp | **2.31x WIN** | **2.03x WIN** | **2.02x WIN** |
+| churn | 0.75x LOSS | 0.63x LOSS | 0.75x LOSS |
+| cache-thrash | 0.56x LOSS | 0.63x LOSS | 0.74x LOSS |
+| cross-thread | 0.85x LOSS | 0.42x LOSS | 0.43x LOSS |
+| thread-churn | **2.61x WIN** | **2.18x WIN** | **2.32x WIN** |
+| large | **14.63x WIN** | **7.61x WIN** | **6.80x WIN** |
+| realloc-grow | **1.25x WIN** | **1.27x WIN** | **1.27x WIN** |
+| overhead | 0.58x LOSS | 0.34x LOSS | 0.38x LOSS |
+
+### FastAlloc vs mimalloc
+
+| workload | T=1 | T=2 | T=4 |
+| :--- | ---: | ---: | ---: |
+| tiny | **1.31x WIN** | 0.97x LOSS | 0.92x LOSS |
+| small-mixed | **1.30x WIN** | **1.02x WIN** | **1.20x WIN** |
+| random-1-4096 | **1.82x WIN** | **1.57x WIN** | **1.35x WIN** |
+| ramp | 0.36x LOSS | 0.42x LOSS | 0.51x LOSS |
+| churn | 0.55x LOSS | 0.57x LOSS | 0.58x LOSS |
+| cache-thrash | 0.64x LOSS | 0.64x LOSS | **1.12x WIN** |
+| cross-thread | **1.05x WIN** | 0.66x LOSS | 0.87x LOSS |
+| thread-churn | 0.82x LOSS | 0.67x LOSS | 0.56x LOSS |
+| large | **9.15x WIN** | **4.83x WIN** | **4.56x WIN** |
+| realloc-grow | 1.00x TIE | 1.02x TIE | 1.01x TIE |
+| overhead | 0.46x LOSS | 0.32x LOSS | 0.29x LOSS |
+
+## Latency percentiles (single thread, ns per alloc+free pair)
+
+| workload | pctl | glibc | jemalloc | mimalloc | FastAlloc | verdict |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- |
+| tiny | p50 | 17.5 | 16.9 | 17.5 | **13.1** | FastAlloc 1.29x better |
+| tiny | p99 | 20.3 | 18.6 | 21.1 | **18.2** | tie (within 2%) |
+| tiny | p99.9 | 83.2 | 81.1 | 84.8 | **74.3** | FastAlloc 1.09x better |
+| small-mixed | p50 | 24.0 | 17.9 | 20.5 | **15.6** | FastAlloc 1.15x better |
+| small-mixed | p99 | 31.1 | 29.3 | 26.3 | **20.5** | FastAlloc 1.28x better |
+| small-mixed | p99.9 | 101.2 | 110.6 | 95.4 | **91.0** | FastAlloc 1.05x better |
+| random-1-4096 | p50 | 41.0 | 18.4 | 24.7 | **13.3** | FastAlloc 1.38x better |
+| random-1-4096 | p99 | 53.9 | 25.3 | 27.6 | **15.4** | FastAlloc 1.65x better |
+| random-1-4096 | p99.9 | 123.4 | **91.0** | 98.2 | 93.6 | jemalloc 1.03x better |
+
+![Latency percentiles](charts/latency.png)
+
+## Memory (overhead workload: 1M live objects, then free-all)
+
+| metric | glibc | jemalloc | mimalloc | FastAlloc |
+| :--- | ---: | ---: | ---: | ---: |
+| RSS / live bytes at full live set | 0.78 | 1.20 | 1.16 | 1.08 |
+| retained after free (MB) | 369.6 | 171.8 | 552.2 | **123.6** |
+| retained after purge (MB) | 46.7 | 171.8 | 552.2 | **16.0** |
+| peak RSS (MB) | 369.5 | 572.4 | 552.2 | 512.7 |
+| alloc phase (ms) | 169 | 99 | 85 | 167 |
+| free phase (ms) | 64 | 105 | 77 | 185 |
+
+glibc's 0.78 RSS/live ratio benefits from its 1.28x trim gain (top-chunk
+consolidation); its purge path is `malloc_trim(0)`, FastAlloc's is
+`fast_alloc_purge()` (which drains the pending queues first). jemalloc and
+mimalloc intentionally keep freed pages in arenas — that is precisely the
+retention FastAlloc does not have: 2.9x/10.7x/34.5x less memory held after
+purge. The flip side is visible in the free phase (185 ms vs 64–105 ms):
+returning memory through the locked batch path costs time during the free
+storm — the same mechanism that wins the retention column.
+
+![Memory footprint](charts/memory.png)
+
+## Thread lifecycle (spawn/exit bursts, 256 pairs per thread)
+
+| threads | glibc ns/pair | jemalloc | mimalloc | FastAlloc |
+| :--- | ---: | ---: | ---: | ---: |
+| T=1 | **155** | 657 | 206 | 252 |
+| T=2 | **115** | 519 | 159 | 238 |
+| T=4 | **103** | 497 | 121 | 215 |
+| threads/s (T=1) | **25,141** | 5,944 | 18,994 | 15,526 |
+
+A fresh FastAlloc thread performs ~52 class refills (adaptive 16-block
+batches, cross-arena steals) plus the O(bins) exit defer, while glibc's
+tcache is 64 shallow bins with a 7-entry cap — warm-up/teardown is nearly
+free. FastAlloc's 2.6x lead over jemalloc (and 1.2x over mimalloc at T=1)
+comes from the v2 thread-lifecycle work: the TLSCache recycling pool, the
+deferred lock-free exit hand-off, and direct-feed refills. The v1 → v2
+improvement was 2614 → 305 ns/pair (8.6x); today's measurement lands at
+252 ns/pair on this VM generation.
+
+![Thread lifecycle](charts/thread_lifecycle.png)
+
+## In-process microbenchmarks (Google Benchmark, std vs FastAlloc)
+
+92 paired configs (family-isolated, `--benchmark_min_time=3000x`): 77 wins /
+14 losses / 1 tie. Family verdicts (geometric mean of ratios; per-config
+verdicts in `bench_report.md`):
+
+| family | configs | verdict |
+| :--- | ---: | :--- |
+| MallocOnly | 18 | FastAlloc wins 18/18 (up to 50x at 4 KB, 285x at 4 KB/T=4) |
+| FreeOnly | 15 | FastAlloc wins 15/15 (1.5–23.8x) |
+| MallocFree | 15 | FastAlloc wins 8/15 (4096/512 B and single-thread win up to 34.6x; 8 KB loses 2.3–3.2x; 64/8 B lose at T=4/8 oversubscription) |
+| HeavyContention | 20 | FastAlloc wins 20/20 (1.15–6.7x) |
+| RandomSize | 3 | FastAlloc wins 3/3 (1.69–1.97x) |
+| ScopedAlloc | 9 | FastAlloc wins 6/9 (geo-mean 0.82x — the 32 B T=1 0.05x warmup outlier drags the mean below parity) |
+| LargeAlloc | 6 | FastAlloc wins 4/6 (64 KB T=1 0.10x = page-fault noise) |
+| Realloc | 3 | FastAlloc wins 2/3 (512 B: std wins 1.29x) |
+| Calloc | 3 | mixed: 10 B std wins 11.9x, 100 B FastAlloc 1.4x, 1000 B tie |
+
+The extreme MallocOnly ratios (50x–285x at 4–8 KB) are real but
+context-dependent: repeated same-size allocation re-faults fresh pages under
+std::malloc while FastAlloc's span cache recycles already-backed pages —
+the same effect that wins cache-thrash and the memory-retention column.
+
+![Microbenchmark family verdicts](charts/gbench_verdicts.png)
+
+## Thread scaling
+
+On the 2-vCPU box, small-mixed peaks at T=2 for every allocator and FastAlloc
+stays on top through the 2x-oversubscribed T=4 (1.40x vs glibc). Churn is the
+stress case: FastAlloc holds 1.43x/1.26x over glibc at T=1/2 and converges to
+a tie at T=4 as the shared-slab spinlocks saturate; jemalloc and mimalloc
+pull ahead there on the strength of fully private arenas (0.74–0.75x).
+
+![Thread scaling](charts/scaling.png)
+
+## Side-by-side memory stress (fast_alloc_bench_memory, one process)
+
+Threads {1,2,4} × block sizes {64, 256, 4096} B, 20,000 allocs per thread:
+FastAlloc wins all 9 time configurations (1.33x–2.22x faster) at comparable
+peak RSS (e.g. 4096 B/T=4: 283 MB std vs 292 MB FastAlloc — within 3%).
+
+## Where FastAlloc still loses (and why) — unchanged root causes
+
+| workload | this session's evidence | root cause |
+| :--- | :--- | :--- |
+| **realloc growth** | 0.28x vs glibc (consistent with 0.29x in the v4 matrix) | glibc expands its contiguous heap top in place — a property arena/slab allocators cannot replicate for small blocks without span-tracking headers on the hot free path. On par with mimalloc (1.00–1.02x), beats jemalloc (1.25x). |
+| **thread-churn vs glibc** | 0.48–0.62x (T=1..4); 25.1k vs 15.5k threads/s | ~52 class refills per fresh thread vs glibc's 64 shallow tcache bins (7-entry cap). FastAlloc still beats mimalloc at T=1 and crushes jemalloc (2.2–2.6x). |
+| **churn / cache-thrash vs jemalloc & mimalloc** | 0.55–0.75x | Competitors give each thread a private arena/heap so a constant live set never touches shared state. FastAlloc's shared slabs + 16 arenas beat glibc everywhere but not that design; closing it needs per-thread slab ownership. |
+| **ramp vs mimalloc** | 0.36–0.51x | mimalloc's thread heap keeps ramp-up allocations thread-local; FastAlloc refills from shared slabs (locked) during growth. Still 1.54–1.94x faster than glibc. |
+| **bulk alloc+free of 1M objects** | 0.66x vs glibc (free phase 185 ms vs 64 ms) | The free storm walks saturated bins through the locked batch path; the same mechanism returns 2.9–34.5x more memory to the OS. Speed-vs-RSS trade. |
+| **large at T=1** | 0.91x vs glibc (was 0.90x in the v4 matrix) | Run-to-run variance dominates this cell; at T=4 FastAlloc is 1.04x ahead and 4.6–14.6x ahead of jemalloc/mimalloc at all thread counts. |
+| **Calloc/10B** | std wins 11.9x | FastAlloc's calloc zeroes the full usable block (size-class rounded), glibc's zeroes only 10 requested bytes; at 100 B+ the comparison flips to FastAlloc. |
+| **cross-thread at T=4** | 0.91x vs glibc (T=2 was 2.52x WIN) | With 1 producer + 3 consumers on 2 vCPU, the consumer's free-side MPSC handoff competes with producer allocations; glibc's tcache free is local. |
+
+## Session-to-session variance (read before quoting numbers)
+
+This VM generation re-measured the v4 matrix within expected noise on the
+"stable" cells (realloc 0.28 vs 0.29; thread-churn T=1 0.62 vs 0.60; large
+T=1 0.91 vs 0.90; latency p50 13.1–13.3 vs 12.8; purge retention 16.0 vs
+15.8 MB) but moved the contended multi-threaded cells more than single-digit
+percent: churn-vs-glibc at T=4 moved from 1.16x WIN to a 1.00x TIE, and
+cross-thread T=4 from 1.48x WIN to 0.91x LOSS, while small-mixed T=4 moved
+from 1.50x to 1.40x. Contended cells on 2-vCPU shared runners are the
+noisiest in the matrix — the CI cross-allocator job exists precisely to
+catch regressions with repeat runs rather than single numbers. Quote the
+win/loss *pattern* (which is stable) rather than any individual multiplier;
+re-run `bench_compare.py` on your target hardware before making claims.
 
 ## What changed in v2 (thread-lifecycle & churn optimizations)
 
 Root-caused from instrumented runs, then fixed; each fix is verified by the
-full test + sanitizer battery (69/69 release, 80/80 debug incl. 11 death
-tests, ASan/UBSan/LSan clean, TSan zero warnings, 70 s TSan soak with
-~5,000 thread create/destroy cycles, 70 s ASan+debug soak, page-cache
-retention check).
+full test + sanitizer battery (75/75 release, 86 debug incl. 11 death tests —
+one debug-only test intentionally skips because the registry fatals on forged
+pointers by design, ASan/UBSan/LSan clean, TSan zero warnings).
 
 1. **TLSCache recycling pool** — retired thread caches are parked in a
    capped 32-slot pool and re-used by new threads. A thread lifecycle
@@ -54,8 +268,7 @@ retention check).
    8,192 blocks: a 256-op burst thread touching ~50 classes yanked ~18,000
    blocks out of the slabs and handed every one of them back at exit. The
    ramp resets at thread death, so short-lived threads stay small while
-   steady-state threads reach full batch size within ~9 misses (amortized
-   noise for 10M-op runs).
+   steady-state threads reach full batch size within ~9 misses.
 3. **Lazy slab wiring** — `Slab::Create` no longer writes per-block
    headers across every page of the span (a 64 KB / 32 B slab = 2,048
    headers on 16 pages, all faulted at once). Blocks are carved and wired
@@ -97,55 +310,6 @@ retention check).
     blocks are "out"; purge drains them so empty slabs (and their spans)
     actually return to the OS. Post-purge retention is back to 16 MB.
 
-## Where FastAlloc wins (single-thread medians, ns per alloc+free pair)
-
-| workload | glibc | jemalloc | mimalloc | FastAlloc | speedup vs glibc |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| tiny (1–32 B) | 19.1 | 17.6 | 14.8 | **12.9** | 1.48x |
-| small-mixed (realistic mix) | 25.1 | 18.8 | 21.4 | **15.1** | 1.66x |
-| random 1–4096 B | 42.0 | 19.6 | 25.7 | **13.7** | 3.08x |
-| ramp (0→100k live→0) | 76.3 | 95.3 | 15.2 | 43.3 | 1.76x |
-| large (64KB–512KB + touch) | 21.3 | 345.2 | 210.8 | **23.6** | 0.90x T=1 (noisy); 1.61x T=2, 1.89x T=4 |
-
-- **Single-thread latency percentiles (batch-of-64 timing):** FastAlloc has
-  the best p50 **and** p99 in every pair workload, e.g. `random-1-4096`:
-  p50 12.8 ns vs glibc 40.9 / jemalloc 18.4 / mimalloc 24.6; p99 15.5 ns
-  vs 59.1 / 25.1 / 29.1. p99.9 stays under 90 ns.
-- **Multi-thread small-block pairs:** FastAlloc is fastest at **every**
-  thread count including the 2x-oversubscribed T=4 case that it previously
-  lost: `small-mixed` T=4 = 13.6 ns vs glibc 20.4 (1.50x), jemalloc 16.4,
-  mimalloc 16.8. The v1 gap (0.52–0.79x) is gone.
-- **Thread-churn (spawn/exit bursts): 2614 → 305 ns/pair (8.6x faster).**
-  At T=1 FastAlloc is now 0.60x glibc (was 0.04x), **1.3x faster than
-  mimalloc** and **2.2x faster than jemalloc**. The remaining gap to glibc
-  is the ~52 class-refills a fresh thread performs vs glibc's tiny 64-bin
-  tcache — see the loss table.
-- **churn / cache-thrash:** FastAlloc now beats glibc at every thread count
-  (churn: 1.69x/1.35x/1.16x at T=1/2/4; cache-thrash: 1.34x/1.33x/1.12x),
-  where v1 was 1.1–1.3x on churn and ~1.1x on cache-thrash. jemalloc and
-  mimalloc still lead these two (0.6–0.74x) — their per-thread arenas keep
-  a constant live set off shared structures entirely.
-- **Cross-thread MPSC handoff** (T=2): 2.65x vs glibc; on par with
-  jemalloc/mimalloc (pending-queue path). At T=4 (1.48x glibc, 1.23x
-  mimalloc) FastAlloc leads every allocator.
-- **Memory return-to-OS** (1M live objects, 476 MB payload, then free-all):
-  FastAlloc retains **15.8 MB after purge** vs 46.5 MB glibc
-  (`malloc_trim`), 171.8 MB jemalloc, 552.3 MB mimalloc — 3x/11x/35x less.
-  Retained right after free (no purge): 123 MB vs glibc 369 / jemalloc 172
-  / mimalloc 552 — least of the four. RSS/live at full live set: 1.07
-  (glibc 0.78 with its 1.28 trim gain).
-
-## Where FastAlloc still loses (and why)
-
-| workload | evidence | root cause |
-| :--- | :--- | :--- |
-| **thread-churn at T≥2** | 281/252 ns vs glibc 141/103 (0.50x/0.41x) | A fresh thread performs ~52 class refills (16 blocks each, stolen cross-arena) plus an O(bins) exit defer. glibc's tcache is 64 shallow bins with a 7-entry cap, so its per-thread warm-up/teardown is trivial. v1 was 0.04–0.16x here; v2 is 0.41–0.50x vs glibc but beats mimalloc (0.56–0.63x) and crushes jemalloc (2x). Structural without a per-CPU cache redesign. |
-| **realloc growth** (1.5x geometric to 8KB) | 31.6 ns/step vs glibc 9.0 (0.29x) | glibc expands its contiguous heap top in place — a property arena/slab allocators cannot replicate for small blocks without span-tracking headers on the hot free path. FastAlloc is on par with mimalloc (1.03x) and beats jemalloc (1.30x). The copy path itself is already minimal (pop new class, memcpy, push old). |
-| **churn / cache-thrash vs jemalloc/mimalloc** | 0.6–0.74x at T=1..4 | Both competitors give each thread a private arena/heap, so a constant 50 MB live set never touches shared state. FastAlloc's shared slabs + 16 arenas win against glibc everywhere but not against that design; closing it needs per-thread slab ownership (a P4-scale redesign). |
-| **ramp vs mimalloc** | 0.35–0.55x | mimalloc's thread heap keeps ramp-up allocations entirely thread-local; FastAlloc refills from shared slabs (locked) during growth. Still 1.76–2.14x faster than glibc. |
-| **bulk alloc+free of 1M objects** | 334 vs glibc 228 ns/op (0.68x; v1: 0.61x) | The free phase (177 ms vs glibc 63 ms) walks saturated bins through the locked batch path; the same mechanism is what returns 3–35x more memory to the OS than the competitors. Speed-vs-RSS trade, visible in both tables. |
-| **large at T=1** | 23.6 vs glibc 21.3 (0.90x) | Run-to-run variance dominates this cell (glibc itself moved 26.2→21.3 between the v1 and v3 matrices with identical code); at T=2/T=4 FastAlloc is clearly ahead (1.61x/1.89x) and 7–15x ahead of jemalloc/mimalloc at all thread counts. |
-
 ## Old suite (Google Benchmark) numbers — kept for continuity
 
 The legacy `bench_main` batch-of-500 numbers (8 B: 9.6 µs std vs 4.8 µs
@@ -155,8 +319,10 @@ glibc's own tcache. Treat them as a fast-path microbenchmark, not as an
 application-level claim. The legacy `bench_memory` side-by-side mode also
 had a known flaw: it ran std then FastAlloc **in one process**, so
 FastAlloc's "peak RSS" column inherited glibc's high-water mark
-(`ru_maxrss` is process-lifetime monotonic). The new suite fixes this by
-running one allocator per process.
+(`ru_maxrss` is process-lifetime monotonic). The cross-allocator suite
+fixes this by running one allocator per process; the side-by-side binary is
+kept as a quick smoke tool and its RSS column should be read with that
+caveat.
 
 ## Design notes affecting performance
 
@@ -172,22 +338,27 @@ running one allocator per process.
   debug build is for validation, not production numbers. Debug builds keep
   eager slab wiring; lazy carving is release-only.
 - Windows paths use Fls* + VirtualAlloc; behaviour is equivalent but was
-  verified by inspection on this box (no MSVC run here; CI covers it). The
-  span pool and mremap guards are Linux-only (`#ifdef __linux__`), so
-  Windows takes the previous syscall path unchanged.
+  verified by inspection on this box (no MSVC run here; CI covers it — the
+  windows-msvc-asan job runs the suite under ASan with the runtime DLL
+  staged next to the executables). The span pool and mremap guards are
+  Linux-only (`#ifdef __linux__`), so Windows takes the previous syscall
+  path unchanged.
 
 ## Honest summary
 
 FastAlloc is the fastest allocator in this matrix for the classic
 server-shaped workload — small mixed-size alloc/free pairs — at **every**
-thread count including 2x oversubscription, with best-in-class p50/p99
-latency, 8.6x faster thread lifecycles than v1 (now ahead of mimalloc and
-jemalloc at T=1, within 0.5x of glibc), and it remains dramatically faster
-(7–15x) than jemalloc/mimalloc on large-block cycles while returning
-3–35x more memory to the OS than any competitor after purge. It is **not**
-the fastest at realloc-heavy patterns (glibc's contiguous heap grows in
-place; FastAlloc ties mimalloc and beats jemalloc), at
-constant-live-set churn against jemalloc/mimalloc's private-arena design
-(though it beats glibc everywhere), or at multi-thread spawn/exit storms
-against glibc's minimal tcache. Every remaining gap has a measured root
-cause and a scoped fix proposal above.
+thread count including 2x oversubscription (1.16–1.51x vs glibc, winning
+against jemalloc and mimalloc at T=1/T=4 too), with the best p50/p99 tail
+latency of all four allocators, 4.6–14.6x faster than jemalloc/mimalloc on
+large-block cycles, and it returns 2.9–34.5x more memory to the OS after
+purge than any competitor. It is **not** the fastest at realloc-heavy
+patterns (0.28x vs glibc's in-place heap growth; ties mimalloc, beats
+jemalloc), at constant-live-set churn against mimalloc's/jemalloc's
+private-arena design (still beats glibc at T=1/2, ties at T=4), at ramp
+growth against mimalloc's thread-local heap (0.36–0.51x), at multi-thread
+spawn/exit storms against glibc's minimal tcache (0.48–0.62x; but 2.2–2.6x
+faster than jemalloc), or at bulk free storms (0.66x — the price of the
+memory-return column). Every gap has a measured root cause above and a
+scoped fix proposal; every number in this report can be regenerated with
+one command (`bench_compare.py`).

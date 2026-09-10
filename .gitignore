@@ -50,3 +50,10 @@ _deps/
 
 # Local verification build trees (v8 session)
 build_*/
+
+# bench_compare.py session caches (family JSONs reused between invocations)
+benchmarks/benchsuite/gbench_cache/
+benchmarks/benchsuite/bench_report_data.json
+benchmarks/benchsuite/compare_results.jsonl
+benchmarks/benchsuite/bench_report.md
+
