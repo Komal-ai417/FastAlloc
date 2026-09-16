@@ -187,14 +187,6 @@ For in-depth explanations of FastAlloc's internal mechanics, refer to the docs:
 - [QA & Memory Safety Report](docs/qa_report.md)
 - [API Reference Guide](docs/api_reference.md)
 
-Benchmark charts (regenerated 2026-09-10, in `docs/charts/`):
-- [Speedup heatmap (vs all three allocators)](docs/charts/speedup_heatmap.png)
-- [Latency percentiles](docs/charts/latency.png)
-- [Thread scaling](docs/charts/scaling.png)
-- [Memory footprint & retention](docs/charts/memory.png)
-- [Thread lifecycle](docs/charts/thread_lifecycle.png)
-- [Microbenchmark family verdicts](docs/charts/gbench_verdicts.png)
-
 ## License
 
 This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
