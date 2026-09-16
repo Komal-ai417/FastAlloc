@@ -176,13 +176,13 @@ mimalloc's thread-local heap (0.36–0.51x), for bulk free storms (0.66x —
 the price of the memory-return win), or for thread spawn/exit storms vs
 glibc's minimal tcache (0.48–0.62x; still 2.2–2.6x faster than jemalloc) —
 see [docs/performance_report.md](docs/performance_report.md) for the full
-win/loss matrices, latency/memory/thread-lifecycle sections, charts and
+win/loss matrices, latency/memory/thread-lifecycle sections, and
 root causes.
 
 ## Documentation
 
 For in-depth explanations of FastAlloc's internal mechanics, refer to the docs:
-- [Performance & Benchmark Report](docs/performance_report.md) (with charts in `docs/charts/`)
+- [Performance & Benchmark Report](docs/performance_report.md)
 - [Technical Design Document](docs/technical_design.md)
 - [QA & Memory Safety Report](docs/qa_report.md)
 - [API Reference Guide](docs/api_reference.md)

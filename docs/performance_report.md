@@ -72,8 +72,6 @@ Long sessions can be chunked: `--workloads tiny,churn ...` runs a subset,
   `Calloc/10B` (std wins 11.9x — FastAlloc's calloc zeroes the full usable
   block; see loss table).
 
-![FastAlloc speedup heatmap](charts/speedup_heatmap.png)
-
 ## Full verdict matrices (median ns per op; ratio = competitor/FastAlloc)
 
 ### FastAlloc vs glibc
@@ -138,8 +136,6 @@ Long sessions can be chunked: `--workloads tiny,churn ...` runs a subset,
 | random-1-4096 | p99 | 53.9 | 25.3 | 27.6 | **15.4** | FastAlloc 1.65x better |
 | random-1-4096 | p99.9 | 123.4 | **91.0** | 98.2 | 93.6 | jemalloc 1.03x better |
 
-![Latency percentiles](charts/latency.png)
-
 ## Memory (overhead workload: 1M live objects, then free-all)
 
 | metric | glibc | jemalloc | mimalloc | FastAlloc |
@@ -160,8 +156,6 @@ purge. The flip side is visible in the free phase (185 ms vs 64–105 ms):
 returning memory through the locked batch path costs time during the free
 storm — the same mechanism that wins the retention column.
 
-![Memory footprint](charts/memory.png)
-
 ## Thread lifecycle (spawn/exit bursts, 256 pairs per thread)
 
 | threads | glibc ns/pair | jemalloc | mimalloc | FastAlloc |
@@ -179,8 +173,6 @@ comes from the v2 thread-lifecycle work: the TLSCache recycling pool, the
 deferred lock-free exit hand-off, and direct-feed refills. The v1 → v2
 improvement was 2614 → 305 ns/pair (8.6x); today's measurement lands at
 252 ns/pair on this VM generation.
-
-![Thread lifecycle](charts/thread_lifecycle.png)
 
 ## In-process microbenchmarks (Google Benchmark, std vs FastAlloc)
 
@@ -205,8 +197,6 @@ context-dependent: repeated same-size allocation re-faults fresh pages under
 std::malloc while FastAlloc's span cache recycles already-backed pages —
 the same effect that wins cache-thrash and the memory-retention column.
 
-![Microbenchmark family verdicts](charts/gbench_verdicts.png)
-
 ## Thread scaling
 
 On the 2-vCPU box, small-mixed peaks at T=2 for every allocator and FastAlloc
@@ -214,8 +204,6 @@ stays on top through the 2x-oversubscribed T=4 (1.40x vs glibc). Churn is the
 stress case: FastAlloc holds 1.43x/1.26x over glibc at T=1/2 and converges to
 a tie at T=4 as the shared-slab spinlocks saturate; jemalloc and mimalloc
 pull ahead there on the strength of fully private arenas (0.74–0.75x).
-
-![Thread scaling](charts/scaling.png)
 
 ## Side-by-side memory stress (fast_alloc_bench_memory, one process)
 
