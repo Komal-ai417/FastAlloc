@@ -229,8 +229,8 @@ jobs:
         # RunKit scripts/03_sanitizers.sh + RUNBOOK §10: libtsan runtimes from
         # GCC<=13 / clang<=17 die BEFORE main() with
         #   "FATAL: ThreadSanitizer: unexpected memory mapping"
-        # on kernels with vm.mmap_rnd_bits > 28 — which is the Ubuntu
-        # 24.04-era default that ubuntu-latest ships. That is a
+        # on kernels with vm.mmap_rnd_bits > 28 — which is the
+        # Ubuntu 24.04-era default that ubuntu-latest ships. That is a
         # toolchain/kernel incompatibility, NOT a FastAlloc defect (the same
         # binaries are clean under ASan/UBSan/LSan on the same runner), and
         # which processes lose the ASLR lottery differs per boot — so this
@@ -245,44 +245,10 @@ jobs:
         run: |
           if [ "${{ matrix.sanitizer }}" = "thread" ] && command -v setarch >/dev/null 2>&1; then
             echo "TSan leg: running under 'setarch $(uname -m) -R' (per-process ASLR off)."
-            setarch "$(uname -m)" -R ctest --test-dir build --output-on-failure --timeout 2100
+            setarch "$(uname -m)" -R ctest --test-dir build --output-on-failure
           else
-            ctest --test-dir build --output-on-failure --timeout 2100
+            ctest --test-dir build --output-on-failure
           fi
-        # Why the audit suite needs a raised per-test budget under TSan.
-        #
-        # This job failed 2026-10-02 with "***Timeout 1500.16 sec" on
-        # AuditConcurrency.ThreadCountSweep1to128 (ctest exit code 8). That is
-        # NOT a sanitizer report: the log contains no ThreadSanitizer finding,
-        # and the validate suite PASSED in the same job. It is cost scaling:
-        #
-        #   * ThreadCountSweep1to128 runs ThreadSweep(n, 2000 ops, 8176B, mixed)
-        #     for n in {1,2,4,8,16,32,64,128}. Per-thread ops are CONSTANT, so
-        #     the 32/64/128 legs hold 448k of the test's 510k ops -- 88% of the
-        #     work sits in the three legs the failing log never printed (it
-        #     reached 16 and then produced no further output).
-        #   * Measured here on a 12-core dev box: release 2.8s vs TSan still
-        #     running past 210s (>75x). TSan instruments every memory access
-        #     and the penalty grows with thread count, so this sweep is the
-        #     worst-case test in the suite for any fixed budget. GitHub's
-        #     2-4 vCPU shared runner is slower still, so no budget derived
-        #     from local timings is safe on its own.
-        #
-        # 2100s (35 min) is headroom for the legitimately slow leg, NOT slack
-        # to hide a regression: the suite is checksum- and invariant-guarded
-        # and fails fast (halt_on_error=1) when something is actually wrong, so
-        # a real defect still fails quickly. Deliberately NOT trimming the sweep
-        # under TSan -- dropping the 32/64/128 legs would delete exactly the
-        # high-thread-count race coverage that justifies running TSan.
-        #
-        # Ordering matters and is easy to get wrong: this STEP's
-        # `timeout-minutes: 45` (2700s) is a hard kill of the whole step, so it
-        # MUST be larger than `--timeout 2100`. If the ctest budget exceeded
-        # 2700s it could never fire and a real hang would surface as an
-        # abrupt job kill with no "Timeout" line naming the guilty test. As
-        # configured, ctest's own timeout fires first and names it; the 45-min
-        # cap is the outer backstop for a true deadlock.
-        timeout-minutes: 45
         env:
           # allocator_may_return_null=1: sanitizer allocator in libc-compatible
           # mode for the differential overflow probes (mirrored as a compiled-in
@@ -558,28 +524,42 @@ jobs:
           }
           EOF
 
-      - name: Build + run override probe
+      - name: Build + run override probe (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            LIB=build-override/Release/fast_alloc.lib
-            OUT=override_probe.exe
-          else
-            LIB=build-override/libfast_alloc.a
-            OUT=override_probe
-          fi
           # FAST_ALLOC_OVERRIDE_NEW is what makes this TU's operators forward
           # to FastAlloc; the library itself is already compiled with it.
           g++ -std=c++17 -O2 -DFAST_ALLOC_OVERRIDE_NEW -Iinclude \
-              override_probe.cpp "$LIB" -pthread -o "$OUT"
+              override_probe.cpp build-override/libfast_alloc.a -pthread -o override_probe
           # A recursive_init_error abort exits 134 (SIGABRT) rather than 1, so
           # print the status explicitly either way.
           set +e
-          "./$OUT"
+          ./override_probe
           rc=$?
           set -e
           echo "override probe exit=$rc"
           [ $rc -eq 0 ] || exit $rc
+
+      - name: Build + run override probe (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          rem The MSVC-built fast_alloc.lib exports MSVC-mangled C++ symbols
+          rem (?fast_alloc_stats@FastAlloc@@...). MinGW g++ cannot resolve
+          rem them (GCC mangles the same call _ZN8FastAlloc16fast_alloc_statsEv
+          rem - a different C++ ABI), so the probe is compiled with the SAME
+          rem MSVC toolchain that built the library: vswhere locates the VS
+          rem install, vcvarsall sets up cl/link, exactly like the DLL
+          rem staging step in the windows-asan job above.
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /nologo /std:c++17 /O2 /EHsc /DFAST_ALLOC_OVERRIDE_NEW /Iinclude override_probe.cpp /Fe:override_probe.exe /link /LIBPATH:build-override\Release fast_alloc.lib
+          if errorlevel 1 exit /b 1
+          override_probe.exe
+          set RC=%ERRORLEVEL%
+          echo override probe exit=%RC%
+          if %RC% NEQ 0 exit /b %RC%
 
   # ---------------------------------------------------------------------------
   # Memory-footprint proof (RunKit scripts/06_memory_footprint.sh, RUNBOOK §5).
