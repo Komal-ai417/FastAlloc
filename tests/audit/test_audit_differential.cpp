@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _MSC_VER
+#include <malloc.h>  // _aligned_malloc, _aligned_free
+#endif
 
 using namespace FastAlloc;
 
@@ -91,11 +94,22 @@ TEST(AuditDifferential, FastAllocVsGlibc_ObservableEquivalence) {
     // static library and does not interpose, so both coexist)
     Obs gl = RunStream(0x01A1, 20000,
         [](std::size_t s) { return std::malloc(s); },
+#ifdef _MSC_VER
+        // _aligned_malloc must be freed with _aligned_free on MSVC;
+        // _aligned_free is safe for regular malloc pointers too.
+        [](void* p) { _aligned_free(p); },
+#else
         [](void* p) { std::free(p); },
+#endif
         [](void* p, std::size_t n) { return std::realloc(p, n); },
         [](std::size_t a, std::size_t s) -> void* {
             if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;  // FastAlloc contract
-            return std::aligned_alloc(a, (s + a - 1) & ~(a - 1));
+            std::size_t aligned_s = (s + a - 1) & ~(a - 1);
+#ifdef _MSC_VER
+            return _aligned_malloc(aligned_s, a);  // MSVC: no std::aligned_alloc
+#else
+            return std::aligned_alloc(a, aligned_s);
+#endif
         });
     // Both allocators must succeed for the whole stream on this 4GB box
     size_t fa_fail = std::count(fa.outcomes.begin(), fa.outcomes.end(), 0);
@@ -110,10 +124,16 @@ TEST(AuditDifferential, FastAllocVsGlibc_ObservableEquivalence) {
     }
     // calloc overflow: both fail
     EXPECT_EQ(fast_calloc(SIZE_MAX, 3), nullptr);
+#ifndef _MSC_VER
 #pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic ignored "-Walloc-size-larger-than="
+#endif
+#endif
     EXPECT_EQ(std::calloc(SIZE_MAX, 3), nullptr);
+#ifndef _MSC_VER
 #pragma GCC diagnostic pop
+#endif
     // realloc(p,0): both free and return null (glibc does since 2.4x? C11)
     void* p1 = fast_malloc(10); void* p2 = std::malloc(10);
     EXPECT_EQ(fast_realloc(p1, 0), nullptr);
