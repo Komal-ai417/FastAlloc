@@ -111,7 +111,10 @@ jobs:
                 -DFASTALLOC_BUILD_TESTS=ON `
                 -DFASTALLOC_SANITIZE=address
       - name: Build
-        run: cmake --build build --config Release -j --target fast_alloc_tests
+        # BOTH gtest binaries: ctest runs every registered test, and the
+        # audit suite (fast_alloc_audit_tests) is registered too — building
+        # only fast_alloc_tests would leave it "Not Run" and fail the job.
+        run: cmake --build build --config Release -j --target fast_alloc_tests fast_alloc_audit_tests
       - name: Stage MSVC ASan runtime + symbolizer (v12)
         shell: pwsh
         run: |
@@ -151,7 +154,11 @@ jobs:
         # green, while a deterministic failure still stops at the first one.
         run: ctest --test-dir build --build-config Release --output-on-failure -V --repeat until-fail:3 --timeout 1800
         env:
-          ASAN_OPTIONS: halt_on_error=1
+          # allocator_may_return_null=1: the differential tests probe libc's
+          # "overflow fails cleanly" contract; sanitizer runtimes must behave
+          # libc-compatible instead of aborting (also default via
+          # tests/sanitizer_defaults.cpp -- env wins per-flag, keep in sync).
+          ASAN_OPTIONS: halt_on_error=1:allocator_may_return_null=1
       - name: Post-mortem rerun under cdb (failure only)
         if: failure()
         shell: pwsh
@@ -166,7 +173,7 @@ jobs:
             Write-Host "cdb.exe not found on this image - skipping post-mortem"
             exit 0
           }
-          $env:ASAN_OPTIONS = "halt_on_error=1:abort_on_error=1:symbolize=1"
+          $env:ASAN_OPTIONS = "halt_on_error=1:abort_on_error=1:symbolize=1:allocator_may_return_null=1"
           $out = Join-Path $env:RUNNER_TEMP "cdb-rerun.txt"
           $exe = Join-Path $PWD "build\Release\fast_alloc_tests.exe"
           $p = Start-Process -FilePath $cdb -PassThru -NoNewWindow `
@@ -209,8 +216,11 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
         env:
-          TSAN_OPTIONS: halt_on_error=1
-          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          # allocator_may_return_null=1: sanitizer allocator in libc-compatible
+          # mode for the differential overflow probes (mirrored as a compiled-in
+          # default in tests/sanitizer_defaults.cpp; env wins per-flag).
+          TSAN_OPTIONS: halt_on_error=1:allocator_may_return_null=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:allocator_may_return_null=1
           UBSAN_OPTIONS: halt_on_error=1
 
   # ---------------------------------------------------------------------------
@@ -228,7 +238,10 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
         env:
-          ASAN_OPTIONS: detect_leaks=1
+          # allocator_may_return_null=1: libc-compatible overflow failures for
+          # the differential probes (also compiled-in via
+          # tests/sanitizer_defaults.cpp; env wins per-flag).
+          ASAN_OPTIONS: detect_leaks=1:allocator_may_return_null=1
 
   # ---------------------------------------------------------------------------
   # Windows VirtualAlloc/VirtualFree semantics, emulated on Linux.
@@ -262,10 +275,101 @@ jobs:
           -DCMAKE_CXX_FLAGS="-DFASTALLOC_WINVA_EMULATION"
 
       - name: Build
-        run: cmake --build build -j --target fast_alloc_tests
+        # Both gtest binaries — ctest runs every registered test (see
+        # windows-asan note): the audit suite must be built too.
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Fuzzing (audit §8): the fuzz/ harness family — shared byte-program ISA
+  # (8 op classes) + shadow model, invariants checked after EVERY op.
+  #
+  #   1. fast_alloc_fuzz_standalone, release semantics — deterministic seed,
+  #      120 s budget, exit 0 + "FUZZ-CLEAN" = no invariant violations.
+  #   2. fast_alloc_fuzz_standalone, FASTALLOC_DEBUG semantics — canaries,
+  #      exact-size registry, poison and leak machinery active WHILE
+  #      fuzzing (the debug build is the one that found nothing but proved
+  #      the F1 fix holds under random programs).
+  #   3. libFuzzer campaign — clang, -fsanitize=fuzzer,address,undefined,
+  #      persistent allocator state across inputs; mirrors the audit's
+  #      build_fuzz.sh (480 s campaign: 36 794 units, 76 exec/s, 0 ASan/
+  #      UBSan/LSan errors). CI budget: 300 s + corpus + crash artifacts
+  #      uploaded on every run.
+  # ---------------------------------------------------------------------------
+  fuzzing:
+    name: fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (release semantics + fuzz harnesses)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=ON
+          -DFASTALLOC_BUILD_FUZZ=ON
+
+      - name: Build fuzz harness (standalone)
+        run: cmake --build build -j --target fast_alloc_fuzz_standalone
+
+      - name: Smoke campaign via ctest (20 s, seed pinned)
+        run: ctest --test-dir build --output-on-failure -R fast_alloc_fuzz_smoke
+
+      - name: Standalone campaign — release semantics (120 s)
+        run: |
+          set -o pipefail
+          ./build/fast_alloc_fuzz_standalone 120 20260930 2>&1 | tee fuzz-standalone-release.log
+          grep -q "FUZZ-CLEAN" fuzz-standalone-release.log
+
+      - name: Configure (FASTALLOC_DEBUG semantics + fuzz harnesses)
+        run: >
+          cmake -S . -B build-dbg -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_FUZZ=ON
+          -DFASTALLOC_DEBUG=ON
+
+      - name: Build fuzz harness (standalone, debug semantics)
+        run: cmake --build build-dbg -j --target fast_alloc_fuzz_standalone
+
+      - name: Standalone campaign — debug semantics (120 s)
+        run: |
+          set -o pipefail
+          ./build-dbg/fast_alloc_fuzz_standalone 120 20260931 2>&1 | tee fuzz-standalone-debug.log
+          grep -q "FUZZ-CLEAN" fuzz-standalone-debug.log
+
+      - name: libFuzzer campaign (clang, fuzzer+address+undefined, 300 s)
+        run: |
+          # Identical flag set to audit-scripts/build_fuzz.sh, which produced
+          # the audit's 480 s campaign (0 sanitizer findings). The library
+          # sources are compiled INTO the harness so ASan/UBSan instrument
+          # the allocator itself.
+          LIBS="src/fast_alloc.cpp src/slab.cpp src/global_heap.cpp src/tls_cache.cpp src/os_memory.cpp src/debug_aid.cpp"
+          mkdir -p fuzz-artifacts corpus
+          clang++ -g -O1 -std=gnu++17 -fsanitize=fuzzer,address,undefined \
+            -fno-omit-frame-pointer -Iinclude -Isrc -pthread \
+            fuzz/fuzz_ops_libfuzzer.cpp $LIBS -o fuzz_ops_libfuzzer
+          ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=halt_on_error=1 \
+          ./fuzz_ops_libfuzzer -max_total_time=300 -rss_limit_mb=4096 \
+            -print_final_stats=1 -artifact_prefix=fuzz-artifacts/ corpus/ \
+            2>&1 | tee fuzz-libfuzzer-campaign.log
+          # A crash/leak exits non-zero (fails this step). Belt-and-braces:
+          # no sanitizer error lines may be present in the log either.
+          ! grep -q -E "ERROR: (AddressSanitizer|LeakSanitizer)|runtime error:" fuzz-libfuzzer-campaign.log
+
+      - name: Upload fuzz campaign logs + crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-logs
+          path: |
+            fuzz-standalone-release.log
+            fuzz-standalone-debug.log
+            fuzz-libfuzzer-campaign.log
+            fuzz-artifacts/
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # EVERY benchmark, on BOTH Linux and Windows, executed (not just built):

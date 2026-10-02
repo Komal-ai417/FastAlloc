@@ -48,7 +48,7 @@ Thumbs.db
 # FetchContent leaves nothing behind in-tree, but guard anyway
 _deps/
 
-# Local verification build trees (v8 session)
+# Local verification build trees
 build_*/
 
 # bench_compare.py session caches (family JSONs reused between invocations)
@@ -57,3 +57,7 @@ benchmarks/benchsuite/bench_report_data.json
 benchmarks/benchsuite/compare_results.jsonl
 benchmarks/benchsuite/bench_report.md
 
+# Local verification outputs — written to benchmarks/results/ (regenerable)
+benchmarks/results/bench_fast.jsonl
+benchmarks/results/cross_allocator_results.jsonl
+benchmarks/results/cross_allocator_report.md

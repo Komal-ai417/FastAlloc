@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <thread>
 #include <cstdlib>
+#include <new>
 
 namespace FastAlloc {
 
@@ -263,9 +264,19 @@ std::size_t PurgePageCacheLocked() {
 // late TLS destructor at process shutdown (unspecified destruction order
 // across translation units) -> use-after-destroy. Leaking is the standard
 // allocator practice: the OS reclaims everything at exit anyway.
+//
+// FIX (RunKit audit finding OVR-1): the instance used to be created with
+// `new GlobalHeap()`, which routes through the GLOBAL operator new. When the
+// library is built with FASTALLOC_OVERRIDE_NEW, that operator forwards to
+// fast_malloc() - which needs this very singleton - so the very first
+// allocation re-entered the magic-static initializer and aborted with
+// __gnu_cxx::recursive_init_error. Placing the object in static storage
+// removes the bootstrap allocation entirely; the ctor still runs exactly
+// once, lazily, and is never destroyed (the intentional leak is preserved).
 // ---------------------------------------------------------------------------
 GlobalHeap& GlobalHeap::GetInstance() {
-    static GlobalHeap* instance = new GlobalHeap(); // NOLINT: intentional leak
+    alignas(GlobalHeap) static unsigned char storage[sizeof(GlobalHeap)];
+    static GlobalHeap* instance = ::new (static_cast<void*>(storage)) GlobalHeap();
     return *instance;
 }
 

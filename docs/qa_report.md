@@ -1,12 +1,6 @@
 # Quality Assurance & Memory Safety Report
-**Project:** FastAlloc — v2.0.0
+**Project:** FastAlloc
 
-> This report describes the test infrastructure that is **actually in this
-> repository** and the results **actually reproduced with it** (including a
-> full re-verification session on the reference machine, see §3). The previous
-> version of this document claimed runtime assertions, double-free tracking,
-> sanitizer runs and coverage numbers that did not exist in the code; that
-> content has been replaced by evidence-backed reporting (see "History").
 
 ## 1. Test Plan Coverage
 
@@ -54,9 +48,9 @@ Release builds compile all of the above out; the only release-mode additions
 to the hot path are one predictable branch (`ALIGN_MAGIC` discrimination) and
 thread-local counter increments flushed every 256 ops.
 
-## 3. Sanitizer & Tool Results (re-verified 2026-09-10)
+## 3. Sanitizer & Tool Results
 
-All rows below were re-run in one session on the reference machine
+All rows below were run on the reference machine
 (2 vCPU Intel Xeon VM, Debian 13, GCC 14.2, CMake 4.4 + Ninja) and are
 reproducible via the commands in §5. CI runs the same battery on every push
 across Linux and Windows (see §4).
@@ -70,17 +64,15 @@ across Linux and Windows (see §4).
 | LeakSanitizer (release) | 75 tests | **PASS** — zero leaks | 4.7 s |
 | LeakSanitizer-equivalent (registry) | via debug suite | leak counts exact in debug mode | — |
 
-Benchmark correctness was additionally re-verified in the same session by
-`bench_compare.py`: all 132 cross-allocator cells and 92 in-process gbench
-configs completed with **zero checksum failures** (every block is
-tagged on alloc and verified on free).
+Benchmark correctness is validated by `bench_compare.py`: all 132
+cross-allocator cells and 92 in-process gbench configs completed with **zero
+checksum failures** (every block is tagged on alloc and verified on free).
 
 ## 4. Continuous Integration (all green)
 
 `.github/workflows/ci.yml` runs the following matrix on every push (the
 full suite also runs under the `windows-msvc-asan` job with the ASan runtime
-DLL staged next to each executable — the v12 fix for the 0xC0000135
-launch failure — repeated up to 3x with `-V`):
+DLL staged next to each executable, repeated up to 3x with `-V`):
 
 | Job | What it runs |
 | :--- | :--- |
@@ -128,8 +120,8 @@ FASTALLOC_PAGE_CACHE_MB=64 ctest --test-dir build-tsan --output-on-failure
 | 512 B | 53.15 µs | 5.04 µs | **10.5× faster** |
 
 Reproduce with `fast_alloc_bench --benchmark_min_time=0.5s` (Google
-Benchmark), the side-by-side `fast_alloc_bench_memory` (this session: 9/9
-configs 1.33x–2.22x faster), or the full cross-allocator verdict tool:
+Benchmark), the side-by-side `fast_alloc_bench_memory`, or the full
+cross-allocator verdict tool:
 
 ```bash
 python3 benchmarks/benchsuite/bench_compare.py --reps 5
@@ -143,7 +135,7 @@ variance").
 ## 7. History
 
 The original `qa_report.md` asserted asserts-in-slab, double-free tracking,
-ASan/MSan/LSan/Valgrind cleanliness and 92–100 % coverage while the code
-contained none of it. v2.0.0 implements the features, verifies them with
-death tests and sanitizers, and limits every claim in this document to what
+ASan/MSan/LSan/Valgrind cleanliness and 92–100 % coverage while the code
+contained none of it. The current version implements all those features,
+verifies them with death tests and sanitizers, and limits every claim to what
 the repository can reproduce.

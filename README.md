@@ -151,12 +151,13 @@ JSONL. Long sessions can be chunked (`--workloads churn,tiny`,
 #    style workloads against glibc / jemalloc / mimalloc via LD_PRELOAD,
 #    one allocator per process, JSONL output:
 cmake --build build --target bench_suite -j
-./build/bench_suite --alloc fast --label FastAlloc --workload churn --threads 4 --reps 5 --json results.jsonl
-LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 ./build/bench_suite --alloc std --label jemalloc --workload churn --threads 4 --reps 5 --json results.jsonl
+mkdir -p benchmarks/results
+./build/bench_suite --alloc fast --label FastAlloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
+LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 ./build/bench_suite --alloc std --label jemalloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
 
 # 4. Cross-allocator matrix driver + analyzer (CI's benchmark-matrix job)
-cd benchmarks/benchsuite && bash ./run_matrix.sh results.jsonl 5
-python3 analyze.py results.jsonl
+cd benchmarks/benchsuite && bash ./run_matrix.sh ../../benchmarks/results/cross_allocator_results.jsonl 5
+python3 analyze.py ../../benchmarks/results/cross_allocator_results.jsonl
 ```
 
 *Note (honest, re-measured 2026-09-10 on a 2-vCPU VM vs glibc 2.41 /
@@ -194,7 +195,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ---
 
-## Verification Matrix (v2.0.0, re-verified 2026-09-10)
+## Verification Matrix
 
 | Configuration | Tests | Status |
 | :--- | :--- | :--- |

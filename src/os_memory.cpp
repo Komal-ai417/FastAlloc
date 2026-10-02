@@ -1,3 +1,4 @@
+#include <new>
 #include "os_memory.h"
 
 // ============================================================================
@@ -326,7 +327,14 @@ struct SpanPool {
 };
 
 SpanPool& Pool() {
-    static SpanPool* pool = new SpanPool(); // NOLINT: intentional leak
+    // FIX (RunKit audit finding OVR-1, part 3): same bootstrap hazard as the
+    // GlobalHeap/CachePool singletons - `new SpanPool()` routes through the
+    // global operator new, which under FASTALLOC_OVERRIDE_NEW forwards to
+    // fast_malloc, which needs this very pool when it first maps a span:
+    // recursive magic-static init -> __gnu_cxx::recursive_init_error.
+    // Static storage + placement new = zero allocations at bootstrap.
+    alignas(SpanPool) static unsigned char storage[sizeof(SpanPool)];
+    static SpanPool* pool = ::new (static_cast<void*>(storage)) SpanPool();
     return *pool;
 }
 

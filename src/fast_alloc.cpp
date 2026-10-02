@@ -574,7 +574,16 @@ void fast_free_sized(void* ptr, std::size_t size) {
         fast_free(ptr);
         return;
     }
-    TLSCache::GetFast().DeallocateBlock(class_index, block);
+    // FIX (RunKit audit finding STAT-1): this release fast path used to call
+    // DeallocateBlock() without CountSmallFree(), so every sized free was
+    // missing from small_frees / current_live_blocks / current_live_bytes in
+    // release builds (the FASTALLOC_OVERRIDE_NEW sized-delete overload lands
+    // here, making fast_alloc_stats() report monotonically growing "live"
+    // counts). The memory itself was freed correctly - only the diagnostics
+    // were wrong. Count it exactly like the unsized fast_free() path does.
+    TLSCache& tls = TLSCache::GetFast();
+    tls.CountSmallFree(UsableSize(class_index));
+    tls.DeallocateBlock(class_index, block);
 }
 
 void* fast_calloc(std::size_t num, std::size_t size) {
@@ -586,6 +595,30 @@ void* fast_calloc(std::size_t num, std::size_t size) {
     }
     return ptr;
 }
+
+//------------------------------------------------------------------------------
+// AUDIT FIX F1 (2026-09-30): large-shrink keep-span early returns used to
+// skip the FASTALLOC_DEBUG registry/red-zone update. The registry kept the
+// OLD logical size, so a lawful write up to new_size destroyed the stale
+// rear red zone and fast_free() reported a FALSE "BUFFER OVERFLOW". Every
+// keep-span exit now records rec.size = new_size and refills the red zone
+// from ptr+new_size to the unchanged span's usable end.
+//------------------------------------------------------------------------------
+#if FASTALLOC_DEBUG_ENABLED
+namespace {
+void DebugUpdateKeptLargeSpan(void* ptr, std::size_t new_size,
+                               std::size_t span_usable) {
+    if (span_usable < new_size) return;  // defensive; caller guarantees
+    AllocRecord rec{};
+    if (AllocRegistry::GetInstance().Erase(ptr, &rec)) {
+        rec.size = new_size;   // logical size changed; span (rec.usable) did not
+        AllocRegistry::GetInstance().Insert(rec, nullptr);
+    }
+    debug_check::FillRearRedZone(static_cast<char*>(ptr) + new_size,
+                                 span_usable - new_size);
+}
+}  // namespace
+#endif
 
 void* fast_realloc(void* ptr, std::size_t new_size) {
     TLSCache::GetFast().CountRealloc();
@@ -714,14 +747,24 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
                 static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
             std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
-            if (needed >= header->alloc_size) return ptr; // rounding ate the gain
+            [[maybe_unused]] std::size_t span_usable =
+                header->alloc_size - sizeof(LargeAllocHeader);
+#if FASTALLOC_DEBUG_ENABLED
+            // AUDIT FIX F1: keep-span exits must update the debug registry.
+            auto debug_keep = [&]() {
+                DebugUpdateKeptLargeSpan(ptr, new_size, span_usable);
+            };
+#else
+            auto debug_keep = []() {};
+#endif
+            if (needed >= header->alloc_size) { debug_keep(); return ptr; } // rounding ate the gain
             char* base = reinterpret_cast<char*>(header);
 #if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
-            if (OSMemory::IsPoolBacked(base)) return ptr; // pooled: keep span
+            if (OSMemory::IsPoolBacked(base)) { debug_keep(); return ptr; } // pooled: keep span
             // mremap shrink: releases the tail pages, never moves the base.
             std::size_t released = header->alloc_size - needed;
             void* shrunk = mremap(base, header->alloc_size, needed, 0);
-            if (shrunk == MAP_FAILED) return ptr; // keep the old span
+            if (shrunk == MAP_FAILED) { debug_keep(); return ptr; } // keep the old span
             // shrunk == base for non-MAYMOVE calls.
             header->alloc_size = needed;
             stats::CountOsFree(released);
@@ -733,6 +776,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 #else
             // No in-place shrink primitive on this platform: keep the span.
             (void)base; (void)needed;
+            debug_keep();
             return ptr;
 #endif
 #if FASTALLOC_DEBUG_ENABLED

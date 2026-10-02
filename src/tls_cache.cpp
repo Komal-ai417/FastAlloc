@@ -150,7 +150,14 @@ struct CachePool {
 };
 
 CachePool& CachePoolInstance() {
-    static CachePool* pool = new CachePool(); // NOLINT: intentional leak
+    // FIX (RunKit audit finding OVR-1, part 2): same bootstrap hazard as the
+    // GlobalHeap singleton - `new CachePool()` goes through the global
+    // operator new, which under FASTALLOC_OVERRIDE_NEW calls fast_malloc,
+    // which needs this very pool to create the thread's cache: recursive
+    // magic-static init -> __gnu_cxx::recursive_init_error -> abort.
+    // Static storage + placement new = zero allocations at bootstrap.
+    alignas(CachePool) static unsigned char storage[sizeof(CachePool)];
+    static CachePool* pool = ::new (static_cast<void*>(storage)) CachePool();
     return *pool;
 }
 

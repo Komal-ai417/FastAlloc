@@ -1,19 +1,18 @@
-# Performance Report — FastAlloc v2.0.0 (rev 5, full re-measurement)
+# Performance Report — FastAlloc
 
-> **Methodology note (v5):** every number below was re-measured in one session
-> with the new **one-shot verdict tool**
-> `benchmarks/benchsuite/bench_compare.py`, which drives *every* benchmark in
-> this repository — the two Google-Benchmark micro-suites, the 11-workload
-> cross-allocator `bench_suite`, and the side-by-side memory stress benchmark —
-> and prints a per-category win/loss verdict with the exact multiplier
-> ("MallocOnly 16B T=1: FastAlloc wins by 1.29x"). Baselines: **glibc 2.41
-> (ptmalloc+tcache)**, **jemalloc 5.3.0**, **mimalloc 2.1.7** (built from
-> source, LD_PRELOAD). Each `bench_suite` cell is the **median of 5
-> repetitions** after a warmup rep, one allocator per process, launch order
+> **Methodology:** every number below was produced by the one-shot verdict
+> tool `benchmarks/benchsuite/bench_compare.py`, which drives *every*
+> benchmark in this repository — the two Google-Benchmark micro-suites, the
+> 11-workload cross-allocator `bench_suite`, and the side-by-side memory
+> stress benchmark — and prints a per-category win/loss verdict with the exact
+> multiplier ("MallocOnly 16B T=1: FastAlloc wins by 1.29x"). Baselines:
+> **glibc 2.41 (ptmalloc+tcache)**, **jemalloc 5.3.0**, **mimalloc 2.1.7**
+> (built from source, LD_PRELOAD). Each `bench_suite` cell is the **median of
+> 5 repetitions** after a warmup rep, one allocator per process, launch order
 > rotated per workload, every block checksum-verified on free (zero failures
 > across the 132-cell matrix; the tool exits non-zero if any checksum fails).
-> Raw records: `benchmarks/benchsuite/compare_results.jsonl`; the generated
-> verdict report: `benchmarks/benchsuite/bench_report.md`.
+> Raw records land in `benchmarks/results/` (gitignored; regenerable with one
+> command).
 
 ## Reference environment
 
@@ -30,20 +29,26 @@ Run it yourself (one command, every benchmark, full verdict report):
 ```bash
 cmake -B build && cmake --build build -j --target bench_suite \
     fast_alloc_bench fast_alloc_bench_extended fast_alloc_bench_memory
+mkdir -p benchmarks/results
 # point the tool at jemalloc/mimalloc (auto-detected if in default paths):
 python3 benchmarks/benchsuite/bench_compare.py \
-    --mimalloc-so /path/to/libmimalloc.so.2 --reps 5 --threads 1,2,4
+    --mimalloc-so /path/to/libmimalloc.so.2 --reps 5 --threads 1,2,4 \
+    --jsonl benchmarks/results/cross_allocator_results.jsonl \
+    --report benchmarks/results/cross_allocator_report.md \
+    --data   benchmarks/results/bench_report_data.json
 # smoke preset:
-python3 benchmarks/benchsuite/bench_compare.py --quick
+python3 benchmarks/benchsuite/bench_compare.py --quick \
+    --jsonl benchmarks/results/cross_allocator_results.jsonl \
+    --report benchmarks/results/cross_allocator_report.md
 ```
 
-The tool writes `bench_report.md` (the verdict report),
-`bench_report_data.json` (chart-ready data) and appends raw JSONL records.
+The tool writes the verdict report, chart-ready data, and raw JSONL records
+all under `benchmarks/results/` (gitignored; regenerable at any time).
 Long sessions can be chunked: `--workloads tiny,churn ...` runs a subset,
 `--suite-skip-run` rebuilds the report from the accumulated JSONL, and
 `--gbench-cache` reuses family JSONs between invocations.
 
-## Headline verdicts (this session's measurement)
+## Headline verdicts
 
 - **vs glibc (std malloc): FastAlloc wins 20 of 33 throughput cells**, loses
   12, ties 1. Wins: every small-block pair workload at every thread count
@@ -224,26 +229,20 @@ peak RSS (e.g. 4096 B/T=4: 283 MB std vs 292 MB FastAlloc — within 3%).
 | **Calloc/10B** | std wins 11.9x | FastAlloc's calloc zeroes the full usable block (size-class rounded), glibc's zeroes only 10 requested bytes; at 100 B+ the comparison flips to FastAlloc. |
 | **cross-thread at T=4** | 0.91x vs glibc (T=2 was 2.52x WIN) | With 1 producer + 3 consumers on 2 vCPU, the consumer's free-side MPSC handoff competes with producer allocations; glibc's tcache free is local. |
 
-## Session-to-session variance (read before quoting numbers)
+## Run-to-run variance (read before quoting numbers)
 
-This VM generation re-measured the v4 matrix within expected noise on the
-"stable" cells (realloc 0.28 vs 0.29; thread-churn T=1 0.62 vs 0.60; large
-T=1 0.91 vs 0.90; latency p50 13.1–13.3 vs 12.8; purge retention 16.0 vs
-15.8 MB) but moved the contended multi-threaded cells more than single-digit
-percent: churn-vs-glibc at T=4 moved from 1.16x WIN to a 1.00x TIE, and
-cross-thread T=4 from 1.48x WIN to 0.91x LOSS, while small-mixed T=4 moved
-from 1.50x to 1.40x. Contended cells on 2-vCPU shared runners are the
-noisiest in the matrix — the CI cross-allocator job exists precisely to
-catch regressions with repeat runs rather than single numbers. Quote the
-win/loss *pattern* (which is stable) rather than any individual multiplier;
-re-run `bench_compare.py` on your target hardware before making claims.
+Contended multi-threaded cells are the noisiest in the matrix — the CI
+cross-allocator job exists precisely to catch regressions with repeat runs
+rather than single numbers. Quote the win/loss *pattern* (which is stable)
+rather than any individual multiplier; run `bench_compare.py` on your target
+hardware before making claims.
 
-## What changed in v2 (thread-lifecycle & churn optimizations)
+## Thread-lifecycle & churn optimizations
 
-Root-caused from instrumented runs, then fixed; each fix is verified by the
-full test + sanitizer battery (75/75 release, 86 debug incl. 11 death tests —
-one debug-only test intentionally skips because the registry fatals on forged
-pointers by design, ASan/UBSan/LSan clean, TSan zero warnings).
+Each optimization below is verified by the full test and sanitizer battery
+(75/75 release, 86 debug incl. 11 death tests — one debug-only test
+intentionally skips because the registry fatals on forged pointers by design,
+ASan/UBSan/LSan clean, TSan zero warnings).
 
 1. **TLSCache recycling pool** — retired thread caches are parked in a
    capped 32-slot pool and re-used by new threads. A thread lifecycle
