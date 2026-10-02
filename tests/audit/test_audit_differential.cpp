@@ -90,27 +90,38 @@ TEST(AuditDifferential, FastAllocVsGlibc_ObservableEquivalence) {
         [](void* p) { fast_free(p); },
         [](void* p, std::size_t n) { return fast_realloc(p, n); },
         [](std::size_t a, std::size_t s) { return fast_aligned_alloc(a, s); });
-    // glibc run (system malloc inside this process is glibc; FastAlloc is a
-    // static library and does not interpose, so both coexist)
+    // Reference run: the system allocator inside this process (glibc on
+    // Linux; FastAlloc is a static library and does not interpose, so both
+    // coexist).
+#ifdef _MSC_VER
+    // MSVC has no std::aligned_alloc, and _aligned_free is ONLY defined for
+    // blocks from _aligned_malloc/_aligned_realloc (Microsoft docs: freeing
+    // any other pointer is undefined behaviour -- the CRT reads an internal
+    // offset header that plain malloc/realloc blocks do not have). RunStream
+    // frees malloc-, realloc- AND aligned-blocks through ONE free lambda, so
+    // the reference run must come from a single allocation family: route
+    // everything through the aligned heap. 16-byte alignment matches what
+    // glibc malloc returns, keeping the observable contract equivalent.
+    Obs gl = RunStream(0x01A1, 20000,
+        [](std::size_t s) { return _aligned_malloc(s, 16); },
+        [](void* p) { _aligned_free(p); },
+        [](void* p, std::size_t n) { return _aligned_realloc(p, n, 16); },
+        [](std::size_t a, std::size_t s) -> void* {
+            if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;
+            std::size_t aligned_s = (s + a - 1) & ~(a - 1);
+            return _aligned_malloc(aligned_s, a);
+        });
+#else
     Obs gl = RunStream(0x01A1, 20000,
         [](std::size_t s) { return std::malloc(s); },
-#ifdef _MSC_VER
-        // _aligned_malloc must be freed with _aligned_free on MSVC;
-        // _aligned_free is safe for regular malloc pointers too.
-        [](void* p) { _aligned_free(p); },
-#else
         [](void* p) { std::free(p); },
-#endif
         [](void* p, std::size_t n) { return std::realloc(p, n); },
         [](std::size_t a, std::size_t s) -> void* {
             if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;  // FastAlloc contract
             std::size_t aligned_s = (s + a - 1) & ~(a - 1);
-#ifdef _MSC_VER
-            return _aligned_malloc(aligned_s, a);  // MSVC: no std::aligned_alloc
-#else
             return std::aligned_alloc(a, aligned_s);
-#endif
         });
+#endif
     // Both allocators must succeed for the whole stream on this 4GB box
     size_t fa_fail = std::count(fa.outcomes.begin(), fa.outcomes.end(), 0);
     size_t gl_fail = std::count(gl.outcomes.begin(), gl.outcomes.end(), 0);
