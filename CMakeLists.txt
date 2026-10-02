@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # Project options
 option(FASTALLOC_BUILD_TESTS "Build unit tests" ON)
 option(FASTALLOC_BUILD_BENCHMARKS "Build performance benchmarks" ON)
+option(FASTALLOC_BUILD_FUZZ "Build entropy-driven fuzz harnesses (standalone; no libFuzzer dependency)" OFF)
 option(FASTALLOC_OVERRIDE_NEW "Override standard new/delete operators" OFF)
 option(FASTALLOC_DEBUG "Enable debug instrumentation (canaries, red zones, poison, registry, leak dump)" OFF)
 option(FASTALLOC_SANITIZE "Sanitizer preset: address|thread|leak|undefined|address,undefined (empty = off)" "")
@@ -172,10 +173,15 @@ if(FASTALLOC_BUILD_TESTS)
     include(CTest)
     add_test(NAME fast_alloc_validate_tests COMMAND fast_alloc_tests)
 
+    # Audit test suite (49 gtest cases: functional, property, differential,
+    # concurrency, slab/OOM/fragmentation). Requires GTest, so it lives inside
+    # the FASTALLOC_BUILD_TESTS block.
+    add_subdirectory(tests/audit)
+
     # Convenience targets for the common verification matrix
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        DEPENDS fast_alloc_tests
+        DEPENDS fast_alloc_tests fast_alloc_audit_tests
         COMMENT "Running FastAlloc test suite"
     )
 endif()
@@ -238,6 +244,32 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     target_link_libraries(fast_alloc_bench PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_extended PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_memory PRIVATE Threads::Threads)
+endif()
+
+# ---------------------------------------------------------------------------
+# Fuzz harnesses (standalone entropy-driven; no libFuzzer dependency)
+# ---------------------------------------------------------------------------
+if(FASTALLOC_BUILD_FUZZ AND NOT MSVC)
+    add_executable(fast_alloc_fuzz_standalone
+        fuzz/fuzz_standalone.cpp
+        src/fast_alloc.cpp
+        src/slab.cpp
+        src/tls_cache.cpp
+        src/global_heap.cpp
+        src/os_memory.cpp
+        src/debug_aid.cpp
+    )
+    target_compile_options(fast_alloc_fuzz_standalone PRIVATE ${WARNING_FLAGS})
+    target_include_directories(fast_alloc_fuzz_standalone PRIVATE include src)
+    target_link_libraries(fast_alloc_fuzz_standalone PRIVATE Threads::Threads)
+
+    include(CTest)
+    # Smoke test: 20-second deterministic campaign; must print FUZZ-CLEAN.
+    add_test(NAME fast_alloc_fuzz_smoke
+        COMMAND fast_alloc_fuzz_standalone 20 42)
+    set_tests_properties(fast_alloc_fuzz_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "FUZZ-CLEAN"
+        TIMEOUT 60)
 endif()
 
 include(CheckIPOSupported)
