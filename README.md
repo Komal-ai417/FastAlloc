@@ -58,15 +58,30 @@ FastAlloc is built using CMake and requires **C++17** or higher.
 
 ### Building from Source
 
+#### Linux / macOS
 ```bash
 git clone https://github.com/yourusername/FastAlloc.git
 cd FastAlloc
-
-# Configure the project
 cmake -B build
-
-# Build (Release Mode Recommended for Performance)
 cmake --build build --config Release
+```
+
+#### Windows — MSVC (Visual Studio Developer Shell)
+```powershell
+cmake -B build
+cmake --build build --config Release
+```
+
+#### Windows — MinGW/UCRT64 (MSYS2)
+```powershell
+# Requires: MSYS2 with ucrt64 toolchain (https://www.msys2.org/)
+# cmake can also be installed via: pip install cmake
+python -m cmake -S . -B build -G "MinGW Makefiles" `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe `
+    -DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe `
+    -DCMAKE_MAKE_PROGRAM=C:/msys64/ucrt64/bin/mingw32-make.exe
+python -m cmake --build build --config Release -j 4
 ```
 
 ## Usage
@@ -199,11 +214,14 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 | Configuration | Tests | Status |
 | :--- | :--- | :--- |
-| Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 75 | all pass, zero warnings |
-| Debug instrumentation (`FASTALLOC_DEBUG`) | 86 (incl. death tests; 1 debug-only skip by design) | all pass |
-| AddressSanitizer + UBSan | 75 | zero memory errors |
-| ThreadSanitizer | 75 | **zero data races** |
-| LeakSanitizer | 75 | zero leaks |
+| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 75 | all pass, zero warnings |
+| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 86 (incl. death tests; 1 debug-only skip by design) | all pass |
+| Linux AddressSanitizer + UBSan | 75 | zero memory errors |
+| Linux ThreadSanitizer | 75 | **zero data races** |
+| Linux LeakSanitizer | 75 | zero leaks |
+| Windows/MSVC Release | 75 | all pass |
+| Windows/MinGW UCRT64 Release (GCC 16.2, 2026-10-15) | 75 | **74 pass, 1 platform-skip** (`ReallocFailurePreservesOriginal` — OOM injection path differs on Windows) |
+| Windows/MinGW UCRT64 audit suite (2026-10-15) | 49 | **48 pass, 1 platform-skip** (`EmptySlabReturnedToOs` — `/proc/self/status` unavailable on Windows) |
 | Benchmark checksums (132 suite cells + 92 gbench configs) | — | zero failures |
 
 CI (all 16 jobs green on every push): ubuntu/windows × release/debug +

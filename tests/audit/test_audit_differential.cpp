@@ -111,13 +111,27 @@ TEST(AuditDifferential, FastAllocVsGlibc_ObservableEquivalence) {
             std::size_t aligned_s = (s + a - 1) & ~(a - 1);
             return _aligned_malloc(aligned_s, a);
         });
+#elif defined(_WIN32)
+    // MinGW: _WIN32 defined but not _MSC_VER. std::aligned_alloc is absent
+    // in MinGW's <cstdlib>. Mirror the MSVC strategy: route everything
+    // through the _aligned_* family so the single free lambda is always
+    // correct (_aligned_free is required for _aligned_malloc blocks).
+    Obs gl = RunStream(0x01A1, 20000,
+        [](std::size_t s) { return _aligned_malloc(s, 16); },
+        [](void* p) { _aligned_free(p); },
+        [](void* p, std::size_t n) { return _aligned_realloc(p, n, 16); },
+        [](std::size_t a, std::size_t s) -> void* {
+            if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;
+            std::size_t aligned_s = (s + a - 1) & ~(a - 1);
+            return _aligned_malloc(aligned_s, a);
+        });
 #else
     Obs gl = RunStream(0x01A1, 20000,
         [](std::size_t s) { return std::malloc(s); },
         [](void* p) { std::free(p); },
         [](void* p, std::size_t n) { return std::realloc(p, n); },
         [](std::size_t a, std::size_t s) -> void* {
-            if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;  // FastAlloc contract
+            if (a == 0 || (a & (a - 1)) != 0 || a > 4096) return nullptr;
             std::size_t aligned_s = (s + a - 1) & ~(a - 1);
             return std::aligned_alloc(a, aligned_s);
         });

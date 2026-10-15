@@ -62,6 +62,7 @@ FastAllocStats fast_alloc_stats();
 void fast_alloc_dump_leaks();
 void fast_alloc_purge();
 void fast_alloc_purge_thread_cache();
+void fast_alloc_audit_pointers(const void* lo, const void* hi); // forensics
 void fast_alloc_log_set_level(int level);   // 0=off .. 5=trace
 ```
 
@@ -91,7 +92,8 @@ set with the `FASTALLOC_LOG_LEVEL` environment variable (0–5).
 | Option | Effect |
 | :--- | :--- |
 | `FASTALLOC_BUILD_TESTS` | Google Test suite (default ON) |
-| `FASTALLOC_BUILD_BENCHMARKS` | Google Benchmark + memory harness (default ON) |
+| `FASTALLOC_BUILD_BENCHMARKS` | Google Benchmark + memory harness + bench_suite (default ON) |
+| `FASTALLOC_BUILD_FUZZ` | Standalone entropy-driven fuzz harness (default OFF; Linux/macOS only) |
 | `FASTALLOC_DEBUG` | Canaries, red zones, poisoning, registry, leak dump (default OFF) |
 | `FASTALLOC_SANITIZE` | `address`, `thread`, `leak`, `undefined`, or comma lists |
 | `FASTALLOC_OVERRIDE_NEW` | Global `operator new/delete` overrides (default OFF) |
