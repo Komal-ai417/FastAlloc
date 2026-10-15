@@ -36,7 +36,7 @@ if(FASTALLOC_SANITIZE AND NOT MSVC)
     add_link_options(-fsanitize=${FASTALLOC_SANITIZE})
 elseif(FASTALLOC_SANITIZE AND MSVC)
     add_compile_options(/fsanitize=address /Zi)
-    add_link_options(/INCREMENTAL:NO)
+    add_link_options(/INCREMENTAL:NO /DEBUG)
 endif()
 
 # ---------------------------------------------------------------------------
