@@ -1,45 +1,20 @@
 #pragma once
 // ============================================================================
-// bench_crash_reporter.h — in-binary crash forensics for the google-benchmark
-// executables (fast_alloc_bench, fast_alloc_bench_extended).
+// bench_crash_reporter.h — crash forensics for benchmark executables.
 //
-// WHY: the Sep-2026 benchmarks-ubuntu-latest failure (SIGSEGV rc=139 in the
-// BM_MallocFree_FastAlloc family, twice per attempt) reproduces only on the
-// CI runner: the identical binary/flags pass 25+ local runs (release, TSan,
-// ASan, CPU-hog preemption pressure, per-size isolated reruns) and a full
-// static audit of the cross-thread return path found no defect. The runner's
-// gdb forensics step already captures a backtrace into an artifact, but the
-// raw frames were not visible in the failure summary the maintainers see.
-// This header installs a signal handler at process start so the FIRST crash
-// — before any gdb rerun — prints the faulting address and a raw backtrace
-// straight into the job log. It changes no allocator or benchmark logic.
+// Installs signal handlers (Linux) or unhandled exception filters (Windows)
+// to output diagnostic reports on unexpected faults.
 //
-// v11 additions (Sep-2026 runner crash, closing round):
-//   * si_code is now printed with the faulting address. The v10 crash's
-//     signature was si_code=SI_KERNEL(128) + si_addr=0 ("faulting address
-//     (nil)") = a NON-CANONICAL access: the CPU raised #GP, not a page
-//     fault. Printing si_code distinguishes that class from ordinary
-//     SEGV_MAPERR/SEGV_ACCERR page faults at a glance.
-//   * Trap-region registry: GuardedSlots (bench_main.cpp) registers its
-//     frozen data page here. A write fault INSIDE a registered region is
-//     the write-trap catching a wild writer red-handed: the handler prints
-//     the faulting address, si_code AND the writer's own instruction
-//     pointer (RIP from ucontext, symbolized via the backtrace machinery),
-//     then HEALS the fault (mprotect RW + retry) so the run survives and
-//     the benchmark completes. Faults outside registered regions keep the
-//     fatal report-and-exit behavior.
+// Features:
+//   * Prints faulting address, signal code, and stack frames to stderr.
+//   * Trap-region registry: supports registering memory regions to catch and
+//     diagnose unauthorized writes.
 //
 // Design notes:
-//   * Header-only; the installer runs as an inline-variable initializer
-//     before main(), so BENCHMARK_MAIN() needs no changes.
-//   * Not installed under sanitizers (they own the signal handlers and give
-//     better reports).
-//   * Linux path uses only write(2)/mprotect(2)/backtrace(3)/
-//     backtrace_symbols_fd(3) (glibc documents these as async-signal-safe
-//     enough for crash reporting); output is intentionally raw frames —
-//     symbolize offline with: addr2line -e <binary> -f -C <frame>.
-//   * Windows path is a SetUnhandledExceptionFilter that reports the
-//     exception code and faulting address (no dbghelp dependency).
+//   * Header-only; initializes before main().
+//   * Disabled when building with sanitizers.
+//   * Linux path uses async-signal-safe system calls where possible.
+//   * Windows path uses SetUnhandledExceptionFilter.
 // ============================================================================
 #if defined(_WIN32) && !defined(FASTALLOC_BENCH_NO_CRASH_REPORTER)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -76,12 +51,9 @@ namespace crash_reporter {
 #if defined(__linux__) && !defined(FASTALLOC_BENCH_CRASH_REPORTER_OFF)
 
 // ---------------------------------------------------------------------------
-// v11 trap-region registry (write-trap healing). Each entry is a frozen
+// Trap-region registry (write-trap healing). Each entry is a frozen
 // GuardedSlots data page [lo, hi). Registration order (lo then hi) and
-// deregistration order (hi then lo) make a torn concurrent read
-// non-member-safe: the handler treats a half-published or half-removed
-// region as absent. mprotect failure (page already unmapped) falls back to
-// the fatal path, so a race at teardown can never spin.
+// deregistration order (hi then lo) ensure thread-safe lock-free reads.
 // ---------------------------------------------------------------------------
 inline void* volatile g_trap_lo[8] = {};
 inline void* volatile g_trap_hi[8] = {};
@@ -129,9 +101,8 @@ inline const char* SegvCodeName(int code) {
 }
 
 inline void ReportAndDie(int sig, siginfo_t* info, void* uc) {
-    // v11: include si_code — the non-canonical/#GP class (si_code=128,
-    // si_addr=0, "faulting address (nil)") is distinguishable at a glance
-    // from ordinary page faults.
+    // Include si_code in diagnostic output to distinguish between invalid
+    // mappings, access permission faults, and general protection violations.
     void* frames[48];
     int n = 0;
     // If the ucontext is available, seed the backtrace with the faulting
@@ -164,17 +135,15 @@ inline void ReportAndDie(int sig, siginfo_t* info, void* uc) {
     std::_Exit(128 + sig);
 }
 
-// v11: a fault inside a registered trap region = the write-trap caught a
-// writer. Print (rate-limited) the faulting address, si_code and the
-// WRITER'S OWN RIP, then heal the page so the write completes and the run
-// continues. If healing fails (page gone), fall through to the fatal path.
+// When a write fault occurs inside a registered trap region, log diagnostic
+// information (faulting address, si_code, writer RIP) and reprotect the page
+// with write permissions so execution can resume.
 inline void TrapFaultOrDie(int sig, siginfo_t* info, void* uc) {
     const void* addr = info ? info->si_addr : nullptr;
     int region = TrapRegionIndex(addr);
     if (region >= 0) {
-        // 4 KiB alignment: the CI runners are x86-64 (4 KiB pages). On a
-        // 64 KiB-page host the mprotect simply fails and we fall through
-        // to the fatal report — never an unbounded fault loop.
+        // 4 KiB alignment: assumes standard 4 KiB pages. On systems with
+        // larger page sizes, mprotect fails safely and falls through to the fatal report.
         const std::uintptr_t page =
             reinterpret_cast<std::uintptr_t>(addr) & ~static_cast<std::uintptr_t>(0xFFFull);
         if (mprotect(reinterpret_cast<void*>(page), 0x1000, PROT_READ | PROT_WRITE) == 0) {

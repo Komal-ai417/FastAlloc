@@ -8,9 +8,7 @@
 // Platform detection & Windows version lockdown
 // ============================================================================
 // FlsAlloc/FlsGetValue/FlsSetValue/FlsFree require Windows Vista (0x0600)+.
-// If the consuming project (or an old SDK) has not pinned _WIN32_WINNT, pin
-// it here BEFORE any windows.h include so the build cannot silently rot.
-// (Audit H5 fix)
+// Ensures _WIN32_WINNT is set before windows.h is included.
 #if defined(_WIN32)
 #if !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0600
@@ -100,52 +98,29 @@ inline const char* fast_getenv(const char* name) {
 namespace FastAlloc {
 
 // Configuration constants for the allocator
-constexpr std::size_t PAGE_SIZE = 4096;   // Minimum/typical OS page size (fallback only).
-                                          // The RUNTIME page size must be taken from
-                                          // OSMemory::GetPageSize() for all rounding
-                                          // arithmetic (audit N1 fix).
+constexpr std::size_t PAGE_SIZE = 4096;   // Minimum/typical OS page size (fallback).
+                                          // Runtime page size is queried from OSMemory::GetPageSize().
 constexpr std::size_t MAX_SLAB_SIZE = 8192;   // Allocations above this size bypass TLS/Slabs
 constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 
-// v10 hardening constant: the lowest address any FastAlloc user pointer (or
-// freelist node) can ever legitimately hold. Blocks live inside mmap'd /
-// pooled spans far above this line; Linux keeps [0, 64 KB) unmapped and
-// Windows reserves the first 64 KB, so nothing below it can be a valid
-// block in either world. Shared by the free-path guards (fast_alloc.cpp)
-// and the TLS freelist pop guard (tls_cache.h) so every consumer of a
-// "pointer from the block universe" applies the SAME canonicity test.
+// Lowest address any valid user pointer or freelist node can hold.
+// Memory below 64 KB is reserved or unmapped across supported operating systems.
 constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
 
-// v11 hardening constant: the UPPER canonicality bound. The Sep-2026 v10
-// runner run produced the closing datapoint: the benchmark's pointer array
-// held 0xd90b6085fe368400 - 16-byte aligned, above 64 KB, and therefore
-// PAST every v10 check - and the inlined fast_free dereferenced [ptr-16]
-// into the non-canonical half of the address space, which the CPU rejects
-// with #GP (SIGSEGV, si_code=SI_KERNEL=128, si_addr=0: the "faulting
-// address (nil)" red herring). x86-64 canonical addresses are strictly
-// below 0x0000_8000_0000_0000; no FastAlloc block, span or stash can ever
-// live there, and Windows/ARM64-usermode pointers stay below it too.
+// Upper canonical address bound for 48-bit user virtual address space.
 constexpr std::uintptr_t kMaxCanonicalUserPtr = 0x0000800000000000ull;
 
-// v11: the ONE shared plausibility predicate for every value that is about
-// to be dereferenced as, or returned as, a FastAlloc pointer (block, user
-// pointer, freelist link, stash raw pointer). Three fused tests:
-//   * >= 64 KB          (null page / small-int garbage: the v9 0x10 class)
-//   * <  2^47           (non-canonical garbage: the v10 0xd90b... class -
-//                        #GP kills the process with faulting address (nil))
-//   * 16-byte aligned   (every block/user/large/span pointer FastAlloc
-//                        produces is 16-aligned by construction; a
-//                        misaligned value is a forged or shifted pointer)
-// fast_aligned_alloc clamps alignment to >= 16, so no legitimate return is
-// ever rejected by the alignment test.
+// Validates whether a pointer is plausible for a FastAlloc allocation:
+//   - >= 64 KB (avoids null page and small-integer values)
+//   - < 2^47 (canonical user-space address)
+//   - 16-byte aligned (all FastAlloc blocks maintain 16-byte alignment)
 inline bool IsPlausibleHeapPtr(const void* p) {
     const std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
     return v >= kMinCanonicalUserPtr && v < kMaxCanonicalUserPtr &&
            (v & (std::uintptr_t)0xF) == 0;
 }
 
-// Effective maximum request size served by the slab path (audit M4 fix:
-// this named constant now documents what the code actually does).
+// Effective maximum request size served by the slab path
 constexpr std::size_t USER_OFFSET = 16;
 constexpr std::size_t MAX_SMALL_REQUEST = MAX_SLAB_SIZE - USER_OFFSET; // 8176
 
@@ -208,8 +183,8 @@ constexpr std::array<uint32_t, NUM_SIZE_CLASSES> CACHE_LIMITS = ComputeCacheLimi
 struct alignas(16) LargeAllocHeader {
     // 'slab' does double duty:
     //   release builds : always nullptr for large blocks
-    //   debug builds   : LARGE_HEADER_MAGIC while the block is live, so that
-    //                    fast_free can validate provenance (audit C3 fix).
+    //   debug builds   : LARGE_MAGIC while the block is live, so that
+    //                    fast_free can validate provenance.
     // When parked in the large free-cache the field aliases LargeFreeEntry::next.
     void* slab;
     std::size_t alloc_size;
@@ -235,7 +210,7 @@ inline std::size_t LargeSizeToClass(std::size_t size) {
 }
 
 // ============================================================================
-// Debug patterns & magic values (audit C1/C2/C3 + Final Report section 4)
+// Debug patterns & magic values
 // ============================================================================
 namespace debug {
     constexpr uint32_t FRONT_CANARY     = 0xC8C8C8C8u; // written at alloc, checked at free (underflow)

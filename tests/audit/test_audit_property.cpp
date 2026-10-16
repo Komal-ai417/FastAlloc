@@ -1,8 +1,7 @@
 // ============================================================================
-// FastAlloc audit — property-based randomized testing with a shadow model
-// (audit item 4): millions of random ops, deterministic seeds, after every op
-// verify: no overlap, alignment, contents, size consistency. Plus metamorphic
-// state-equivalence checks (item 43) and pattern-preservation matrix (item 3).
+// Property-based randomized testing with a shadow model:
+// deterministic random operations verifying no overlap, alignment, contents,
+// and size consistency, along with metamorphic state-equivalence checks.
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"

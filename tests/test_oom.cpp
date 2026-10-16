@@ -1,6 +1,5 @@
 // ============================================================================
-// Out-of-memory handling (audit gap: "how does the allocator behave under
-// memory exhaustion?" was never defined or tested).
+// Out-of-memory handling: tests behavior under memory exhaustion.
 //
 // The OOM seam fails the next N OS page allocations. fast_malloc must return
 // nullptr, previously allocated memory must stay valid, and the allocator

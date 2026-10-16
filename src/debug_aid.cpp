@@ -431,15 +431,7 @@ void SetViolationHandler(ViolationHandler handler) {
     // terminates the process, so this [[noreturn]] function can never fall
     // off the end.
     //
-    // Structure note (MSVC /W4 /WX + /O2 /GL): the old code kept a literal
-    // std::abort() HERE, after a call that always aborts - provably
-    // unreachable code, which C4702 flags. A #pragma warning(disable:4702)
-    // around it worked on the older MSVC backends, but the /GL-affected
-    // backend started re-raising the diagnostic regardless (CI, Sep 2026:
-    // error C2220 + LNK1257 on windows-latest). The function is therefore
-    // structured with NO statement after the last call at all: both
-    // [[noreturn]] annotations hold, control cannot escape, and there is
-    // nothing for any compiler version to flag as unreachable.
+    // DefaultViolationHandler is [[noreturn]] and terminates the process.
     DefaultViolationHandler(info);
 }
 

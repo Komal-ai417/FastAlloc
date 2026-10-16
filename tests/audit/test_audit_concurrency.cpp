@@ -1,6 +1,6 @@
 // ============================================================================
-// FastAlloc audit — concurrency & ownership (items 6, 7, 12, 13):
-// thread counts 1..128 (2-CPU HW: logical contention only, documented),
+// FastAlloc concurrency and ownership tests:
+// thread counts 1..128 (logical contention),
 // cross-thread ownership chains A-alloc -> B-free -> C-realloc -> D-alloc,
 // barrier bursts, long-duration tiers, TLS lifecycle storms, pending-queue
 // accounting via stats. NOTE: gtest assertions are not thread-safe; workers
@@ -95,20 +95,14 @@ static bool ThreadSweep(int nthreads, std::size_t ops_per_thread, std::size_t ma
 
 TEST(AuditConcurrency, ThreadCountSweep1to128) {
 #if FASTALLOC_DEBUG_ENABLED
-    // The 128-thread leg under the full debug registry (per-allocation
-    // tracking + red zones + poison) exceeds 4 GB RSS and gets the process
-    // OOM-killed on small machines. Debug-semantics concurrency is already
-    // covered by the validate suite's ConcurrencyTest and the TSan campaign.
-    GTEST_SKIP() << "128-thread sweep is release-semantics tier (OOM risk "
-                    "under the debug registry); see validate suite + TSan";
+    // The 128-thread sweep with full debug registry instrumentation requires
+    // extensive memory. Skip in debug builds to prevent memory exhaustion.
+    GTEST_SKIP() << "128-thread sweep is release-semantics tier (memory limits "
+                    "under debug registry); see validate suite";
 #endif
 #if FASTALLOC_TEST_TSAN
-    // TSan's per-thread shadow/trace state costs ~20-30 MB per live thread,
-    // so the 128-thread leg alone pushes RSS past 3.6 GB (measured: OOM-
-    // killed on a 4 GB box; thin margin even on 16 GB runners). 64 threads
-    // already oversubscribes every CI runner 16x over, so the extra
-    // contention coverage of the 128 leg is marginal — and the full 1..128
-    // sweep still runs in every non-TSan configuration (release, ASan).
+    // Under TSan, per-thread shadow memory scales significantly with thread count.
+    // Cap thread count to 64 under TSan to keep memory usage bounded.
     const int sweep_counts[] = {1, 2, 4, 8, 16, 32, 64};
     const int sweep_n = 7;
 #else
@@ -254,7 +248,7 @@ TEST(AuditConcurrency, LongDuration10MTotalOps) {
     EXPECT_GE(total.load(), 10000000u);
 }
 
-// ---- 6.6 TLS lifecycle: thousands of short-lived threads (item 12) -------------
+// ---- TLS lifecycle: thousands of short-lived threads -------------------------
 TEST(AuditConcurrency, ShortLivedThreadStorm) {
 #if FASTALLOC_DEBUG_ENABLED
     // 3000 sequential thread create/destroy cycles with per-thread cache
@@ -286,7 +280,7 @@ TEST(AuditConcurrency, ShortLivedThreadStorm) {
         << "cache destroys exceed creates";
 }
 
-// ---- 6.7 pending accounting: after full purge nothing stays stuck (item 13) ---
+// ---- Pending accounting: after full purge nothing stays stuck -----------------
 TEST(AuditConcurrency, PendingQueueAccountingBalance) {
     FastAllocStats t0 = fast_alloc_stats();  // this test's own balance only
     for (int round = 0; round < 300; ++round) {

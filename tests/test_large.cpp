@@ -1,7 +1,6 @@
 // ============================================================================
 // Large-allocation path: cache reuse, in-place realloc growth/shrink,
 // page-rounding semantics.
-// (Audit H2: the large cache had ZERO tests; M2/O5: realloc always remapped.)
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"
@@ -104,8 +103,8 @@ TEST(LargeAllocTest, ReallocGrowAcrossPagesPreservesData) {
 }
 
 TEST(LargeAllocTest, ReallocShrinkReleasesPagesInPlace) {
-    // Shrinking by >= 1 page now happens IN PLACE: same pointer, tail pages
-    // returned to the OS (audit M2/O5: previously always copy+remap).
+    // Shrinking by >= 1 page occurs in place: the same pointer is returned
+    // and excess tail pages are returned to the OS.
     const std::size_t big = 512 * 1024;
     unsigned char* p = static_cast<unsigned char*>(fast_malloc(big));
     ASSERT_NE(p, nullptr);

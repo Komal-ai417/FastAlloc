@@ -12,22 +12,7 @@ namespace FastAlloc {
 FAST_THREAD_LOCAL TLSCache* fast_path_cache = nullptr;
 
 // ===========================================================================
-// Sep-2026 runner-crash forensics + self-healing (v8)
-//
-// The benchmarks-ubuntu-latest SIGSEGV (fast_alloc_bench /
-// BM_MallocFree_FastAlloc, rc=139 twice per attempt, faulting instruction at
-// [curr+16] with curr == nullptr, everything inlined by LTO) traced to
-// DeallocateBlockSlow's batch walk running UNguarded batch_size-1 steps and
-// dereferencing the result. That is only reachable when a bin's count
-// over-reports its list length - the fingerprint of the same block being
-// handed out twice (or freed twice): a duplicate push links block->next onto
-// the block itself or duplicates a node in the list, count/list diverge, and
-// a later flush walks past the end. The two guards below make the failure
-// impossible AND observable: the duplicate-push of a bin head is turned into
-// an idempotent no-op, and a short list is flushed whole with count
-// re-derived from reality. First occurrence per process prints one line to
-// stderr (-> CI job log via the tee'd crashlogs); the allocator keeps
-// serving - no benchmark is ever killed.
+// Invariant checking and telemetry for TLS bins
 // ===========================================================================
 namespace {
 
@@ -58,7 +43,7 @@ void ReportDoublePushGuard() {
     }
 }
 
-// v10: one-shot telemetry for the AllocateBlock pop guard (tls_cache.h).
+// Logs diagnostic information once when an invalid bin head pointer is encountered.
 void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
@@ -72,11 +57,7 @@ void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
     }
 }
 
-// v11: one-shot telemetry for any freelist link / batch head / push target
-// that fails the full plausibility predicate. This is the class the v10
-// runner crash proved: 16-aligned, >=64KB, NON-CANONICAL values passed every
-// v10 check and were dereferenced. The guard sites drop the wild value
-// instead (leak-once discipline); this line lands in the CI job log.
+// Logs diagnostic information once when an invalid freelist pointer is encountered.
 void ReportWildFreelistLink(const char* where, std::size_t class_index,
                              std::uintptr_t bad_link) {
     static std::atomic<bool> reported{false};
@@ -150,21 +131,13 @@ struct CachePool {
 };
 
 CachePool& CachePoolInstance() {
-    // FIX (RunKit audit finding OVR-1, part 2): same bootstrap hazard as the
-    // GlobalHeap singleton - `new CachePool()` goes through the global
-    // operator new, which under FASTALLOC_OVERRIDE_NEW calls fast_malloc,
-    // which needs this very pool to create the thread's cache: recursive
-    // magic-static init -> __gnu_cxx::recursive_init_error -> abort.
-    // Static storage + placement new = zero allocations at bootstrap.
+    // Static storage placement new removes heap allocations during bootstrap.
     alignas(CachePool) static unsigned char storage[sizeof(CachePool)];
     static CachePool* pool = ::new (static_cast<void*>(storage)) CachePool();
     return *pool;
 }
 
-// Park a retired cache. During process shutdown we never touch the OS:
-// the pool push itself is safe, and overflowing entries are simply leaked
-// (the OS reclaims them at exit) - strictly safer than munmapping under a
-// reaper, which was the original Windows exit deadlock hazard (audit N3).
+// Park a retired cache in the pool or return to the OS.
 void RecycleOrFreeCache(TLSCache* cache, bool flushed_ok) {
     if (flushed_ok) {
         CachePoolInstance().Push(cache);
@@ -178,13 +151,7 @@ void RecycleOrFreeCache(TLSCache* cache, bool flushed_ok) {
 } // namespace
 
 // ===========================================================================
-// TLS key management (audit C4 fix)
-//
-// pthread_key_create / FlsAlloc failures were previously ignored. On the
-// POSIX path the half-initialized key defaults to 0, which is a VALID key
-// number that may be owned by another library, so pthread_getspecific could
-// return foreign data that we reinterpret as TLSCache* - silent corruption.
-// These failures are now loud and fatal.
+// TLS key management
 // ===========================================================================
 #ifdef _WIN32
 DWORD TLSCache::tls_key_ = FLS_OUT_OF_INDEXES;
@@ -353,13 +320,8 @@ void TLSCache::FlushToGlobalHeap() {
                 GlobalHeap::GetInstance().DeallocateBatchClass(i, bins_[i].head);
             }
         }
-        // UNCONDITIONAL reset (v8): previously only bins with a non-null
-        // head were cleared, so a bin whose count had diverged from its
-        // (empty) list carried the stale count into the recycling pool and
-        // detonated in the cache's next owner (the next push saw a count
-        // already over CACHE_LIMITS and the flush walk ran off the list).
-        // Clearing every bin field - head, count AND the refill ramp -
-        // matches the documented intent: the next owner starts clean.
+        // Reset all bin fields (head, count, and refill ramp) unconditionally
+        // so that any recycled cache instance starts in a clean state.
         bins_[i].head = nullptr;
         bins_[i].count = 0;
         // Reset the adaptive refill ramp: the next owner of this (recycled
@@ -385,8 +347,7 @@ void TLSCache::FlushToGlobalHeap() {
 
 #if FASTALLOC_DEBUG_ENABLED
 void TLSCache::AuditBin(std::size_t class_index) const {
-    // Audit M6: 'count' was maintained purely by construction; this debug
-    // check ties it to the actual list length before flushing.
+    // Debug check: verify bin count matches actual linked list length before flushing.
     const CacheBin& bin = bins_[class_index];
     std::size_t n = 0;
     for (FreeBlock* p = bin.head; p; p = p->next) ++n;
@@ -405,11 +366,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     stats::CountTlsMisses();
     std::size_t max_cache = CACHE_LIMITS[class_index];
 
-    // Adaptive refill: start at kInitialRefill and double on every miss,
-    // capped at the old fixed target (max_cache/2). Short-lived threads that
-    // touch a class a handful of times pull one small batch; steady-state
-    // threads ramp to full batches after ~log2(ratio) misses (negligible for
-    // 20M-op runs) and behave identically to the old policy afterwards.
+    // Adaptive refill: start at initial refill target and double on consecutive misses, capped at max_cache/2.
     CacheBin& bin = bins_[class_index];
     std::size_t target_count = bin.next_refill;
     if (target_count == 0) target_count = 16; // kInitialRefill
@@ -424,10 +381,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
 
     if (!batch_head) return nullptr;
 
-    // v11: the batch head is dereferenced immediately below (pop + prefetch
-    // walk). A corrupt global-side list could hand a wild head here; the
-    // full plausibility predicate stops it before any dereference. The bin
-    // stays empty and the caller sees a miss - the next refill retries.
+    // Verify batch head plausibility before dereferencing.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(batch_head))) {
         ReportWildFreelistLink("AllocateBlockSlow(batch head)", class_index,
                                reinterpret_cast<std::uintptr_t>(batch_head));
@@ -438,20 +392,14 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     FreeBlock* curr = batch_head;
     for (int i = 0; i < 4 && curr; ++i) {
         __builtin_prefetch(curr, 0, 1);
-        // v11: the prefetch walk chases 'curr->next' through the batch's
-        // user-area links; a wild link would fault the read. Stop the walk
-        // at the first implausible value (prefetch itself never faults, the
-        // load does).
+        // Stop prefetch walk at the first non-plausible pointer.
         FreeBlock* nxt = curr->next;
         curr = IsPlausibleHeapPtr(nxt) ? nxt : nullptr;
     }
 #endif
 
     FreeBlock* block = batch_head;
-    // v11: same guard for the pop's 'block->next' read - a wild tail link
-    // would be parked as the new bin head (and dereferenced on the next
-    // pop). Park nullptr instead: the bin count below is then re-derived on
-    // the next refill (count was unknowable either way).
+    // Verify next pointer plausibility before updating bin head.
     FreeBlock* rest = block->next;
     if (FAST_UNLIKELY(rest != nullptr && !IsPlausibleHeapPtr(rest))) {
         ReportWildFreelistLink("AllocateBlockSlow(pop rest)", class_index,
@@ -473,16 +421,7 @@ void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
     CacheBin& bin = bins_[class_index];
     FreeBlock* head = bin.head;
 
-    // Guarded batch walk (v8 fix for the Sep-2026 runner SIGSEGV): the old
-    // loop ran batch_size-1 UNGUARDED 'curr = curr->next' steps and then
-    // dereferenced curr, faulting at [nullptr + offsetof(FreeBlock, next)]
-    // whenever the list was shorter than the count claimed. The walk is
-    // bounded AND null-guarded now; the null-exit takes the self-healing
-    // path below instead of faulting.
-    // v11: each link is additionally validated with the FULL plausibility
-    // predicate before it is dereferenced again - the v10 runner crash
-    // class (non-canonical 16-aligned garbage in a link) would otherwise
-    // survive the null guard and fault with #GP (faulting address (nil)).
+    // Bounded, plausibility-guarded batch walk.
     FreeBlock* curr = head;
     std::size_t walked = 1; // nodes in [head, curr]
     while (walked < batch_size && curr != nullptr) {
@@ -530,15 +469,11 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
     std::size_t cls = LargeSizeToClass(size);
     LargeFreeEntry** pp = &large_free_bins_[cls];
     while (*pp) {
-        // v11: the walk dereferences each entry (alloc_size read, ->next
-        // chase). Validate the entry with the full plausibility predicate
-        // first; a wild entry is cut off at the node BEFORE it (this node's
-        // ->next was already validated when we advanced here) - never
-        // dereferenced, one leak, once.
+        // Validate the entry with the plausibility predicate before dereferencing.
         if (FAST_UNLIKELY(!IsPlausibleHeapPtr(*pp))) {
             ReportWildFreelistLink("AllocateLargeCached(walk)", cls,
                                    reinterpret_cast<std::uintptr_t>(*pp));
-            *pp = nullptr; // wild tail: cut the bin here, rest is dropped
+            *pp = nullptr; // cut off wild tail
             continue;
         }
         if ((*pp)->alloc_size >= size) {
@@ -586,14 +521,9 @@ void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
 }
 
 // ===========================================================================
-// v10 violation forensics: pointer-array audit
+// Diagnostic pointer scan
 //
-// Reads ONLY the fixed head arrays of this thread's cache (no freelist
-// walks, no foreign dereferences), so it is safe to call while the
-// allocator is in ANY state - including the corrupted state that triggered
-// it. Each pointer landing in [lo, hi) is printed with its container
-// identity; a hit means a corrupted allocator structure targeted the
-// audited region (the wild-write smoking gun).
+// Scans the fixed head arrays of this thread's cache without foreign dereferences.
 // ===========================================================================
 std::size_t TLSCache::AuditPointers(const void* lo, const void* hi) const {
     std::size_t hits = 0;

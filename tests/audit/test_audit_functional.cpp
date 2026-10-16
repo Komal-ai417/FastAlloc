@@ -1,5 +1,5 @@
 // ============================================================================
-// FastAlloc audit — functional correctness matrix (audit item 1).
+// FastAlloc functional correctness test matrix.
 // Every size-class boundary N-1/N/N+1, powers of 2 +/-1, tiny..huge,
 // alignment matrix, realloc semantics, zero-size, usable-image writes.
 // ============================================================================
@@ -270,11 +270,6 @@ TEST(AuditFunctional, CallocZeroAndOverflow) {
 //      is correct EITHER way (a successful move consumes the original --
 //      freeing both would be a double free); and the allocator stays fully
 //      serviceable afterwards.
-//      (Found in the field 2026-10-01: on an overcommit=1 host this test
-//      demanded nullptr for a 1 TiB reservation that the kernel happily
-//      granted, then double-freed the realloc'd block when the assumption
-//      broke -- the TLS double-push guard absorbed it, which is FastAlloc
-//      working as designed; the test's assumption was the defect.)
 TEST(AuditFunctional, HugeAndOverflowSizes) {
     // (a) overflow guards: must be rejected unconditionally
     for (std::size_t s : {SIZE_MAX, SIZE_MAX - 1, SIZE_MAX - 16}) {

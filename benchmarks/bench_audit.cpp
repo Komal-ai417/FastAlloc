@@ -1,9 +1,9 @@
 // ============================================================================
-// FastAlloc audit benchmark (item 17/18/20/23/25): latency percentiles,
+// Comprehensive performance benchmark: latency percentiles,
 // throughput scaling, realistic workloads, warm/cold, 20 reps + CoV + 95% CI.
 // Two build variants share this source:
 //   default:        FastAlloc explicit API
-//   -DUSE_GLIBC:    maps to glibc malloc/free/realloc/calloc/aligned_alloc
+//   -DUSE_GLIBC:    maps to standard allocator functions
 // ============================================================================
 #include "fast_alloc.h"
 #include "fast_alloc_config.h"

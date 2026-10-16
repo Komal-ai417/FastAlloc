@@ -1,7 +1,6 @@
 // ============================================================================
 // Public API behaviour tests: malloc / free / calloc / realloc, zero-size
 // semantics, null handling, alignment guarantees, calloc overflow guard.
-// (Audit gaps: C6 zero-size policy, alignment coverage, null handling.)
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"
@@ -29,14 +28,11 @@ TEST(ApiTest, FreeNullIsNoop) {
     SUCCEED();
 }
 
-// v9 guard: a freed pointer below 64 KB can never be a FastAlloc block
-// (Linux keeps the first 64 KB unmapped, Windows reserves it). The old code
-// dereferenced ptr-16 immediately and faulted at the NULL page - the exact
-// signature of the Sep-2026 CI runner crash (ptr = 0x10, si_addr = 0x0).
-// The guard must drop the pointer and keep serving instead of crashing,
-// in release AND debug builds.
+// Non-canonical pointer guard: pointers below 64 KB cannot be valid heap
+// blocks (first 64 KB is unmapped or reserved). The allocator must ignore
+// such invalid pointers safely without crashing in both release and debug modes.
 TEST(ApiTest, FreeNonCanonicalPointerIsDroppedNotFatal) {
-    fast_free(reinterpret_cast<void*>(0x10));           // the runner-crash value
+    fast_free(reinterpret_cast<void*>(0x10));           // low invalid address
     fast_free(reinterpret_cast<void*>(0x1000));        // anywhere in the null page
     fast_free_sized(reinterpret_cast<void*>(0x20), 8); // sized path, same guard
     void* live = fast_malloc(32);                       // allocator still serviceable
@@ -46,10 +42,8 @@ TEST(ApiTest, FreeNonCanonicalPointerIsDroppedNotFatal) {
     SUCCEED();
 }
 
-// v10: fast_free_sized with a WRONG size hint must route the block through
-// its TRUE class (from the block's own header), never into the hinted
-// class's TLS bin. Misrouting handed the next allocation from that bin an
-// undersized block - the seed of every downstream freelist corruption.
+// Sized deallocation with an incorrect size hint must route the block through
+// its true size class derived from its header, preventing freelist corruption.
 TEST(ApiTest, FreeSizedWrongHintRoutesToTrueClass) {
     void* p = fast_malloc(8); // true class: RequestToClass(8 + 16) -> 1
     ASSERT_NE(p, nullptr);
@@ -71,10 +65,8 @@ TEST(ApiTest, FreeSizedWrongHintRoutesToTrueClass) {
     SUCCEED();
 }
 
-// v10: a block whose header was zeroed/scribbled (slab field 0, garbage
-// alloc_size) must be DROPPED on the large-discrimination path, never fed
-// into the large cache with its bogus size - a poisoned entry there can be
-// handed out later as fresh memory.
+// Blocks with corrupt header metadata (e.g. unaligned or invalid allocation sizes)
+// must be dropped on the large-block path rather than cached.
 TEST(ApiTest, FreeWithCorruptLargeHeaderIsDroppedNotCached) {
 #if FASTALLOC_DEBUG_ENABLED
     GTEST_SKIP() << "debug build: the registry fatals on forged pointers by design";
@@ -107,17 +99,12 @@ TEST(ApiTest, FreeWithCorruptLargeHeaderIsDroppedNotCached) {
 }
 
 // ---------------------------------------------------------------------------
-// v11 guards: the closing datapoint of the Sep-2026 runner crash was a slot
-// holding 0xd90b6085fe368400 - 16-byte aligned, >= 64 KB, NON-CANONICAL. It
-// passed every v10 check (>= 64 KB only) and the inlined fast_free read its
-// header at [ptr-16] in the non-canonical half of the address space: the CPU
-// raises #GP and the kernel reports si_code=SI_KERNEL(128) with si_addr=0
-// ("faulting address (nil)"). The v11 predicate completes the checks with
-// the upper bound (< 2^47) and 16-alignment; all three free/resize entry
-// points must drop such values and keep serving, in release AND debug.
+// Non-canonical pointer guard: pointers in the non-canonical upper range
+// (>= 2^47) or misaligned addresses must be dropped safely across free and realloc
+// entry points without causing hardware faults.
 // ---------------------------------------------------------------------------
 TEST(ApiTest, FreeNonCanonicalHighPointerIsDroppedNotFatal) {
-    // The exact runner-crash value class (16-aligned, >= 64 KB, >= 2^47).
+    // Non-canonical addresses (>= 2^47).
     fast_free(reinterpret_cast<void*>(0xd90b6085fe368400ull));
     // The canonical boundary itself and beyond.
     fast_free(reinterpret_cast<void*>(0x0000800000000000ull));
@@ -155,10 +142,9 @@ TEST(ApiTest, FreeMisalignedPointerIsDroppedNotFatal) {
     SUCCEED();
 }
 
-// v11: every pointer the allocator hands out must satisfy the full shared
-// plausibility predicate (>= 64 KB, < 2^47, 16-aligned) - small, large and
-// aligned paths alike. This is the forward contract the free-side guards
-// rely on: a legitimate return is never rejected later.
+// Every pointer the allocator hands out must satisfy the full shared
+// plausibility predicate (>= 64 KB, < 2^47, 16-aligned) across small, large,
+// and aligned allocation paths.
 TEST(ApiTest, AllReturnsPassFullPlausibility) {
     const std::size_t sizes[] = {1, 8, 16, 24, 64, 100, 256, 1024, 4096,
                                  8192, 8193, 16 * 1024, 256 * 1024,

@@ -17,8 +17,7 @@
 // ordinary unused extern functions the linker discards.
 // ============================================================================
 extern "C" const char* __asan_default_options() {
-    // libc-compatible failure mode for huge/overflowing requests instead of
-    // a hard abort (also what the audit evidence methodology used).
+    // Allow null returns on huge/overflowing requests instead of aborting.
     return "allocator_may_return_null=1";
 }
 

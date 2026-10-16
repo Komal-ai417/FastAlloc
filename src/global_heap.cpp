@@ -1,5 +1,5 @@
 #include "global_heap.h"
-#include "tls_cache.h" // v11: ReportWildFreelistLink (definition in tls_cache.cpp)
+#include "tls_cache.h"
 #include "os_memory.h"
 #include "debug_aid.h"
 #include <algorithm>
@@ -14,13 +14,9 @@ namespace FastAlloc {
 namespace {
 
 // ===========================================================================
-// Page-span cache (C5 fix)
+// Page-span cache
 //
-// OLD policy: per-bin cap of (16 MB / span_size) with floor 8, no global
-// limit -> worst-case retention of 513 x 16 MB ~= 8.2 GB of anonymous memory
-// that was never returned to the OS.
-//
-// NEW policy:
+// Caching policy:
 //   - per-bin retention cap        : PAGE_CACHE_PER_BIN_BYTES (2 MB default)
 //   - global retention high-water  : PAGE_CACHE_TOTAL_BYTES (64 MB default,
 //                                    overridable via FASTALLOC_PAGE_CACHE_MB)
@@ -114,7 +110,7 @@ std::size_t BinRetentionCount(std::size_t span_pages) {
 void* PageHeapAllocate(std::size_t size) {
     const std::size_t page_size = OSMemory::GetPageSize();
 #if FASTALLOC_DEBUG_ENABLED
-    // Audit M1: the page-multiple contract is now actually asserted.
+    // Assert that size is a non-zero multiple of page size.
     if (FAST_UNLIKELY(size == 0 || (size % page_size) != 0)) {
         ViolationInfo info{};
         info.kind = Violation::InternalInvariant;
@@ -257,22 +253,11 @@ std::size_t PurgePageCacheLocked() {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Singleton (audit C7 fix)
+// Singleton
 //
-// The instance is intentionally LEAKED: it is constructed on first use and
-// never destroyed. A destroyed function-local static could be accessed by a
-// late TLS destructor at process shutdown (unspecified destruction order
-// across translation units) -> use-after-destroy. Leaking is the standard
-// allocator practice: the OS reclaims everything at exit anyway.
-//
-// FIX (RunKit audit finding OVR-1): the instance used to be created with
-// `new GlobalHeap()`, which routes through the GLOBAL operator new. When the
-// library is built with FASTALLOC_OVERRIDE_NEW, that operator forwards to
-// fast_malloc() - which needs this very singleton - so the very first
-// allocation re-entered the magic-static initializer and aborted with
-// __gnu_cxx::recursive_init_error. Placing the object in static storage
-// removes the bootstrap allocation entirely; the ctor still runs exactly
-// once, lazily, and is never destroyed (the intentional leak is preserved).
+// The instance uses placement new into static storage and is intentionally
+// not destroyed at exit. This avoids destruction-order issues with late
+// thread-local destructors and removes heap allocations during bootstrap.
 // ---------------------------------------------------------------------------
 GlobalHeap& GlobalHeap::GetInstance() {
     alignas(GlobalHeap) static unsigned char storage[sizeof(GlobalHeap)];
@@ -281,10 +266,8 @@ GlobalHeap& GlobalHeap::GetInstance() {
 }
 
 GlobalHeap::GlobalHeap() : next_arena_(0) {
-    // N3/C7: mark shutdown as soon as exit begins. TLSCache destructors then
-    // skip reflushing into the global heap, which removes both the
-    // destruction-order hazard and the Windows killed-thread-holding-a-lock
-    // deadlock at process exit.
+    // Mark shutdown at process exit so TLSCache destructors skip
+    // reflushing memory into the global heap.
     std::atexit([]() {
         GlobalHeap::GetInstance().shutting_down_.store(true, std::memory_order_release);
     });
@@ -377,14 +360,10 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
 // free lists warm with recently-faulted blocks).
 namespace {
 
-// v11 freelist-walk guard: validates one link before it is dereferenced.
-// Freelist links live in the USER AREA of blocks (FreeBlock::next @ +16), so
-// any stale-user-data / UAF / wild write lands exactly there - the v10
-// runner run carried non-canonical 16-aligned garbage (0xd90b6085fe368400)
-// through these lists and the old walks dereferenced it blindly. A link that
-// fails the full plausibility predicate (<64KB / <2^47 / 16-aligned) is
-// treated as end-of-list: the walk stops, the remainder is dropped (leak-
-// once discipline), the caller's existing self-healing paths absorb it.
+// Freelist link validation: validates a link before dereferencing.
+// Freelist links reside in the user area of free blocks (FreeBlock::next).
+// A link that fails the plausibility check (<64KB / <2^47 / 16-aligned)
+// is treated as the end of the list and dropped to prevent corrupt traversals.
 inline bool WalkLinkPlausible(FreeBlock* node, const char* where,
                                std::size_t class_index) {
     if (node == nullptr) return true; // list end: fine
@@ -394,12 +373,8 @@ inline bool WalkLinkPlausible(FreeBlock* node, const char* where,
     return false;
 }
 
-// v11 slab-field guard: every batch walk dereferences block->slab (IsFull /
-// Deallocate / arena_index). A wild-but-plausible slab with an out-of-range
-// arena_index would index past the 16-entry stack tables; validate both.
-// (kArenaCount mirrors GlobalHeap::NUM_ARENAS, which is private; a mismatch
-// would be caught by the arena tables' own bounds discipline and the test
-// suite's cross-thread coverage.)
+// Slab pointer validation: validates that the block's slab pointer is a
+// plausible heap address and references a valid arena index within bounds.
 inline bool BlockSlabUsable(FreeBlock* node, const char* where,
                             std::size_t class_index) {
     constexpr uint32_t kArenaCount = 16; // == GlobalHeap::NUM_ARENAS
@@ -419,9 +394,8 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
     if (!pending) return;
     Arena& arena = arenas_[arena_index];
     while (pending) {
-        // v11: validate node + slab metadata before the dereferences below
-        // (the pending queue is fed by lock-free MPSC pushes; a corrupted
-        // link must not reach slab->IsFull / Deallocate).
+        // Validate node and slab metadata before dereferencing to prevent
+        // corrupted links from reaching slab operations.
         if (FAST_UNLIKELY(!WalkLinkPlausible(pending, "ProcessPendingList",
                                              class_index) ||
                           !BlockSlabUsable(pending, "ProcessPendingList(slab)",
@@ -511,17 +485,8 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
     while (actual_count < target_count && !slab->IsFull()) {
         FreeBlock* block = static_cast<FreeBlock*>(slab->Allocate());
         if (FAST_UNLIKELY(!block || !IsPlausibleHeapPtr(block))) {
-            // v8 fix: Slab::Allocate() returned null although !IsFull() said
-            // the slab still had free blocks - its free_blocks counter is
-            // over-reporting (the fingerprint of a block double-return:
-            // free_blocks incremented twice for one physical block). The old
-            // code linked the nullptr into the batch: the first null was
-            // appended (silently corrupting actual_count), the second wrote
-            // through the null tail and faulted at [nullptr + 16] - the
-            // same fault signature as the Sep-2026 runner crash. Stop
-            // extracting instead and hand out only the real blocks taken.
-            // v11: a non-null but non-plausible block (wild slab freelist
-            // head) is treated the same way - never linked into the batch.
+            // Stop extraction if slab returns null or an implausible address,
+            // returning only valid extracted blocks to the caller.
             if (block) {
                 ReportWildFreelistLink("ExtractBlocksFromSlab", class_index,
                                        reinterpret_cast<std::uintptr_t>(block));
@@ -571,9 +536,8 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
         PendingList& pl = arena.pending_returns_[class_index];
         FreeBlock* pending = pl.head.exchange(nullptr, std::memory_order_acquire);
         if (pending) {
-            // v11: a popped pending head is dereferenced immediately; a wild
-            // head (corrupt MPSC queue) is rejected whole (leak, once) and
-            // the refill falls through to the slab paths below.
+            // Validate popped pending head before dereferencing; reject invalid
+            // pointers to prevent traversing corrupted queues.
             if (FAST_UNLIKELY(!IsPlausibleHeapPtr(pending))) {
                 ReportWildFreelistLink("AllocateBatch(pending head)",
                                        class_index,
@@ -585,8 +549,7 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
             FreeBlock* split = pending;
             std::size_t taken = 1;
             while (taken < target_count && split->next) {
-                // v11: validate the link before chasing it - the walk below
-                // (and the 'split->next = nullptr' cut) dereference it.
+                // Validate link before chasing it to ensure list integrity.
                 FreeBlock* nxt = split->next;
                 if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt))) {
                     ReportWildFreelistLink("AllocateBatch(feed walk)",
@@ -693,9 +656,9 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
                             }
                             tailr = tailr->next;
                         }
-                        // v11: if the append walk stopped on a wild link, cut
+                        // If the append walk stopped on an invalid link, cut
                         // the result there and append the stolen batch after
-                        // the cut; the wild tail is dropped (leak, once).
+                        // the cut.
                         tailr->next = p2;
                         actual_count += taken2;
                     }
@@ -731,7 +694,7 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
 void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
     (void)slab;
     FreeBlock* block = static_cast<FreeBlock*>(ptr);
-    // v11: the stores below write through 'block'; never push a wild value.
+    // Validate block address and slab metadata before modifying block fields.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(block) || !BlockSlabUsable(
             block, "GlobalHeap::DeallocateBlock(slab)", block->class_index))) {
         return;
@@ -753,8 +716,7 @@ void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
 void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails) {
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) { heads[i] = nullptr; tails[i] = nullptr; }
     while (head) {
-        // v11: stop at the first wild link (the rest of the list is dropped
-        // - one leak, once) and drop blocks whose slab metadata is unusable.
+        // Stop at the first invalid link and drop blocks with invalid slab metadata.
         if (FAST_UNLIKELY(!WalkLinkPlausible(head, "SplitListByArena", 0) ||
                           !BlockSlabUsable(head, "SplitListByArena(slab)", 0))) {
             return;
@@ -829,21 +791,18 @@ void GlobalHeap::DeallocateBatchClass(std::size_t class_index, FreeBlock* head) 
 }
 
 // ---------------------------------------------------------------------------
-// DeallocateBatch (audit N2 fix)
+// DeallocateBatch
 //
-// The incoming list is split by (arena, class) using EACH BLOCK'S OWN slab
-// metadata. Previously the class was derived from the first block only,
-// which silently relied on every caller passing single-class lists. The
-// routing tables are stack-resident (NUM_ARENAS * 2 pointers) plus a
-// per-arena 512-entry bucket pass, so no heap allocation occurs inside the
-// allocator.
+// The incoming list is split by (arena, class) using each block's own slab
+// metadata. Routing tables are stack-resident (NUM_ARENAS * 2 pointers)
+// plus a per-arena 512-entry bucket pass without heap allocation.
 // ---------------------------------------------------------------------------
 void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* list) {
     Arena& arena = arenas_[arena_index];
     FreeBlock* curr = list;
     while (curr) {
-        // v11: validate the node and its slab metadata before dereferencing;
-        // a wild node or unusable slab ends the batch here (dropped, once).
+        // Validate the node and its slab metadata before dereferencing;
+        // a wild node or unusable slab ends the batch here.
         if (FAST_UNLIKELY(!WalkLinkPlausible(curr, "ProcessBatchLocked",
                                              class_index) ||
                           !BlockSlabUsable(curr, "ProcessBatchLocked(slab)",
@@ -883,9 +842,7 @@ void GlobalHeap::DeallocateBatch(FreeBlock* head) {
     std::array<FreeBlock*, NUM_ARENAS> arena_tails{};
 
     while (head) {
-        // v11: validate node + slab metadata (the phase split dereferences
-        // head->slab->arena_index and indexes the stack tables with it); a
-        // wild node ends the batch (dropped, once).
+        // Validate node and slab metadata before dereferencing head->slab->arena_index.
         if (FAST_UNLIKELY(!WalkLinkPlausible(head, "DeallocateBatch", 0) ||
                           !BlockSlabUsable(head, "DeallocateBatch(slab)", 0))) {
             return;
@@ -907,9 +864,9 @@ void GlobalHeap::DeallocateBatch(FreeBlock* head) {
         head = next;
     }
 
-    // Phase 2: within each arena, split by size class (per-block metadata,
-    // audit N2), then push each class run to the pending queue or process
-    // directly if the class lock is free.
+    // Phase 2: within each arena, split by size class using per-block metadata,
+    // then push each class run to the pending queue or process directly
+    // if the class lock is free.
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
         if (!arena_heads[i]) continue;
 
@@ -920,8 +877,7 @@ void GlobalHeap::DeallocateBatch(FreeBlock* head) {
 
         FreeBlock* curr = arena_heads[i];
         while (curr) {
-            // v11: same per-step validation for the class split (it indexes
-            // the 512-entry class tables with slab->block_size arithmetic).
+            // Validate link and slab metadata before indexing class tables.
             if (FAST_UNLIKELY(!WalkLinkPlausible(curr, "DeallocateBatch(class)", 0) ||
                               !BlockSlabUsable(curr, "DeallocateBatch(class slab)", 0))) {
                 curr = nullptr;
@@ -1022,11 +978,9 @@ std::size_t GlobalHeap::PurgePageCache() {
 }
 
 // ===========================================================================
-// v10 violation forensics: pointer-array audit (see fast_alloc.h).
-// Reads only the fixed head arrays - arena slab lists, pending queues and
-// page bins - never dereferences a foreign pointer, so it is safe while
-// the allocator is in any state. A hit means some corrupted structure
-// currently targets the audited region.
+// Pointer-array diagnostic scan (see fast_alloc.h).
+// Reads head arrays across arena slab lists, pending queues, and page bins.
+// Performs read-only inspections without foreign dereferences.
 // ===========================================================================
 std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
     const std::uintptr_t low = reinterpret_cast<std::uintptr_t>(lo);

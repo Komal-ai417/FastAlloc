@@ -53,7 +53,7 @@ struct Slab {
     uint32_t arena_index;
     uint32_t class_idx;             // cached class index for lazy carving
 #if FASTALLOC_DEBUG_ENABLED
-    uint64_t magic;     // Validated on every free (audit C3: pointer provenance)
+    uint64_t magic;     // Validated on every free for pointer provenance
 #endif
 
     /**
@@ -73,7 +73,7 @@ struct Slab {
      */
     inline void* Allocate() {
 #if FASTALLOC_DEBUG_ENABLED
-        // Audit H1/QA-report: these invariants are now actually implemented.
+        // Invariant check: verify free blocks available.
         assert_fast(free_blocks > 0 && (free_list != nullptr || next_new < total_blocks),
                     "Allocate from exhausted slab");
 #endif
@@ -104,21 +104,12 @@ struct Slab {
     inline void Deallocate(void* ptr) {
         FreeBlock* block = static_cast<FreeBlock*>(ptr);
 #if FASTALLOC_DEBUG_ENABLED
-        // Audit H1/QA-report: runtime asserts that were claimed to exist.
         assert_fast(block->slab == this, "Block returned to wrong slab");
         assert_fast(free_blocks < total_blocks, "Double free / free_blocks overflow");
-        // v8: the head-double-return (same block returned twice) is fatal in
-        // DEBUG (it is the source of every downstream invariant break) and
-        // absorbed in release (idempotent return, below).
         assert_fast(free_list != block, "Double return of the free-list head");
 #endif
         if (FAST_UNLIKELY(free_list == block)) {
-            // v8 guard: 'block' is already this slab's free-list head - a
-            // double return (the same block handed out twice upstream).
-            // Relinking would store block->next = block (self-cycle) AND
-            // inflate free_blocks past total_blocks, so every later
-            // IsFull()/IsEmpty() answer is wrong. Idempotent-return instead:
-            // the list and the counters stay exact.
+            // Guard against double return of current free list head.
             return;
         }
         block->next = free_list;

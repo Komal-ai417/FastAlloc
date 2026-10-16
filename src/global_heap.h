@@ -14,8 +14,7 @@
 
 namespace FastAlloc {
 
-// Portable pause/yield intrinsic for spin loops (audit O3: ARM emitted no
-// pause instruction before, degrading contended performance).
+// Portable pause/yield intrinsic for spin loops.
 #if defined(_MSC_VER)
 #define FAST_CPU_PAUSE() _mm_pause()
 #elif defined(__i386__) || defined(__x86_64__)
@@ -63,8 +62,8 @@ public:
     void DeallocateBlock(Slab* slab, void* ptr);
 
     // Return a batched linked list of blocks back to their respective slabs.
-    // Safe for mixed size classes: blocks are routed by their OWN slab's
-    // class index (audit N2 fix - previously derived from the first block only).
+    // Safe for mixed size classes: blocks are routed by their own slab's
+    // class index.
     void DeallocateBatch(FreeBlock* head);
 
     // Single-class variant used by the TLS overflow flush: every block in
@@ -86,22 +85,17 @@ public:
     void  DeallocateLarge(void* ptr, std::size_t size);
 
     // True once process shutdown has begun. Thread-cache destructors check
-    // this and skip reflushing memory back into the global heap, which
-    // avoids two hazards:
-    //   (a) destruction-order UB between the GlobalHeap singleton and late
-    //       TLS callbacks (audit C7), and
-    //   (b) Windows process-exit deadlock when a thread was terminated while
-    //       holding a page-bin lock (audit N3).
+    // this and skip reflushing memory back into the global heap, avoiding
+    // destruction-order conflicts with late TLS callbacks and lock-holding exits.
     bool IsShuttingDown() const { return shutting_down_.load(std::memory_order_acquire); }
 
     // Drop every cached page span back to the OS. Thread-safe; acquires each
     // bin lock in turn. Returns the number of bytes released.
     std::size_t PurgePageCache();
 
-    // v10 forensics: report (stderr) every arena slab-list head, pending
-    // queue head and page-bin head pointing into [lo, hi); returns the hit
-    // count. Pointer-array reads only - no foreign dereferences, safe in
-    // any allocator state.
+    // Reports (stderr) every arena slab-list head, pending queue head, and
+    // page-bin head pointing into [lo, hi); returns the hit count.
+    // Read-only inspection of internal pointer arrays.
     std::size_t AuditPointers(const void* lo, const void* hi);
 
     // OOM-injection seam for tests: when set, the next N page allocations

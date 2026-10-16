@@ -4,10 +4,10 @@
 // ============================================================================
 // FastAlloc public API
 // ============================================================================
-// Zero-size semantics (documented contract, audit C6 fix):
-//   fast_malloc(0)      -> returns a UNIQUE non-null pointer (1 byte usable),
-//                          matching glibc/musl behaviour. Free it with
-//                          fast_free. (Previously returned nullptr.)
+// Zero-size semantics:
+//   fast_malloc(0)      -> returns a unique non-null pointer (1 byte usable),
+//                          matching standard allocator behaviour. Free it with
+//                          fast_free.
 //   fast_calloc(0, n)   -> unique non-null pointer, same as malloc(0).
 //   fast_calloc(n, 0)   -> unique non-null pointer, same as malloc(0).
 //   fast_realloc(p, 0)  -> frees p and returns nullptr (C11 semantics).
@@ -101,15 +101,12 @@ void fast_alloc_purge();
 void fast_alloc_purge_thread_cache();
 
 /**
- * @brief Forensics: print every allocator-internal pointer that falls inside
- *        [lo, hi), naming the structure that holds it.
+ * @brief Diagnostic pointer scan: inspects allocator head arrays for any
+ *        internal pointers that fall inside [lo, hi), reporting their locations.
  *
- * Called by instrumented clients (the benchmark guard) when they observe
- * memory corruption, to answer "did a corrupted allocator pointer target my
- * region?". Scans the calling thread's TLS bin heads, the thread-cache pool,
- * every arena's partial/full/pending head arrays and the page-bin heads -
- * pointer arrays only, no foreign dereferences, safe to call in any state.
- * One call, one report block on stderr. Zero cost when never called.
+ * Scans the calling thread's TLS bin heads, the thread-cache pool,
+ * arena slab lists, pending queues, and page-bin heads.
+ * Read-only scan of pointer arrays with no foreign dereferences.
  */
 void fast_alloc_audit_pointers(const void* lo, const void* hi);
 
@@ -125,7 +122,7 @@ void fast_alloc_log_set_level(int level);
 
 // Optional global operator overrides (usually provided in a separate file or
 // conditionally enabled). The sized-delete override forwards the size hint
-// to fast_free_sized() so the hot path skips one dependent load (audit O1).
+// to fast_free_sized() to avoid an extra header lookup.
 #ifdef FAST_ALLOC_OVERRIDE_NEW
 void* operator new(std::size_t size);
 void* operator new[](std::size_t size);

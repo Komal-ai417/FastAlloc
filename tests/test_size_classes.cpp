@@ -1,6 +1,5 @@
 // ============================================================================
 // Size-class boundary tests and slab-path data integrity.
-// (Audit gap: class-boundary behaviour was never verified numerically.)
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"

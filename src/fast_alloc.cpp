@@ -33,32 +33,17 @@ constexpr std::uintptr_t ALIGN_MAGIC = 0xA1A2A3A4A5A6A701ull; // odd, never a re
 
 
 inline std::size_t EffectivePageSize() {
-    // Audit N1 fix: the large-allocation rounding must use the RUNTIME page
-    // size, not the compile-time constant. On 64KB-page systems the old code
-    // recorded 4KB-rounded sizes in headers while the actual mappings were
-    // 64KB-rounded -> munmap with wrong sizes and corrupted page-bin entries.
+    // Queries the system page size at runtime for page-aligned allocation sizing.
     return OSMemory::GetPageSize();
 }
 
-// v8 hardening telemetry (see fast_free): one-shot stderr on the first
-// out-of-range class index observed per process, silent afterwards.
-//
-// v9: compiled ONLY when its (release-path) call site exists. FASTALLOC_DEBUG
-// builds validate provenance through the registry instead and never call
-// this function, which left it unreferenced - Clang treats an unused static
-// inline function as -Wunused-function (a hard error under our -Werror) and
-// failed the ubuntu-latest-clang-debug CI job (Sep 2026). GCC does not warn
-// for unused static inline functions, which is why only the Clang job saw
-// it. Guarding the definition with the same condition as the call site is
-// the structural fix; no [[maybe_unused]] band-aid that would outlive the
-// call site it protects.
+// Logs diagnostic information once if an out-of-range size class index is encountered.
 #if !FASTALLOC_DEBUG_ENABLED
 inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 #if defined(__GNUC__) || defined(__clang__)
     if (__builtin_expect(class_index < NUM_SIZE_CLASSES, 1)) return;
 #endif
-    // Atomic one-shot: two threads can observe the same corruption; the
-    // exchange guarantees exactly one full report line, race-free (TSan).
+    // Atomic one-shot reporting to avoid duplicate logs across threads.
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -71,32 +56,14 @@ inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 }
 #endif // !FASTALLOC_DEBUG_ENABLED
 
-// v9 crash-survival guard: the lowest address any FastAlloc user pointer can
-// ever have. Blocks live inside mmap'd / pooled spans (multi-MB regions far
-// above this line); Linux keeps [0, 64KB) unmapped and Windows reserves the
-// first 64 KB as the null-pointer zone, so nothing below 64 KB can be a
-// valid block in either world. (v10: moved to fast_alloc_config.h as
-// kMinCanonicalUserPtr; v11: the local alias was superseded entirely by
-// IsPlausibleHeapPtr and removed - one predicate, one home.)
-
-// v10 hardening: is 'alloc_size' a value the large path can trust? A live
-// large header always carries the page-rounded SPAN size (>= one page, a
-// page multiple, sane magnitude). A block whose header was zeroed
-// (madvise'd span) or scribbled reads 0 / garbage here; the OLD code
-// trusted it unconditionally, then pushed the bogus entry into the TLS
-// large cache, from which AllocateLargeCached could later hand it out as
-// fresh memory - a silent cross-arena aliasing machine. The check is one
-// compare on an already-loaded word.
+// Checks that a large allocation header has a plausible page-aligned span size.
 inline bool LargeHeaderSizePlausible(std::size_t alloc_size) {
     const std::size_t page = EffectivePageSize();
     return alloc_size >= page && (alloc_size % page) == 0 &&
            alloc_size < (1ull << 48);
 }
 
-// v10: one-shot telemetry when a forged/zeroed header is rejected on the
-// large path (fast_free / fast_realloc). Referenced from BOTH the debug and
-// release discrimination paths, so it is compiled unconditionally - no
-// -Wunused-function exposure under FASTALLOC_DEBUG (the v9 lesson).
+// Logs diagnostic information once when a large allocation header has an invalid size.
 inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
@@ -109,23 +76,8 @@ inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
     }
 }
 
-// One-shot telemetry for the v9/v11 guard: the Sep-2026 runner crashes
-// faulted exactly on this class of value. v9: the benchmark's pointer array
-// held 0x10 and the inlined fast_free read its header at [0x10 - 16] = 0x0,
-// a SIGSEGV at the NULL page. v10 (closing datapoint): the array held
-// 0xd90b6085fe368400 - 16-aligned, >= 64 KB, NON-CANONICAL - which passed
-// every v10 check, and [ptr-16] landed in the non-canonical half: the CPU
-// raises #GP and the kernel reports si_code=SI_KERNEL(128) with
-// si_addr=0 ("faulting address (nil)", reproduced 3/3 on the runner,
-// 0/650+ locally). The guard now applies the FULL plausibility predicate
-// (>= 64 KB, < 2^47, 16-aligned) and drops the poisoned pointer (a
-// one-block leak, once) so the run completes and the event lands in the
-// CI job log; the benchmark-side store-time witness (bench_main.cpp)
-// distinguishes "allocator returned it" from "slot overwritten after the
-// store" on the same occurrence.
+// Logs diagnostic information once when an invalid pointer is passed to free.
 inline void ReportNonCanonicalFree(void* ptr) {
-    // Atomic one-shot: exactly one report line even when several threads
-    // trip the guard simultaneously (race-free under TSan).
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -137,13 +89,7 @@ inline void ReportNonCanonicalFree(void* ptr) {
     }
 }
 
-// v11: one-shot telemetry when fast_malloc/fast_aligned_alloc is about to
-// RETURN a value that fails the plausibility predicate. Defense-in-depth:
-// the pop/batch guards upstream should make this unreachable, but the
-// runner's codegen surprises (the v10 binary even dropped the bench's
-// alignment check from the hot path) justify a final gate on every exit.
-// The block is leaked (once) and nullptr is returned instead of handing a
-// wild pointer to the caller.
+// Logs diagnostic information once if an allocation exit check detects an invalid pointer.
 inline void ReportWildReturnValue(void* ptr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
@@ -338,7 +284,7 @@ AllocRecord DebugOnFreeLarge(void* user, LargeAllocHeader* header) {
 // Core allocation entry points
 // ===========================================================================
 void* fast_malloc(std::size_t size) {
-    // Zero-size policy (audit C6): unique non-null pointer, like glibc.
+    // Zero-size policy: unique non-null pointer.
     if (size == 0) size = 1;
 
     if (FAST_UNLIKELY(size > MaxSmallRequest())) {
@@ -356,17 +302,12 @@ void* fast_malloc(std::size_t size) {
         TLSCache& tls = TLSCache::GetFast();
         void* cached_mem = tls.AllocateLargeCached(alloc_size);
         if (cached_mem) {
-            // v11 final gate (same rationale as the small path): never hand
-            // the caller a non-plausible pointer.
+            // Exit gate: verify pointer plausibility before returning.
             if (FAST_UNLIKELY(!IsPlausibleHeapPtr(cached_mem))) {
                 ReportWildReturnValue(cached_mem);
                 return nullptr;
             }
-            // Count the span's usable bytes (header->alloc_size is the exact
-            // page-rounded span): fast_free counts the same quantity, so
-            // alloc/free stay balanced and current_live_bytes never
-            // underflows (it used to: alloc counted the REQUESTED size while
-            // free counted the SPAN size).
+            // Count the span's usable bytes so alloc and free statistics balance.
             LargeAllocHeader* h = reinterpret_cast<LargeAllocHeader*>(
                 static_cast<char*>(cached_mem) - sizeof(LargeAllocHeader));
 #if FASTALLOC_DEBUG_ENABLED
@@ -391,11 +332,7 @@ void* fast_malloc(std::size_t size) {
     if (FAST_UNLIKELY(!block)) return nullptr;
 
     void* user = reinterpret_cast<char*>(block) + USER_OFFSET;
-    // v11 final gate: never hand the caller a pointer that fails the full
-    // plausibility predicate. Upstream pop/batch guards make this belt-and-
-    // braces, but the v10 runner run proved codegen can defeat expectations;
-    // this is the last exit before the value escapes into user code (and
-    // into the benchmark's slot array, where the v10 crash was born).
+    // Exit gate: ensure pointer passes plausibility check before returning.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(user))) {
         ReportWildReturnValue(user);
         return nullptr;
@@ -405,9 +342,7 @@ void* fast_malloc(std::size_t size) {
     // Exact requested bytes: the debug registry's free path counts rec.size.
     tls.CountSmallAlloc(size);
 #else
-    // Usable bytes: the release free path counts UsableSize(class) too, so
-    // per-block alloc/free counts match and current_live_bytes cannot
-    // underflow (it previously wrapped to ~16 EB after enough churn).
+    // Usable bytes: tracked so alloc and free statistics balance.
     tls.CountSmallAlloc(UsableSize(class_index));
 #endif
 #if FASTALLOC_LOGGING_ENABLED
@@ -420,13 +355,7 @@ void* fast_malloc(std::size_t size) {
 void fast_free(void* ptr) {
     if (!ptr) return;
 
-    // v9/v11 guard (see ReportNonCanonicalFree): reject a non-plausible
-    // pointer BEFORE the header read can fault. v9 caught sub-64KB values
-    // (0x10 -> [ptr-16] = the NULL page); v11 completes the predicate with
-    // the upper canonicality bound and alignment - the v10 runner crash
-    // dereferenced 0xd90b6085fe368400-16 in the non-canonical half of the
-    // address space, which faults with #GP (si_code=SI_KERNEL=128,
-    // si_addr=0 - the "faulting address (nil)" signature).
+    // Verify pointer plausibility before reading header.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         return;
@@ -445,11 +374,7 @@ void fast_free(void* ptr) {
         alloc_size = header->alloc_size; // header validated; size trustworthy
         TLSCache::GetFast().CountLargeFree(alloc_size - sizeof(LargeAllocHeader));
 #else
-        // v10 guard: a zeroed (madvise'd span) or scribbled header reads a
-        // non-span alloc_size here. Trusting it fed the TLS large cache a
-        // bogus entry (size 0 / garbage), which AllocateLargeCached could
-        // later serve - handing out a pointer into foreign memory. Dropping
-        // the pointer leaks one block once; the cache stays clean.
+        // Validate large header span size before caching or returning.
         if (FAST_UNLIKELY(!LargeHeaderSizePlausible(alloc_size))) {
             ReportCorruptLargeHeader(ptr, alloc_size);
             return;
@@ -505,12 +430,7 @@ void fast_free(void* ptr) {
     TLSCache::GetFast().CountSmallFree(rec.size);
     TLSCache::GetFast().DeallocateBlock(rec.class_or_large, block);
 #else
-    // v8 hardening: the class index comes from the block header; a corrupted
-    // value >= NUM_SIZE_CLASSES would index past the 512-entry TLS bins_
-    // array (and CACHE_LIMITS) and silently corrupt the thread cache object.
-    // The debug registry catches provenance; this is the release-side bound.
-    // A corrupted header cannot be routed safely, so the block is dropped
-    // (a leak, once) instead of corrupting the allocator.
+    // Validate class index bounds before indexing into thread-local bins.
     if (FAST_UNLIKELY(block->class_index >= NUM_SIZE_CLASSES)) {
         ReportCorruptClassIndex(ptr, block->class_index);
         return;
@@ -527,8 +447,7 @@ void fast_free(void* ptr) {
 void fast_free_sized(void* ptr, std::size_t size) {
     if (!ptr) return;
 
-    // v9/v11 guard: same full-plausibility rejection as fast_free before
-    // the header read (this path also loads block->slab first).
+    // Check pointer plausibility before reading block header.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         return;
@@ -560,27 +479,14 @@ void fast_free_sized(void* ptr, std::size_t size) {
     return;
 #endif
 
-    // Release fast path: the size hint saves the header->class_index load
-    // and its dependent-use latency (audit O1 / M3).
+    // Release fast path: the size hint avoids loading the header's class_index.
     std::size_t class_index = RequestToClass(size);
-    // v10: cross-check the hint against the block's OWN header (same
-    // already-touched 16 bytes, one 4-byte load + compare). A wrong hint
-    // used to push the block into a foreign TLS bin: the next allocation
-    // from that bin returned an undersized block, and the user's first
-    // write overflowed into the NEXT block's header - the canonical seed
-    // of freelist corruption (0x10-class garbage in pointers). A mismatch
-    // now routes through fast_free, which trusts only the header.
+    // Verify the caller's size hint against the block header; if mismatched, fallback to standard free.
     if (FAST_UNLIKELY(static_cast<std::size_t>(block->class_index) != class_index)) {
         fast_free(ptr);
         return;
     }
-    // FIX (RunKit audit finding STAT-1): this release fast path used to call
-    // DeallocateBlock() without CountSmallFree(), so every sized free was
-    // missing from small_frees / current_live_blocks / current_live_bytes in
-    // release builds (the FASTALLOC_OVERRIDE_NEW sized-delete overload lands
-    // here, making fast_alloc_stats() report monotonically growing "live"
-    // counts). The memory itself was freed correctly - only the diagnostics
-    // were wrong. Count it exactly like the unsized fast_free() path does.
+    // Maintain deallocation statistics for sized deallocation.
     TLSCache& tls = TLSCache::GetFast();
     tls.CountSmallFree(UsableSize(class_index));
     tls.DeallocateBlock(class_index, block);
@@ -596,14 +502,7 @@ void* fast_calloc(std::size_t num, std::size_t size) {
     return ptr;
 }
 
-//------------------------------------------------------------------------------
-// AUDIT FIX F1 (2026-09-30): large-shrink keep-span early returns used to
-// skip the FASTALLOC_DEBUG registry/red-zone update. The registry kept the
-// OLD logical size, so a lawful write up to new_size destroyed the stale
-// rear red zone and fast_free() reported a FALSE "BUFFER OVERFLOW". Every
-// keep-span exit now records rec.size = new_size and refills the red zone
-// from ptr+new_size to the unchanged span's usable end.
-//------------------------------------------------------------------------------
+// Updates debug registry and red-zone tracking when a large span is shrunk in place.
 #if FASTALLOC_DEBUG_ENABLED
 namespace {
 void DebugUpdateKeptLargeSpan(void* ptr, std::size_t new_size,
@@ -632,9 +531,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         return fast_malloc(new_size);
     }
 
-    // v9/v11 guard: fast_realloc reads block->slab immediately below; reject
-    // a non-plausible pointer (full predicate: <64KB / >=2^47 / misaligned)
-    // instead of faulting on its "header".
+    // Reject non-plausible pointers before reading block header.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
         ReportNonCanonicalFree(ptr);
         errno = EINVAL;
@@ -650,11 +547,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             static_cast<char*>(ptr) - 32);
         std::size_t old_size = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 8);
-        // v11: the stash lives in the raw block's user area - user data can
-        // corrupt it (that is its threat model). A forged alignment would
-        // make fast_aligned_alloc return nullptr (it validates power-of-two
-        // range), but a forged old_size would drive the memcpy length below
-        // straight into unmapped memory. Reject absurd values outright.
+        // Validate alignment and size fields recovered from stash.
         if (FAST_UNLIKELY(alignment < ALIGNMENT || alignment > 4096 ||
                           (alignment & (alignment - 1)) != 0 ||
                           old_size > (1ull << 30))) {
@@ -684,11 +577,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     if (is_large) {
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-        // v10: reject a zeroed/scribbled header BEFORE its bogus size flows
-        // into copy lengths and shrink/grow decisions. (Common path, both
-        // configs: in DEBUG the slab==nullptr discrimination is normally
-        // only reached with LARGE_MAGIC headers, so an implausible size
-        // here already means the header is corrupt.)
+        // Validate header alloc_size before sizing shrink or grow operations.
         if (FAST_UNLIKELY(!LargeHeaderSizePlausible(header->alloc_size))) {
             ReportCorruptLargeHeader(ptr, header->alloc_size);
             errno = EINVAL;
@@ -738,7 +627,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             return ptr;
         }
 
-        // In-place large shrink (audit M2/O5): keep the front pages, release
+        // In-place large shrink: keep the front pages, release
         // the tail back to the OS instead of copy+remap. Pooled spans skip
         // mremap entirely: a shrink would unmap a sub-range of a pool chunk
         // (VMA split) and the pool cannot track that; keeping the span is
@@ -750,7 +639,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             [[maybe_unused]] std::size_t span_usable =
                 header->alloc_size - sizeof(LargeAllocHeader);
 #if FASTALLOC_DEBUG_ENABLED
-            // AUDIT FIX F1: keep-span exits must update the debug registry.
+            // Update debug registry for retained span.
             auto debug_keep = [&]() {
                 DebugUpdateKeptLargeSpan(ptr, new_size, span_usable);
             };
@@ -796,7 +685,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         }
         // Small shrink falls through to the generic copy path.
     } else if (is_large) {
-        // ---- Large growth: try to grow in place first (audit M2/O5) -------
+        // ---- Large growth: try to grow in place first -------
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
@@ -858,8 +747,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     void* new_ptr = fast_malloc(new_size);
     if (new_ptr) {
 #if FASTALLOC_DEBUG_ENABLED
-        // Copy only the user's real bytes (audit N5: previously up to the
-        // full class-usable size, dragging red-zone garbage into the copy).
+        // Copy only the user's active bytes.
         std::size_t copy_bytes = old_size;
         AllocRecord rec{};
         if (AllocRegistry::GetInstance().Erase(ptr, &rec)) {
@@ -877,7 +765,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 }
 
 // ===========================================================================
-// Aligned allocation (audit M7)
+// Aligned allocation
 // ===========================================================================
 void* fast_aligned_alloc(std::size_t alignment, std::size_t size) {
     if (size == 0) size = 1; // zero-size policy: unique pointer
@@ -999,7 +887,7 @@ void operator delete[](void* ptr) noexcept {
     FastAlloc::fast_free(ptr);
 }
 void operator delete(void* ptr, std::size_t size) noexcept {
-    // Audit O1/M3: honour the sized-deallocation hint.
+    // Forward the size hint to sized deallocation.
     FastAlloc::fast_free_sized(ptr, size);
 }
 void operator delete[](void* ptr, std::size_t size) noexcept {

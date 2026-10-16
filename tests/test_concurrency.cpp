@@ -153,9 +153,8 @@ TEST(ConcurrencyTest, CrossThreadFreeProducerConsumer) {
 }
 
 TEST(ConcurrencyTest, ThreadExitFlushesCaches) {
-    // A thread allocates WITHOUT freeing anything, then exits. The TLS
-    // destructor must return its cached blocks to the global heap (audit:
-    // this was a suspected leak point; also required by Final Report 5.2).
+    // A thread allocates without freeing, then exits. The TLS destructor
+    // must return its cached blocks to the global heap.
     const std::size_t before = fast_alloc_stats().os_bytes_live;
 
     constexpr int kRounds = 8;

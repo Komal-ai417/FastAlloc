@@ -16,8 +16,7 @@
 #include <pthread.h>
 #endif
 
-// fast_alloc_config.h pins _WIN32_WINNT >= 0x0600 before any windows.h
-// include chain reaches this point (audit H5 fix: Fls* APIs require Vista+).
+// Requires _WIN32_WINNT >= 0x0600 for FLS APIs on Windows.
 
 #if defined(_MSC_VER)
 #define FAST_THREAD_LOCAL __declspec(thread)
@@ -32,22 +31,17 @@ namespace FastAlloc {
 class TLSCache;
 extern FAST_THREAD_LOCAL TLSCache* fast_path_cache;
 
-// Sep-2026 runner-crash forensics: fired by the TLS bin guards below, defined
-// in tls_cache.cpp. One-shot stderr (first occurrence per process) so the
-// event lands in the CI job log; later occurrences are silent.
+// Logs diagnostic information once if a double push of the bin head is detected.
 void ReportDoublePushGuard();
 
-// v10: fired by the AllocateBlock pop guard when a bin head holds a
-// non-canonical value (small integer). Same one-shot discipline.
+// Logs diagnostic information once if a bin head contains an invalid pointer.
 void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head);
 
-// v11: fired when a freelist link or batch head fails the full plausibility
-// predicate (non-canonical, sub-64KB or misaligned). One-shot.
+// Logs diagnostic information once if a freelist link fails pointer plausibility.
 void ReportWildFreelistLink(const char* where, std::size_t class_index,
                              std::uintptr_t bad_link);
 
-// v10 forensics: audit the calling thread's TLSCache AND the cross-thread
-// cache-recycling pool for pointers into [lo, hi). Returns hit count.
+// Diagnostic scan: inspect calling thread's TLSCache and pool for pointers in [lo, hi).
 std::size_t AuditCurrentThreadCache(const void* lo, const void* hi);
 
 class TLSCache {
@@ -61,27 +55,14 @@ public:
     inline void* AllocateBlock(std::size_t class_index) {
         CacheBin& bin = bins_[class_index];
         FreeBlock* block = bin.head;
-        // v11: the FULL plausibility predicate (>=64KB, <2^47, 16-aligned).
-        // The v10 pop guard only rejected sub-64KB heads; the runner's v10
-        // run proved the missing class: a non-canonical 16-aligned value
-        // (0xd90b6085fe368400) sailed through and 'block->next' dereferenced
-        // the non-canonical half -> #GP -> SIGSEGV(si_code=128, faulting
-        // address (nil)). Both bounds plus alignment are now enforced before
-        // ANY dereference of a head.
+        // Verify head pointer plausibility before dereferencing next pointer.
         if (FAST_LIKELY(IsPlausibleHeapPtr(block))) {
             bin.head = block->next;
             bin.count--;
             return block;
         }
         if (FAST_UNLIKELY(block != nullptr)) {
-            // v10 pop guard: the bin head holds a non-canonical value (a
-            // small integer such as 0x10 - the exact class of the Sep-2026
-            // runner corruption). The old code only null-checked, so a small
-            // non-null value sailed through and 'block->next' faulted at
-            // [0x10 + 16]. The corruption is dropped, the WHOLE bin is
-            // re-derived from a fresh batch (count was unknowable), and the
-            // allocator keeps serving. One-shot telemetry lands in the CI
-            // job log via tls_cache.cpp.
+            // Reset bin and route to slow path if bin head holds an invalid pointer.
             ReportBinHeadCorruption(class_index,
                                     reinterpret_cast<std::uintptr_t>(block));
             bin.head = nullptr;
@@ -94,13 +75,7 @@ public:
     void* AllocateBlockSlow(std::size_t class_index);
 
     inline void DeallocateBlock(std::size_t class_index, FreeBlock* block) {
-        // v11 push guard: the store below writes through 'block' (its 'next'
-        // field at block+16). A wild block pointer - non-canonical,
-        // misaligned or sub-64KB - would turn the push itself into the wild
-        // write that corrupts whatever the pointer happens to target (on the
-        // runner: foreign pages). The v10 run showed freed wild pointers are
-        // the vector by which slot-adjacent memory gets scribbled; the guard
-        // drops them instead, one leak instead of one corruption.
+        // Validate block pointer plausibility before linking into bin.
         if (FAST_UNLIKELY(!IsPlausibleHeapPtr(block))) {
             ReportWildFreelistLink("DeallocateBlock(push)", class_index,
                                    reinterpret_cast<std::uintptr_t>(block));
@@ -108,16 +83,7 @@ public:
         }
         CacheBin& bin = bins_[class_index];
         if (FAST_UNLIKELY(bin.head == block)) {
-            // Idempotent-free guard (Sep-2026 runner crash root):
-            // 'block' is already this bin's head - a double free, or the
-            // same block handed out twice upstream. Pushing it again would
-            // store block->next = block (a self-cycle) which corrupts the
-            // count/list invariant and eventually walks off the list end
-            // (SIGSEGV at [nullptr + 16]). A later push of a NON-head
-            // duplicate is absorbed by the guarded, self-healing flush in
-            // DeallocateBlockSlow. bin.head == block is only reachable via
-            // that duplicate push: the head always IS a list member, and a
-            // legitimate free never pushes an already-free block.
+            // Guard against double-pushing the current head block.
             ReportDoublePushGuard();
             return;
         }
@@ -140,9 +106,7 @@ public:
     // Used by fast_alloc_purge_thread_cache() and by the destructor.
     void FlushToGlobalHeap();
 
-    // v10 forensics: report (stderr) every bin/large-cache head pointing
-    // into [lo, hi); returns the number of hits. Pure pointer-array reads,
-    // no foreign dereferences - safe in any allocator state.
+    // Diagnostic pointer scan: inspect bin and large-cache heads for pointers in [lo, hi).
     std::size_t AuditPointers(const void* lo, const void* hi) const;
 
     // ------------------------------------------------------------------
@@ -186,14 +150,9 @@ private:
     // ------------------------------------------------------------------
     // CacheBin: head + count + adaptive refill sizing.
     //
-    // 'next_refill' is the batch size the NEXT refill of this bin will
-    // request from the global heap. It starts small (kInitialRefill) and
-    // doubles on every consecutive miss, capped at CACHE_LIMITS/2. This
-    // keeps short-lived threads (a handful of allocations) from pulling
-    // thousands of blocks they will only have to flush back at exit,
-    // while steady-state threads ramp up to full batches within a few
-    // misses and behave exactly like the old fixed-size policy.
-    // The field occupies the old padding slot: CacheBin stays 16 bytes.
+    // 'next_refill' is the batch size for the next refill of this bin.
+    // Starts small and ramps up on consecutive misses to optimize for both short-
+    // and long-lived thread allocations.
     // ------------------------------------------------------------------
     struct CacheBin {
         FreeBlock* head{nullptr};
@@ -209,12 +168,8 @@ private:
     };
 
     static inline std::size_t GetMaxLargeCacheSize(std::size_t size) {
-        // Per-class retention cap: ~2 MB of spans per large class per thread
-        // (was 16 MB, which hoarded up to ~50 MB/thread and pushed the
-        // shared 64 MB page cache over its cap -> constant mmap/munmap
-        // cycling under mixed large sizes). Entry count stays within
-        // [4, 64]; LIFO cycling workloads only need depth 1-4, and misses
-        // are served by the (now best-fit) global page cache.
+        // Per-class retention cap: ~2 MB of spans per large class per thread,
+        // bounded between 4 and 64 entries.
         std::size_t count = (2 * 1024 * 1024) / (size ? size : 1);
         if (count < 4) return 4;
         if (count > 64) return 64;
@@ -247,7 +202,7 @@ private:
     static void InitTlsKey();
 
 #if FASTALLOC_DEBUG_ENABLED
-    // Debug invariants: bin count vs actual list length (audit M6).
+    // Debug invariants: verifies bin count matches actual list length.
     void AuditBin(std::size_t class_index) const;
 #endif
 };

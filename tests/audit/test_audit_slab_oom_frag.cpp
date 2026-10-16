@@ -1,6 +1,6 @@
 // ============================================================================
-// FastAlloc audit — slab/size-class lifecycle (items 10, 11), OOM adversarial
-// (item 14), fragmentation + memory return (items 15, 16), API misuse (31).
+// Slab/size-class lifecycle, OOM adversarial handling,
+// fragmentation, memory return, and API misuse testing.
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"
@@ -292,14 +292,9 @@ TEST(AuditMisuse, MisuseStormKeepsAllocatorHealthy) {
 #if !FASTALLOC_DEBUG_ENABLED
         fast_free(reinterpret_cast<void*>(0x10));     // null-page: predicate rejects, no read
         fast_free(reinterpret_cast<void*>(0x2000));   // null page, unaligned: same
-        // NOT tested: fast_free(0x30000) -- 16-aligned, >=64KB, <2^47: it PASSES
-        // the plausibility predicate, so the release path dereferences the
-        // header at 0x2fff0. If that page is unmapped -> SIGSEGV. glibc is
-        // identical here (free(p) reads p-16); verified parity in the audit
-        // evidence. Wild plausible-range pointers are UB in every allocator.
-        // Same for fast_free(&stack_i): an aligned stack pointer gets its
-        // "header" read (guard-absorbed in plain builds, ASan-redzone-reported
-        // under ASan -- glibc parity). Skip under ASan.
+        // Note: pointers satisfying the plausibility predicate (16-aligned, >=64KB, <2^47)
+        // are inspected at p-16. If that memory is unmapped, hardware fault occurs.
+        // Stack pointers under ASan land in a redzone and are reported, so skip under ASan.
 # if !defined(__SANITIZE_ADDRESS__)
         fast_free(&stack_i);                          // aligned stack object
 # endif

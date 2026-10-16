@@ -1,5 +1,5 @@
 // ============================================================================
-// Over-aligned allocation tests (audit M7: no aligned API existed).
+// Over-aligned allocation tests.
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"

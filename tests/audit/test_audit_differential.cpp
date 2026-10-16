@@ -1,7 +1,6 @@
 // ============================================================================
-// FastAlloc audit — differential testing vs glibc malloc (item 5) and
-// memory-correctness guards (item 2): invalid frees, scribble-then-free
-// serviceability, interior/stack/static/foreign pointers.
+// Differential testing vs system allocator and memory-correctness guards:
+// invalid frees, scribble-then-free serviceability, interior/stack/static/foreign pointers.
 // ============================================================================
 #include <gtest/gtest.h>
 #include "fast_alloc.h"
@@ -190,12 +189,10 @@ TEST(AuditMemory, FreeNullAndWildPointersServiceable) {
     // and crashes every mainstream allocator; the guard boundary at 64KB is a
     // documented trade-off (see report).
 #if !defined(__SANITIZE_ADDRESS__)
-    // 16-ALIGNED foreign pointers (stack/global objects) also pass the
-    // predicate and get their "header" read: in plain builds the v9-v11
-    // guards absorb the garbage (drop + protect); under ASan that same read
-    // lands in a stack/global REDZONE and is reported as stack-buffer-underflow
-    // (fast_free at fast_alloc.cpp:436). glibc free() of a stack pointer is the
-    // identical UB class under ASan -- parity, not a defect. Skip under ASan.
+    // 16-aligned foreign pointers (stack/global objects) pass the plausibility
+    // predicate and have their header read. In standard builds, the entry guards
+    // safely drop the pointer. Under ASan, the read lands in an ASan redzone
+    // and is reported as a stack-buffer-underflow, so skip under ASan.
     fast_free(&global_var);                       // stack object, aligned by chance
     fast_free(&static_var);                       // .bss object, aligned by chance
 #endif

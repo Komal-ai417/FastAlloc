@@ -40,20 +40,12 @@ elseif(FASTALLOC_SANITIZE AND MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# MSVC ASan runtime staging (v12)
+# MSVC ASan runtime staging
 #
-# /fsanitize=address + the dynamic CRT (/MD, the default - and forced for
-# gtest via gtest_force_shared_crt) makes every executable IMPORT
-# clang_rt.asan_dynamic-x86_64.dll. The DLL ships INSIDE the MSVC toolset
-# (next to cl.exe in bin\Hostx64\x64), which is on PATH only inside a
-# vcvars/developer shell. A plain `ctest` run from the CI job environment
-# inherits the runner image's PATH: when the image's PATH entries lag a
-# toolset update (windows-latest refreshes its MSVC versions continuously),
-# the loader fails the process AT LAUNCH with 0xC0000135 - which ctest
-# reports as a failed test with NO output at all (the Sep-2026 v11
-# windows-msvc-asan failure signature). Copying the DLL next to each
-# executable at build time makes the exe self-contained: load always
-# succeeds regardless of the environment's PATH.
+# /fsanitize=address + dynamic CRT (/MD) requires clang_rt.asan_dynamic-x86_64.dll
+# at runtime. The DLL resides within the MSVC toolset directory. Copying the DLL
+# next to each executable makes the test executables self-contained and runnable
+# regardless of whether the MSVC toolset directory is on the system PATH.
 # ---------------------------------------------------------------------------
 set(FASTALLOC_ASAN_DLL "")
 if(MSVC AND FASTALLOC_SANITIZE)
@@ -101,19 +93,9 @@ else()
         if(NOT WIN32)
             add_compile_options("$<$<CONFIG:Release>:-fno-plt>")
         endif()
-        # Clang >= 19 understands AVX10 and diagnoses -march=native feature
-        # sets that implicitly promote: on the new AVX10.1-256 Xeon-class
-        # CI runners it emits
-        #   "invalid feature combination: +avx10.1-256; will be promoted to
-        #    avx10.1-512"  [-Winvalid-feature-combination]
-        # The promoted target is exactly what the hardware supports, so the
-        # diagnostic is benign - but our global -Werror (which also reaches
-        # the googletest/google-benchmark subprojects via the directory
-        # scope) escalated it into a build failure (ubuntu-latest-clang-
-        # release, Sep 2026). Demote ONLY this one diagnostic to a warning,
-        # and only on Clang >= 19: older Clang does not know the option and
-        # would itself warn about the unknown flag (which -Werror would
-        # escalate). GCC never emits this diagnostic.
+        # Clang >= 19 diagnoses -march=native feature combinations that implicitly
+        # promote (e.g. +avx10.1-256 promoted to avx10.1-512) via -Winvalid-feature-combination.
+        # Demote this diagnostic from an error to a warning when -Werror is enabled.
         if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
            CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
             add_compile_options(-Wno-error=invalid-feature-combination)
@@ -190,11 +172,6 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     FetchContent_Declare(
         googlebenchmark
         GIT_REPOSITORY https://github.com/google/benchmark.git
-        # v1.9.4 (2025-05): the 1.9.x series reworked the timing scheduler
-        # that v1.8.3's adaptive mode corrupted the heap with (reproduced
-        # locally with zero FastAlloc code linked). Flags/API used here
-        # (--benchmark_min_time=3000x, repetitions, report_aggregates_only,
-        # BENCHMARK_MAIN) are unchanged in 1.9.x.
         GIT_TAG v1.9.4
     )
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)

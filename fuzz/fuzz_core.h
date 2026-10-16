@@ -1,5 +1,5 @@
 // ============================================================================
-// FastAlloc audit — shared fuzzing core: byte-program decoder + shadow model
+// Shared fuzzing core: byte-program decoder + shadow model
 // + invariant checks. Used by fuzz_ops_libfuzzer.cpp (libFuzzer, persistent
 // state across inputs) and fuzz_standalone.cpp (entropy-driven, time-budget).
 //

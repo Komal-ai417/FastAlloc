@@ -11,29 +11,21 @@
 //          WHOLE reservation that p is the base of and FAILS on interior
 //          addresses; VirtualFree(p, size, MEM_DECOMMIT) drops the physical
 //          pages but keeps the VA reserved.
+// The page cache splits cached spans (best-fit + split): a freed span can
+// serve its prefix to the caller and retain the tail. On Windows, interior
+// sub-spans cannot be released with MEM_RELEASE directly because VirtualFree
+// requires the original allocation base and releases the entire contiguous
+// reservation.
 //
-// The v2 page cache SPLITS cached spans (best-fit + split): a freed span of
-// the wrong size serves the head to the caller and parks the tail in another
-// bin. On Windows those interior tails can therefore not be released with a
-// blind MEM_RELEASE:
-//   * freeing a tail -> VirtualFree fails silently -> VA leak + broken
-//     retention accounting;
-//   * freeing the head (the reservation base) -> releases the ENTIRE
-//     reservation, including any still-cached tails -> dangling page-cache
-//     nodes -> 0xC0000005 (reproduced on Linux via FASTALLOC_WINVA_EMULATION
-//     and on the windows-latest CI runners).
-//
-// Fix: a reservation registry. Every VirtualAlloc becomes a tracked region
+// Reservation registry: every VirtualAlloc becomes a tracked region
 // {base, size, live}. Freeing a span decommits exactly its pages and drops
 // the region's live count; the whole reservation is MEM_RELEASE'd only when
 // its last live span goes away. This mirrors the Linux span pool semantics
 // (per-span MADV_DONTNEED, chunk released when exhausted).
 //
-// FASTALLOC_WINVA_EMULATION (test/CI tool, Linux-only): runs the exact same
-// reservation-registry code with mmap/mprotect/munmap standing in for
-// VirtualAlloc/VirtualFree(MEM_DECOMMIT)/VirtualFree(MEM_RELEASE), and turns
-// every decommitted page PROT_NONE so a use-after-decommit faults (the
-// 0xC0000005 equivalent). Lets Linux CI catch Windows-only lifetime bugs.
+// FASTALLOC_WINVA_EMULATION (test/diagnostic tool, Linux-only): runs the exact
+// reservation-registry code with mmap/mprotect/munmap simulating Windows
+// VirtualAlloc/VirtualFree semantics to detect invalid memory access.
 // ============================================================================
 #if defined(FASTALLOC_WINVA_EMULATION) && !defined(_WIN32)
 #define FASTALLOC_WINVA 1
@@ -194,9 +186,8 @@ WinReservationRegistry& WinRegistry() {
 }
 
 #if FASTALLOC_WINVA
-// Crash forensics for the emulation build: report the faulting address and a
-// backtrace on SIGSEGV/SIGBUS so a Windows-only lifetime bug reproduced on
-// Linux points straight at its cause.
+// Diagnostic signal handler for emulation builds: reports the faulting address
+// and backtrace on SIGSEGV/SIGBUS.
 void WinVaInstallSegvHandler() {
     struct sigaction sa {};
     sa.sa_sigaction = [](int sig, siginfo_t* info, void*) {
@@ -327,12 +318,7 @@ struct SpanPool {
 };
 
 SpanPool& Pool() {
-    // FIX (RunKit audit finding OVR-1, part 3): same bootstrap hazard as the
-    // GlobalHeap/CachePool singletons - `new SpanPool()` routes through the
-    // global operator new, which under FASTALLOC_OVERRIDE_NEW forwards to
-    // fast_malloc, which needs this very pool when it first maps a span:
-    // recursive magic-static init -> __gnu_cxx::recursive_init_error.
-    // Static storage + placement new = zero allocations at bootstrap.
+    // Static storage placement new removes heap allocations during bootstrap.
     alignas(SpanPool) static unsigned char storage[sizeof(SpanPool)];
     static SpanPool* pool = ::new (static_cast<void*>(storage)) SpanPool();
     return *pool;
