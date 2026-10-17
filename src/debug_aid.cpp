@@ -117,50 +117,64 @@ void LogEvent(LogLevel level, const char* event, const char* fmt, ...) {
 namespace stats {
 namespace {
 // Global counters. Relaxed atomics: diagnostics only, no ordering needs.
-std::atomic<std::size_t> g_small_allocs{0}, g_small_frees{0};
-std::atomic<std::size_t> g_large_allocs{0}, g_large_frees{0};
+// PADDED GROUPS: the TLS-flush writers (CountSmallAlloc/Free, the dominant
+// pair) hammer the first group; large-path flushes the second; everything
+// else is slow-path. Packing them into one cacheline made every small-op
+// flush also bounce the large/OS counters' line between cores (T>=2).
+struct alignas(64) SmallFlushCounters {
+    std::atomic<std::size_t> small_allocs{0}, small_frees{0};
+    std::atomic<std::size_t> live_blocks{0}, live_bytes{0};
+    std::atomic<std::size_t> peak_live_blocks{0}, peak_live_bytes{0};
+    char _pad[64 - 6 * sizeof(std::atomic<std::size_t>)];
+};
+struct alignas(64) LargeFlushCounters {
+    std::atomic<std::size_t> large_allocs{0}, large_frees{0};
+    char _pad[64 - 2 * sizeof(std::atomic<std::size_t>)];
+};
+SmallFlushCounters g_small_;
+LargeFlushCounters g_large_;
 std::atomic<std::size_t> g_reallocs{0};
-std::atomic<std::size_t> g_live_blocks{0}, g_live_bytes{0};
-std::atomic<std::size_t> g_peak_live_blocks{0}, g_peak_live_bytes{0};
 std::atomic<std::size_t> g_os_allocs{0}, g_os_frees{0}, g_os_bytes_live{0};
 std::atomic<std::size_t> g_page_cache_hits{0}, g_page_cache_bytes{0};
 std::atomic<std::size_t> g_page_cache_evictions{0};
 std::atomic<std::size_t> g_tls_misses{0}, g_pending_pushes{0};
 std::atomic<std::size_t> g_tls_created{0}, g_tls_destroyed{0};
+static_assert(sizeof(SmallFlushCounters) == 64, "one cacheline");
+static_assert(sizeof(LargeFlushCounters) == 64, "one cacheline");
 
 inline void BumpLive(uint64_t n, std::size_t bytes) {
-    g_live_blocks.fetch_add(n, std::memory_order_relaxed);
-    g_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    g_small_.live_blocks.fetch_add(n, std::memory_order_relaxed);
+    g_small_.live_bytes.fetch_add(bytes, std::memory_order_relaxed);
     // Peak maintenance at flush granularity: values are monotone snapshots
     // of the running totals, so peaks can only be under-reported between
     // flushes (documented as approximate in release builds).
-    std::size_t b = g_live_blocks.load(std::memory_order_relaxed);
-    std::size_t by = g_live_bytes.load(std::memory_order_relaxed);
-    std::size_t pb = g_peak_live_blocks.load(std::memory_order_relaxed);
-    while (b > pb && !g_peak_live_blocks.compare_exchange_weak(pb, b, std::memory_order_relaxed)) {}
-    std::size_t pby = g_peak_live_bytes.load(std::memory_order_relaxed);
-    while (by > pby && !g_peak_live_bytes.compare_exchange_weak(pby, by, std::memory_order_relaxed)) {}
+    std::size_t b = g_small_.live_blocks.load(std::memory_order_relaxed);
+    std::size_t by = g_small_.live_bytes.load(std::memory_order_relaxed);
+    std::size_t pb = g_small_.peak_live_blocks.load(std::memory_order_relaxed);
+    while (b > pb && !g_small_.peak_live_blocks.compare_exchange_weak(pb, b, std::memory_order_relaxed)) {}
+    std::size_t pby = g_small_.peak_live_bytes.load(std::memory_order_relaxed);
+    while (by > pby && !g_small_.peak_live_bytes.compare_exchange_weak(pby, by, std::memory_order_relaxed)) {}
 }
 inline void DropLive(uint64_t n, std::size_t bytes) {
-    g_live_blocks.fetch_sub(n, std::memory_order_relaxed);
-    g_live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    g_small_.live_blocks.fetch_sub(n, std::memory_order_relaxed);
+    g_small_.live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 } // namespace
 
 void CountSmallAlloc(uint64_t n, std::size_t bytes) {
-    g_small_allocs.fetch_add(n, std::memory_order_relaxed);
+    g_small_.small_allocs.fetch_add(n, std::memory_order_relaxed);
     BumpLive(n, bytes);
 }
 void CountSmallFree (uint64_t n, std::size_t bytes) {
-    g_small_frees.fetch_add(n, std::memory_order_relaxed);
+    g_small_.small_frees.fetch_add(n, std::memory_order_relaxed);
     DropLive(n, bytes);
 }
 void CountLargeAlloc(uint64_t n, std::size_t bytes) {
-    g_large_allocs.fetch_add(n, std::memory_order_relaxed);
+    g_large_.large_allocs.fetch_add(n, std::memory_order_relaxed);
     BumpLive(n, bytes);
 }
 void CountLargeFree (uint64_t n, std::size_t bytes) {
-    g_large_frees.fetch_add(n, std::memory_order_relaxed);
+    g_large_.large_frees.fetch_add(n, std::memory_order_relaxed);
     DropLive(n, bytes);
 }
 void CountRealloc(uint64_t n) { g_reallocs.fetch_add(n, std::memory_order_relaxed); }
@@ -175,15 +189,15 @@ void CountTlsCreate()  { ++g_tls_created; }
 void CountTlsDestroy()  { ++g_tls_destroyed; }
 
 void Snapshot(FastAllocStats& out) {
-    out.small_allocs = g_small_allocs.load(std::memory_order_relaxed);
-    out.small_frees = g_small_frees.load(std::memory_order_relaxed);
-    out.large_allocs = g_large_allocs.load(std::memory_order_relaxed);
-    out.large_frees = g_large_frees.load(std::memory_order_relaxed);
+    out.small_allocs = g_small_.small_allocs.load(std::memory_order_relaxed);
+    out.small_frees = g_small_.small_frees.load(std::memory_order_relaxed);
+    out.large_allocs = g_large_.large_allocs.load(std::memory_order_relaxed);
+    out.large_frees = g_large_.large_frees.load(std::memory_order_relaxed);
     out.reallocs = g_reallocs.load(std::memory_order_relaxed);
-    out.current_live_blocks = g_live_blocks.load(std::memory_order_relaxed);
-    out.current_live_bytes = g_live_bytes.load(std::memory_order_relaxed);
-    out.peak_live_blocks = g_peak_live_blocks.load(std::memory_order_relaxed);
-    out.peak_live_bytes = g_peak_live_bytes.load(std::memory_order_relaxed);
+    out.current_live_blocks = g_small_.live_blocks.load(std::memory_order_relaxed);
+    out.current_live_bytes = g_small_.live_bytes.load(std::memory_order_relaxed);
+    out.peak_live_blocks = g_small_.peak_live_blocks.load(std::memory_order_relaxed);
+    out.peak_live_bytes = g_small_.peak_live_bytes.load(std::memory_order_relaxed);
     out.os_alloc_calls = g_os_allocs.load(std::memory_order_relaxed);
     out.os_free_calls = g_os_frees.load(std::memory_order_relaxed);
     out.os_bytes_live = g_os_bytes_live.load(std::memory_order_relaxed);

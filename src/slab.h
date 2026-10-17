@@ -17,13 +17,22 @@ struct Slab;
  * every list the block visits (slab list, TLS cache, pending MPSC queue),
  * which is what makes the O(1) free path possible.
  *
+ * RELEASE free path: the block header is NOT read on free anymore (the span
+ * map routes by address - see span_map.h); reading it was a guaranteed cache
+ * miss per free for live sets larger than cache. The header remains for the
+ * debug instrumentation (canary / registry) and internal list walking.
+ *
  * DEBUG: 'canary' (formerly padding) holds a front canary written at
  * allocation time and validated at free time to catch buffer underflows.
  */
 struct FreeBlock {
     Slab* slab;           // Always valid (never overwritten by user data)
     uint32_t class_index; // Store class index
-    uint32_t canary;      // DEBUG front canary; padding in release builds
+    // RELEASE (v13.7): owning arena index, written once at lazy wiring -
+    // the free path reads it from this line (which the freelist push
+    // brings into cache anyway) instead of the slab header line.
+    // DEBUG: front canary, written at allocation, validated at free.
+    uint32_t canary;
     FreeBlock* next;      // Overwritten by user data when allocated!
 };
 
@@ -41,17 +50,22 @@ struct FreeBlock {
  * initialized slab exactly as before.
  */
 struct Slab {
+    // ---- cacheline 0 (bytes 0..39): span-map free-path validation ----
+    // The v12 release free path validates a freed pointer against these six
+    // fields and nothing else, so they are packed into the first cacheline:
+    // one line - shared by every block of the slab - serves every free.
+    std::size_t block_size;
+    std::size_t total_blocks;
+    std::size_t memory_size;
+    std::size_t first_block_offset; // offset of block 0 from 'this'
+    uint32_t arena_index;
+    uint32_t class_idx;             // cached class index for lazy carving
+    // ---- cacheline 1: allocator slow-path fields ----
     Slab* next; // Intrusive list pointer to link slabs of the same size class
     Slab* prev; // Added for O(1) removal
     FreeBlock* free_list;
-    std::size_t block_size;
-    std::size_t total_blocks;
     std::size_t free_blocks;
-    std::size_t memory_size;
-    std::size_t first_block_offset; // offset of block 0 from 'this'
     std::size_t next_new;           // bump cursor: virgin blocks wired so far
-    uint32_t arena_index;
-    uint32_t class_idx;             // cached class index for lazy carving
 #if FASTALLOC_DEBUG_ENABLED
     uint64_t magic;     // Validated on every free for pointer provenance
 #endif
@@ -89,7 +103,15 @@ struct Slab {
                 reinterpret_cast<char*>(this) + first_block_offset + next_new * block_size);
             block->slab = this;
             block->class_index = class_idx;
-            block->canary = 0;
+#if FASTALLOC_DEBUG_ENABLED
+            block->canary = 0; // debug: front canary written at allocation
+#else
+            // v13.7: release routing stores the owning arena here - the
+            // block's own header line is brought in by every free's
+            // freelist push anyway, so (slab, class, arena) can be read for
+            // free and a free never touches the slab header line.
+            block->canary = arena_index;
+#endif
             next_new++;
             free_blocks--;
             return block;

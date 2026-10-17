@@ -249,7 +249,12 @@ namespace {
 
 constexpr std::size_t kChunkSize = 4 * 1024 * 1024;          // per-chunk mapping
 constexpr std::size_t kMaxPooledSpan = 2 * 1024 * 1024;      // <= page-cache span cap
-constexpr std::size_t kMaxChunks = 64;                       // 256 MB address-space cap
+// v13: 64 chunks (256 MB) was reachable by benchmark working sets (churn
+// 200 MB + overhead 70 MB + page-cache retention), and pool exhaustion falls
+// back to direct-mmap slab spans - which munmap on eviction and reopen the
+// stale-span-map-entry SEGV hole (see RetireOrFree). VA is free until
+// touched; 1 GB of *reservation* costs nothing on 64-bit.
+constexpr std::size_t kMaxChunks = 256;                      // 1 GB address-space cap
 
 struct Chunk {
     void* base;

@@ -1,5 +1,6 @@
 #include "global_heap.h"
 #include "tls_cache.h"
+#include "span_map.h"
 #include "os_memory.h"
 #include "debug_aid.h"
 #include <algorithm>
@@ -10,6 +11,14 @@
 #include <new>
 
 namespace FastAlloc {
+
+// SpanMap root (see span_map.h): 256 KB of static BSS covering the full
+// 47-bit user address space at 4KB page granularity.
+std::atomic<SpanMap::Mid*> SpanMap::root_[32768];
+
+// SpanMap hash tier: 2 MB of static BSS, 2^18 direct-mapped slots. Defined
+// here (single TU) so every header inclusion shares one instance.
+std::atomic<std::uintptr_t> SpanMap::hash_[1u << 18];
 
 namespace {
 
@@ -41,9 +50,23 @@ std::size_t PageCacheTotalLimit() {
     return limit;
 }
 
-struct PageNode {
-    PageNode* next;
-};
+// v13: the free-list link used to live at span offset 0 - exactly on top of
+// Slab::block_size / LargeAllocHeader's first fields, which the span-map
+// validators read WITHOUT any lock while the span sits parked in a bin. A
+// parked span's header must stay intact (and the span mapped) so a racing
+// validator either (a) validates a foreign pointer against a CONSISTENT
+// header and rejects it on geometry, or (b) falls to the radix, which
+// Unmap already cleared, and drops. Offset 64 is past both the Slab
+// validation cacheline (bytes 0..39) and the LargeAllocHeader (16 bytes),
+// and every page-cache-eligible span is >= 3 pages (12 KB).
+constexpr std::size_t kPageNodeLinkOffset = 64;
+struct PageNode {}; // marker type: spans are linked via PageNodeLink below
+inline PageNode*& PageNodeLink(void* span_base) {
+    return *reinterpret_cast<PageNode**>(static_cast<char*>(span_base) + kPageNodeLinkOffset);
+}
+inline PageNode* PageNodeLink(const void* span_base) {
+    return *reinterpret_cast<PageNode* const*>(static_cast<const char*>(span_base) + kPageNodeLinkOffset);
+}
 struct PageBin {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     PageNode* head = nullptr;   // guarded by 'lock'
@@ -82,6 +105,72 @@ inline std::size_t FirstNonEmptyAbove(std::size_t pages) {
 }
 
 std::atomic<std::size_t> page_cache_total_bytes{0};
+
+// ===========================================================================
+// Pending-queue retention cap (v12 splice design)
+// ===========================================================================
+// Overflow flushes splice whole TLS bins onto per-(arena,class) pending
+// queues in O(1); the owning arena's allocations drain them via the direct
+// feed in AllocateBatch. When NOBODY allocates (pure free storms), the
+// queues would grow without bound, so a global byte cap makes the pusher
+// drain its own push eagerly (bounded work, same total slab cost as the
+// old eager path). Default 32 MB, overridable via FASTALLOC_PENDING_MB.
+std::atomic<std::size_t> g_pending_bytes{0};
+
+std::size_t PendingBytesCap() {
+    static const std::size_t cap = []() {
+        const char* env = fast_getenv("FASTALLOC_PENDING_MB");
+        std::size_t mb = 32;
+        if (env && *env) {
+            long v = std::atol(env);
+            if (v > 0) mb = static_cast<std::size_t>(v);
+        }
+        return mb * 1024 * 1024;
+    }();
+    return cap;
+}
+
+// Wrap-safe approximate subtraction for the advisory pending-bytes counter
+// (it may transiently over-subtract across concurrent push/drain pairs;
+// clamping at zero keeps it from wrapping into "always over cap").
+inline void PendingBytesSub(std::size_t bytes) {
+    if (bytes == 0) return;
+    std::size_t v = g_pending_bytes.load(std::memory_order_relaxed);
+    while (v > 0) {
+        std::size_t nv = (bytes < v) ? v - bytes : 0;
+        if (g_pending_bytes.compare_exchange_weak(v, nv,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+// ===========================================================================
+// Empty-slab retention cache (v12)
+// ===========================================================================
+// An emptied slab is parked (span stays resident) instead of being released
+// to the OS, and the next slab for the same (arena, class) re-creates its
+// header on the same span: no madvise, no mmap, no first-touch fault cycle
+// - exactly the ping-pong short-lived-thread and slab-cycling workloads
+// used to pay. Bounded by kEmptySlabKeepPerClass per (arena,class) plus a
+// global byte cap (default 32 MB, FASTALLOC_EMPTY_SLAB_MB); purge releases
+// everything.
+constexpr uint32_t kEmptySlabKeepPerClass = 2;
+std::atomic<std::size_t> g_empty_slab_bytes{0};
+
+std::size_t EmptySlabBytesCap() {
+    static const std::size_t cap = []() {
+        const char* env = fast_getenv("FASTALLOC_EMPTY_SLAB_MB");
+        std::size_t mb = 32;
+        if (env && *env) {
+            long v = std::atol(env);
+            if (v > 0) mb = static_cast<std::size_t>(v);
+        }
+        return mb * 1024 * 1024;
+    }();
+    return cap;
+}
 
 // Test seam for OOM simulation (unit tests set this from the test binary).
 // Plain function pointer + relaxed bool: only consulted on the slow path.
@@ -127,7 +216,7 @@ void* PageHeapAllocate(std::size_t size) {
             AcquireBinLock(bin.lock);
             if (bin.head) {
                 PageNode* node = bin.head;
-                bin.head = node->next;
+                bin.head = PageNodeLink(node);
                 bin.count--;
                 if (!bin.head) MarkMaybeEmpty(pages);
                 bin.lock.clear(std::memory_order_release);
@@ -150,7 +239,7 @@ void* PageHeapAllocate(std::size_t size) {
             AcquireBinLock(bin.lock);
             if (bin.head) {
                 PageNode* node = bin.head;
-                bin.head = node->next;
+                bin.head = PageNodeLink(node);
                 bin.count--;
                 if (!bin.head) MarkMaybeEmpty(p);
                 std::size_t span_bytes = p * page_size;
@@ -167,8 +256,26 @@ void* PageHeapAllocate(std::size_t size) {
                     auto& rbin = page_bins_[rem_pages];
                     PageNode* rem = reinterpret_cast<PageNode*>(
                         reinterpret_cast<char*>(node) + size);
+                    // v13.3: re-publish the tail under its OWN identity.
+                    // The popped span's kept map entries cover the WHOLE
+                    // p-page range with desc=node; leaving them in place
+                    // would orphan the tail's slots at eviction time (the
+                    // head's Unmap never walks the tail's pages, and the
+                    // tail's own Unmap only clears slots whose desc == the
+                    // tail base) -> stale (node|kind) entries pointing at
+                    // unmapped memory -> validator SEGV. Reproduced
+                    // deterministically by a 2M-block live-set probe once
+                    // the span pool (1 GB) exhausts and slab spans go
+                    // direct-mmap. Own-identity + zero poison also keeps a
+                    // wild free of the parked tail from routing anywhere.
+                    {
+                        const std::size_t rem_bytes = rem_pages * page_size;
+                        SpanMap::Map(rem, rem_bytes, rem, SpanMap::kKindSlab,
+                                     OSMemory::IsPoolBacked(rem));
+                        *reinterpret_cast<std::uint64_t*>(rem) = 0; // poisoned
+                    }
                     AcquireBinLock(rbin.lock);
-                    rem->next = rbin.head;
+                    PageNodeLink(rem) = rbin.head;
                     rbin.head = rem;
                     rbin.count++;
                     MarkNonEmpty(rem_pages);
@@ -187,6 +294,147 @@ void* PageHeapAllocate(std::size_t size) {
         }
     }
     return OSMemory::AllocatePages(size);
+}
+
+// ---------------------------------------------------------------------------
+// v13 retire ring: deferred munmap for DIRECT-mmap spans.
+//
+// A lock-free span-map validator may have loaded a hash/radix entry for a
+// span in the nanoseconds before PageHeapFree's SpanMap::Unmap cleared it.
+// If that span is then munmap'd, the validator's header read faults on
+// unmapped VA (the runner's intermittent SI_KERNEL crashes). Pooled spans
+// are safe (FreePages keeps the mapping, madvise only - a stale read sees
+// zero pages, fails the block_size sanity check, falls to the cleared
+// radix and drops). DIRECT-mmap spans therefore defer their munmap by a
+// grace window: the reader between 'entry load' and 'header read' (a few
+// instructions) is given milliseconds to finish. Drain happens lazily on
+// the next retire, and forcibly on purge. This matches production practice
+// (jemalloc's retained extents, mimalloc's delayed segment free).
+// ---------------------------------------------------------------------------
+struct RetiredSpan {
+    void* ptr;
+    std::size_t bytes;
+    std::uint64_t due_ns;
+};
+constexpr std::size_t kRetireCap = 128;
+constexpr std::uint64_t kRetireGraceNs = 2'000'000; // 2 ms
+RetiredSpan g_retired[kRetireCap];
+std::size_t g_retired_n = 0;
+std::atomic_flag g_retire_lock = ATOMIC_FLAG_INIT;
+
+std::uint64_t RetireNowNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
+
+void DrainRetiredLocked(bool force) {
+    const std::uint64_t now = force ? ~0ull : RetireNowNs();
+    std::size_t w = 0;
+    for (std::size_t i = 0; i < g_retired_n; ++i) {
+        if (now < g_retired[i].due_ns) {
+            g_retired[w++] = g_retired[i];
+        } else {
+            OSMemory::FreePages(g_retired[i].ptr, g_retired[i].bytes);
+        }
+    }
+    g_retired_n = w;
+}
+
+// ---------------------------------------------------------------------------
+// v13.6 dirty-span list: deferred, coalesced madvise for pooled spans.
+//
+// The overhead workload exposed the free-phase cost: its 1% large tail is
+// ~10K individually-evicted pooled spans, and evict-madvise per span costs
+// a syscall + TLB shootdown each (~12 us) - 137 ms of pure syscall time in
+// one free phase, vs glibc's 53 ms (its 8..36KB objects live inside the
+// brk heap: free touches metadata only, nothing returns to the OS).
+//
+// Deferred batching: evicted pooled spans go on a dirty list instead of
+// being madvise'd on the spot. The list flushes (a) when it exceeds
+// kDirtyThreshold bytes, (b) at purge, (c) when the entry array fills.
+// A flush SORTS the entries and coalesces EXACTLY-ADJACENT ranges - spans
+// carved consecutively from one 4 MB pool chunk are adjacent, so a flush
+// of 64 MB typically issues a few dozen madvise calls of 1-4 MB instead
+// of a thousand calls of ~56 KB. Coalescing never crosses a gap: a gap
+// between two dirty spans is a span that is still live.
+//
+// Safety: a dirty span has left every page bin (evicted), the pool never
+// re-uses freed span VA (bump-only carving), and its map entries were
+// retracted by Unmap before eviction - nothing touches the memory between
+// the free and the delayed madvise, and nothing can hand it out again.
+// Retained-dirty is bounded by kDirtyThreshold (64 MB).
+// ---------------------------------------------------------------------------
+struct DirtySpan {
+    char* base;
+    std::size_t bytes;
+};
+constexpr std::size_t kDirtyCap = 16384;
+constexpr std::size_t kDirtyThreshold = 64ull << 20;
+DirtySpan g_dirty[kDirtyCap];
+std::size_t g_dirty_n = 0;
+std::size_t g_dirty_bytes = 0;
+std::atomic_flag g_dirty_lock = ATOMIC_FLAG_INIT;
+
+int DirtySpanCmp(const void* a, const void* b) {
+    const DirtySpan* x = static_cast<const DirtySpan*>(a);
+    const DirtySpan* y = static_cast<const DirtySpan*>(b);
+    if (x->base < y->base) return -1;
+    if (x->base > y->base) return 1;
+    return 0;
+}
+
+void FlushDirtyLocked() {
+    if (g_dirty_n == 0) return;
+    std::qsort(g_dirty, g_dirty_n, sizeof(DirtySpan), DirtySpanCmp);
+    std::size_t i = 0;
+    while (i < g_dirty_n) {
+        char* run_base = g_dirty[i].base;
+        std::size_t run_bytes = g_dirty[i].bytes;
+        std::size_t j = i + 1;
+        // Coalesce exactly-adjacent ranges only; a gap is live memory.
+        while (j < g_dirty_n &&
+               run_base + run_bytes == g_dirty[j].base) {
+            run_bytes += g_dirty[j].bytes;
+            ++j;
+        }
+        OSMemory::FreePages(run_base, run_bytes); // madvise(DONTNEED)
+        i = j;
+    }
+    g_dirty_n = 0;
+    g_dirty_bytes = 0;
+}
+
+// Pooled spans: defer to the dirty list (bulk coalesced madvise).
+// Direct-mmap spans: retire with a grace window (see the ring below).
+void ReleaseSpanMemory(void* ptr, std::size_t bytes) {
+    if (OSMemory::IsPoolBacked(ptr)) {
+        AcquireBinLock(g_dirty_lock);
+        if (g_dirty_n == kDirtyCap) FlushDirtyLocked(); // array full: flush now
+        g_dirty[g_dirty_n].base = static_cast<char*>(ptr);
+        g_dirty[g_dirty_n].bytes = bytes;
+        ++g_dirty_n;
+        g_dirty_bytes += bytes;
+        if (g_dirty_bytes >= kDirtyThreshold) FlushDirtyLocked();
+        g_dirty_lock.clear(std::memory_order_release);
+        return;
+    }
+    AcquireBinLock(g_retire_lock);
+    DrainRetiredLocked(false); // opportunistic: expired entries leave now
+    if (g_retired_n == kRetireCap) {
+        // Ring full and nothing expired: the oldest entry's grace is by far
+        // the largest elapsed - release it to make room.
+        OSMemory::FreePages(g_retired[0].ptr, g_retired[0].bytes);
+        std::memmove(&g_retired[0], &g_retired[1],
+                     (kRetireCap - 1) * sizeof(RetiredSpan));
+        g_retired_n = kRetireCap - 1;
+    }
+    g_retired[g_retired_n].ptr = ptr;
+    g_retired[g_retired_n].bytes = bytes;
+    g_retired[g_retired_n].due_ns = RetireNowNs() + kRetireGraceNs;
+    ++g_retired_n;
+    g_retire_lock.clear(std::memory_order_release);
 }
 
 void PageHeapFree(void* ptr, std::size_t size) {
@@ -209,8 +457,16 @@ void PageHeapFree(void* ptr, std::size_t size) {
         if (total <= PageCacheTotalLimit()) {
             AcquireBinLock(bin.lock);
             if (bin.count < BinRetentionCount(pages)) {
+                // v13.1: the span KEEPS its map entries while parked in the
+                // bin (mapped, header poisoned) - a cache round-trip then
+                // costs O(1) instead of an O(pages) Unmap+Map pair (the
+                // v13 'large' 4x regression: ~2 us per 512 KB round-trip).
+                // Entries are retracted only when the memory truly leaves
+                // (eviction / purge / release), and reuse re-publishes via
+                // the cheap EntryMatches skip in AllocateLarge/AllocateNewSlab.
+                SpanMap::PoisonParkedSpan(ptr);
                 PageNode* node = static_cast<PageNode*>(ptr);
-                node->next = bin.head;
+                PageNodeLink(node) = bin.head;
                 bin.head = node;
                 bin.count++;
                 MarkNonEmpty(pages);
@@ -223,7 +479,10 @@ void PageHeapFree(void* ptr, std::size_t size) {
         page_cache_total_bytes.fetch_sub(size, std::memory_order_relaxed);
         stats::CountPageCacheEvict(size);
     }
-    OSMemory::FreePages(ptr, size);
+    // Real departure: retract the entries, then release the memory
+    // (page-bin eviction above, oversized span, or cache over budget).
+    SpanMap::Unmap(ptr, size);
+    ReleaseSpanMemory(ptr, size);
 }
 
 std::size_t PurgePageCacheLocked() {
@@ -238,15 +497,30 @@ std::size_t PurgePageCacheLocked() {
         MarkMaybeEmpty(p);
         bin.lock.clear(std::memory_order_release);
         while (node) {
-            PageNode* next = node->next;
+            PageNode* next = PageNodeLink(node);
             std::size_t span_size = p * page_size;
-            OSMemory::FreePages(node, span_size);
+            // Real departure: retract entries before the memory leaves.
+            SpanMap::Unmap(node, span_size);
+            ReleaseSpanMemory(node, span_size);
             page_cache_total_bytes.fetch_sub(span_size, std::memory_order_relaxed);
             stats::CountPageCacheEvict(span_size);
             released += span_size;
             node = next;
         }
     }
+    // Purge semantics: give the memory back NOW. The grace window only ever
+    // covered entries retired within the last 2 ms; a validator that loaded
+    // an entry before its Unmap has long since finished its few-instruction
+    // read (and the user explicitly asked for the memory back).
+    AcquireBinLock(g_retire_lock);
+    DrainRetiredLocked(true);
+    g_retire_lock.clear(std::memory_order_release);
+    // Flush the deferred dirty list as well: purge promises the OS got the
+    // pages back (this is also where a workload's entire deferred tail is
+    // released in a few coalesced calls).
+    AcquireBinLock(g_dirty_lock);
+    FlushDirtyLocked();
+    g_dirty_lock.clear(std::memory_order_release);
     return released;
 }
 
@@ -316,8 +590,82 @@ static void RemoveSlab(Slab*& head, Slab* slab) {
     slab->prev = nullptr;
 }
 
+// Empty-slab cache helpers (all require the (arena,class) lock held).
+
+void GlobalHeap::ParkEmptySlabLocked(uint32_t arena_index, std::size_t class_index, Slab* slab) {
+    Arena& arena = arenas_[arena_index];
+    if (arena.empty_slab_counts_[class_index] >= kEmptySlabKeepPerClass ||
+        g_empty_slab_bytes.load(std::memory_order_relaxed) + slab->memory_size >
+            EmptySlabBytesCap()) {
+        // Cache full / over budget: release the span as before.
+        std::size_t freed_size = slab->memory_size; // capture BEFORE unmap
+        PageHeapFree(slab, freed_size);
+        stats::CountOsFree(freed_size);
+        return;
+    }
+    // v13.1: parked-in-cache spans keep their map entries (empty-slab reuse
+    // re-Creates the same Slab* on the same span, so the entry never goes
+    // stale) - poison the validation field so a wild/double free that
+    // routes here is rejected instead of pushing a block of an EMPTY slab
+    // into a thread cache (double presence). Slab::Create rewrites the
+    // header (and the memory_size field below stays intact for reuse).
+    // v13.7: also re-mark the entries kKindSlabParked (see PageHeapFree).
+    slab->block_size = 0; // poisoned: IsBlockStart rejects (d < ALIGNMENT)
+    slab->next = arena.empty_slab_cache_[class_index];
+    arena.empty_slab_cache_[class_index] = slab;
+    arena.empty_slab_counts_[class_index]++;
+    g_empty_slab_bytes.fetch_add(slab->memory_size, std::memory_order_relaxed);
+}
+
+Slab* GlobalHeap::TakeEmptySlabLocked(uint32_t arena_index, std::size_t class_index) {
+    Arena& arena = arenas_[arena_index];
+    Slab* slab = arena.empty_slab_cache_[class_index];
+    if (!slab) return nullptr;
+    arena.empty_slab_cache_[class_index] = slab->next;
+    arena.empty_slab_counts_[class_index]--;
+    g_empty_slab_bytes.fetch_sub(slab->memory_size, std::memory_order_relaxed);
+    slab->next = nullptr;
+    slab->prev = nullptr;
+    return slab; // span still resident; caller re-creates the header on it
+}
+
+void GlobalHeap::ReleaseEmptySlabsOfClassLocked(uint32_t arena_index, std::size_t class_index) {
+    Arena& arena = arenas_[arena_index];
+    Slab* slab = arena.empty_slab_cache_[class_index];
+    while (slab) {
+        Slab* next = slab->next;
+        std::size_t freed_size = slab->memory_size;
+        PageHeapFree(slab, freed_size);
+        stats::CountOsFree(freed_size);
+        g_empty_slab_bytes.fetch_sub(freed_size, std::memory_order_relaxed);
+        slab = next;
+    }
+    arena.empty_slab_cache_[class_index] = nullptr;
+    arena.empty_slab_counts_[class_index] = 0;
+}
+
 Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index) {
     std::size_t block_size = ClassIndexToSize(class_index);
+
+    // 1) Reuse a resident empty slab: no madvise/mmap and no first-touch
+    //    faults (the span never left the process). Slab::Create only
+    //    rewrites the header page (release: lazy block wiring), so this is
+    //    O(1) and touches one page.
+    if (Slab* span = TakeEmptySlabLocked(arena_index, class_index)) {
+        Slab* slab = Slab::Create(span, span->memory_size, block_size, arena_index);
+        if (FAST_LIKELY(slab)) {
+            stats::CountOsAlloc(slab->memory_size);
+            // Map entries kept through the park (same span, same class -
+            // the per-(arena,class) cache guarantees it, so the entry's
+            // class bits stay correct); Slab::Create rewrote the header.
+            return slab;
+        }
+        // Cannot happen (the same span served this exact class before), but
+        // be robust: hand the span back to the page heap and continue.
+        PageHeapFree(span, span->memory_size);
+        stats::CountOsFree(span->memory_size);
+    }
+
     std::size_t target_blocks = 256;
     if (block_size >= 1024) target_blocks = 128;
     if (block_size >= 4096) target_blocks = 32;
@@ -346,6 +694,23 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
         PageHeapFree(memory, memory_size);
         stats::CountOsFree(memory_size);
         return nullptr;
+    }
+    // Publish the span in the span map so fast_free can route blocks of
+    // this slab by ADDRESS (no block-header read). The release-store in
+    // Map() publishes the freshly written slab header fields as well.
+    // (Empty-slab reuse keeps the same Slab* on the same span - the entry
+    // stays valid across re-Creates.) The pool flag is computed ONCE per
+    // span (vs. per free in the old design) and gates per-thread caching.
+    // v13.1: a span recycled from the page cache as the SAME role (slab of
+    // the same base) usually kept a matching entry - skip the O(pages) Map.
+    {
+        const bool pooled = OSMemory::IsPoolBacked(memory);
+        if (FAST_UNLIKELY(!SpanMap::EntryMatches(memory, memory, SpanMap::kKindSlab,
+                                                 pooled,
+                                                 static_cast<uint32_t>(class_index)))) {
+            SpanMap::Map(memory, memory_size, slab, SpanMap::kKindSlab, pooled,
+                         static_cast<uint32_t>(class_index));
+        }
     }
 #if FASTALLOC_LOGGING_ENABLED
     LogEvent(LogLevel::Debug, "slab-create", "slab=%p size=%zu class=%zu arena=%u",
@@ -388,14 +753,27 @@ inline bool BlockSlabUsable(FreeBlock* node, const char* where,
     return true;
 }
 
+// Walk bound for every guarded freelist traversal: a legitimate queue can
+// never exceed the pending-bytes cap in blocks (cap / min block size), so
+// this bound only ever fires on cyclic/corrupt lists - the remainder is
+// dropped and reported (leak-once discipline) instead of looping forever.
+constexpr std::size_t kListWalkBound = 8u << 20;
+
+// Splice-batch arena extraction: one guarded walk that routes each node to
+// its own slab's arena. 'counts' may be null (callers that don't need the
+// per-arena node counts).
+
 } // namespace
 
 void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* pending) {
     if (!pending) return;
     Arena& arena = arenas_[arena_index];
-    while (pending) {
-        // Validate node and slab metadata before dereferencing to prevent
-        // corrupted links from reaching slab operations.
+    std::size_t walked = 0;
+    while (pending && walked < kListWalkBound) {
+        // Validate node + slab metadata before the dereferences below (the
+        // pending queue is fed by lock-free MPSC pushes; a corrupted link
+        // must not reach slab->IsFull / Deallocate). The successor link is
+        // validated as the next iteration's node.
         if (FAST_UNLIKELY(!WalkLinkPlausible(pending, "ProcessPendingList",
                                              class_index) ||
                           !BlockSlabUsable(pending, "ProcessPendingList(slab)",
@@ -403,10 +781,6 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
             return;
         }
         FreeBlock* next = pending->next;
-        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "ProcessPendingList(next)",
-                                             class_index))) {
-            next = nullptr;
-        }
         Slab* slab = pending->slab;
 
 #if FASTALLOC_DEBUG_ENABLED
@@ -431,20 +805,32 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
 
         if (slab->IsEmpty()) {
             RemoveSlab(arena.partial_slabs_[class_index], slab);
-            std::size_t freed_size = slab->memory_size; // capture BEFORE unmap
-            PageHeapFree(slab, freed_size);
-            stats::CountOsFree(freed_size);
+            ParkEmptySlabLocked(arena_index, class_index, slab);
         }
         pending = next;
+        ++walked;
+    }
+    if (FAST_UNLIKELY(pending != nullptr)) {
+        ReportWildFreelistLink("ProcessPendingList(walk bound)", class_index,
+                               reinterpret_cast<std::uintptr_t>(pending));
     }
 }
 
 void GlobalHeap::DrainPendingReturns(uint32_t arena_index, std::size_t class_index) {
     Arena& arena = arenas_[arena_index];
-    if (arena.pending_returns_[class_index].head.load(std::memory_order_relaxed) == nullptr) return;
-    FreeBlock* pending = arena.pending_returns_[class_index].head.exchange(nullptr, std::memory_order_acquire);
-    if (!pending) return;
+    PendingList& pl = arena.pending_returns_[class_index];
+    if (pl.len.load(std::memory_order_relaxed) == 0 &&
+        pl.head.load(std::memory_order_relaxed) == nullptr) {
+        return;
+    }
+    FreeBlock* pending = pl.head.exchange(nullptr, std::memory_order_acquire);
+    if (!pending) {
+        pl.len.store(0, std::memory_order_relaxed);
+        return;
+    }
+    uint32_t n = pl.len.exchange(0, std::memory_order_relaxed);
     ProcessPendingListLocked(arena_index, class_index, pending);
+    PendingBytesSub(static_cast<std::size_t>(n) * ClassIndexToSize(class_index));
 }
 
 void* GlobalHeap::AllocateBlock(std::size_t class_index, uint32_t arena_index) {
@@ -478,7 +864,8 @@ void* GlobalHeap::AllocateBlock(std::size_t class_index, uint32_t arena_index) {
     return ptr;
 }
 
-FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index) {
+FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index,
+                                             FreeBlock** out_tail) {
     FreeBlock* head = nullptr;
     FreeBlock* tail = nullptr;
 
@@ -509,15 +896,99 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
     }
 
     if (tail) tail->next = nullptr;
+    if (out_tail) *out_tail = tail;
     return head;
 }
 
-FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index) {
+// ----------------------------------------------------------------------------
+// Feed from a pending queue: pop the whole queue, cut up to 'want' nodes off
+// the head for the caller, and re-park the remainder with one CAS. Returns
+// the taken segment [head..*taken_tail] (null-terminated). The remainder
+// walk is bounded by the advisory queue length plus a margin so a corrupt
+// cyclic list terminates (remainder dropped + reported, leak-once).
+// The (arena,class) lock of the SOURCE queue must be held by the caller.
+// ----------------------------------------------------------------------------
+FreeBlock* GlobalHeap::FeedFromPendingLocked(PendingList& pl, std::size_t class_index,
+                                             std::size_t want, std::size_t& taken_out,
+                                             FreeBlock** taken_tail_out) {
+    taken_out = 0;
+    *taken_tail_out = nullptr;
+    if (pl.len.load(std::memory_order_relaxed) == 0 &&
+        pl.head.load(std::memory_order_relaxed) == nullptr) {
+        return nullptr;
+    }
+    FreeBlock* pending = pl.head.exchange(nullptr, std::memory_order_acquire);
+    if (!pending) {
+        pl.len.store(0, std::memory_order_relaxed);
+        return nullptr;
+    }
+    uint32_t qlen = pl.len.exchange(0, std::memory_order_relaxed);
+    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(pending))) {
+        ReportWildFreelistLink("AllocateBatch(pending head)", class_index,
+                               reinterpret_cast<std::uintptr_t>(pending));
+        return nullptr;
+    }
+
+    // Cut walk: take up to 'want' nodes from the head.
+    FreeBlock* split = pending;
+    std::size_t taken = 1;
+    bool rest_wild = false;
+    while (taken < want) {
+        FreeBlock* nxt = split->next;
+        if (!nxt) break;
+        if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt))) {
+            ReportWildFreelistLink("AllocateBatch(feed walk)", class_index,
+                                   reinterpret_cast<std::uintptr_t>(nxt));
+            rest_wild = true;
+            break;
+        }
+        split = nxt;
+        ++taken;
+    }
+    FreeBlock* rest = rest_wild ? nullptr : split->next;
+    split->next = nullptr;
+    taken_out = taken;
+    *taken_tail_out = split;
+
+    if (rest) {
+        // Remainder walk: find its true tail for the re-park splice.
+        std::size_t bound = (static_cast<std::size_t>(qlen) > taken
+                                 ? static_cast<std::size_t>(qlen) - taken
+                                 : 0) + (64u << 10);
+        FreeBlock* rt = rest;
+        std::size_t rn = 1;
+        bool dropped = false;
+        while (rt->next) {
+            if (rn >= bound) { dropped = true; break; }
+            FreeBlock* nxt = rt->next;
+            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt))) { dropped = true; break; }
+            rt = nxt;
+            ++rn;
+        }
+        if (FAST_UNLIKELY(dropped)) {
+            ReportWildFreelistLink("AllocateBatch(remainder)", class_index,
+                                   reinterpret_cast<std::uintptr_t>(rt->next));
+            rt->next = nullptr; // over-long or wild tail: drop it (leak, once)
+        }
+        // Re-park [rest..rt] with the lock-free CAS protocol.
+        FreeBlock* old_head = pl.head.load(std::memory_order_relaxed);
+        do {
+            rt->next = old_head;
+        } while (!pl.head.compare_exchange_weak(old_head, rest,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed));
+        pl.len.fetch_add(static_cast<uint32_t>(rn), std::memory_order_relaxed);
+    }
+    return pending;
+}
+
+FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index,
+                                     FreeBlock** out_tail, bool* out_foreign) {
     actual_count = 0;
     Arena& arena = arenas_[arena_index];
     FreeBlock* result = nullptr;
-
-    constexpr std::size_t kFeedMaxList = 64; // bounded pending-walk threshold
+    FreeBlock* result_tail = nullptr;
+    bool foreign = false;
 
     {
         ScopedSpinLock lock(arena.class_locks_[class_index]);
@@ -525,146 +996,53 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
         // ------------------------------------------------------------------
         // 1) Direct-feed from this arena's pending queue.
         //
-        // Blocks parked in pending (thread-exit defers / contended flushes)
-        // are already free, single-class, single-arena: feed them straight
-        // to the caller with zero slab work. Short remainders are re-parked
-        // (bounded walk); OVER-LONG remainders are drained into the slabs
-        // instead, which (a) keeps every pending queue O(64) and (b) puts
-        // recently-faulted WARM blocks back on the slab free list, so the
-        // extraction path below stops carving virgin (page-faulting) space.
+        // Blocks spliced here by overflow flushes / thread exits are
+        // already free, single-class, single-arena: feed them straight to
+        // the caller with zero slab work. This is what makes the O(1)
+        // splice flush safe for mixed alloc/free workloads - the blocks
+        // simply cycle TLS bin -> pending queue -> TLS bin.
         // ------------------------------------------------------------------
-        PendingList& pl = arena.pending_returns_[class_index];
-        FreeBlock* pending = pl.head.exchange(nullptr, std::memory_order_acquire);
-        if (pending) {
-            // Validate popped pending head before dereferencing; reject invalid
-            // pointers to prevent traversing corrupted queues.
-            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(pending))) {
-                ReportWildFreelistLink("AllocateBatch(pending head)",
-                                       class_index,
-                                       reinterpret_cast<std::uintptr_t>(pending));
-                pending = nullptr;
-            }
-        }
-        if (pending) {
-            FreeBlock* split = pending;
-            std::size_t taken = 1;
-            while (taken < target_count && split->next) {
-                // Validate link before chasing it to ensure list integrity.
-                FreeBlock* nxt = split->next;
-                if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt))) {
-                    ReportWildFreelistLink("AllocateBatch(feed walk)",
-                                           class_index,
-                                           reinterpret_cast<std::uintptr_t>(nxt));
-                    break;
-                }
-                split = nxt;
-                ++taken;
-            }
-            FreeBlock* rest_head = split->next;
-            if (FAST_UNLIKELY(rest_head != nullptr &&
-                              !IsPlausibleHeapPtr(rest_head))) {
-                rest_head = nullptr; // wild tail: cut here, drop the rest
-            }
-            split->next = nullptr;
-            result = pending;
-            actual_count = taken;
-            if (rest_head) {
-                // Measure the remainder with a hard cap.
-                FreeBlock* tail = rest_head;
-                std::size_t len = 1;
-                while (tail->next && len < kFeedMaxList) {
-                    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(tail->next))) {
-                        ReportWildFreelistLink("AllocateBatch(remainder walk)",
-                                               class_index,
-                                               reinterpret_cast<std::uintptr_t>(tail->next));
-                        break;
-                    }
-                    tail = tail->next;
-                    ++len;
-                }
-                if (tail->next == nullptr) {
-                    // Short: re-park via the lock-free CAS protocol.
-                    FreeBlock* old_head = pl.head.load(std::memory_order_relaxed);
-                    do {
-                        tail->next = old_head;
-                    } while (!pl.head.compare_exchange_weak(old_head, rest_head,
-                                                             std::memory_order_release,
-                                                             std::memory_order_relaxed));
-                } else {
-                    // Over-long: drain into the slabs (warm free lists).
-                    ProcessPendingListLocked(arena_index, class_index, rest_head);
-                }
-            }
+        result = FeedFromPendingLocked(arena.pending_returns_[class_index],
+                                       class_index, target_count, actual_count,
+                                       &result_tail);
+        if (result) {
+            PendingBytesSub(actual_count * ClassIndexToSize(class_index));
         }
 
         // ------------------------------------------------------------------
         // 2) Cross-arena steal. Arena assignment rotates round-robin, so the
         // next owner of arena A appears 16 spawns later; with random class
         // sets the LOCAL pending queue for a class is often empty while
-        // another arena holds a stock of freed blocks for it. Without the
-        // steal, ~half of all first-misses carve virgin slab pages (first-
-        // touch faults ~1.5-3 us each on this VM). A single try-lock per
-        // foreign arena cannot deadlock (never retried while holding A).
+        // another arena holds a stock of freed blocks for it. A single
+        // try-lock per foreign arena cannot deadlock (never retried while
+        // holding A). The advisory len counter skips empty queues without
+        // taking the lock at all.
         // ------------------------------------------------------------------
         if (actual_count < target_count) {
             for (uint32_t off = 1; off < NUM_ARENAS && actual_count < target_count; ++off) {
                 uint32_t a2 = (arena_index + off) % NUM_ARENAS;
+                PendingList& pl2 = arenas_[a2].pending_returns_[class_index];
+                if (pl2.len.load(std::memory_order_relaxed) == 0) continue; // cheap skip
                 auto& lk = arenas_[a2].class_locks_[class_index];
                 if (lk.test_and_set(std::memory_order_acquire)) continue; // busy: skip
-                PendingList& pl2 = arenas_[a2].pending_returns_[class_index];
-                FreeBlock* p2 = pl2.head.exchange(nullptr, std::memory_order_acquire);
+                std::size_t taken2 = 0;
+                FreeBlock* tail2 = nullptr;
+                FreeBlock* p2 = FeedFromPendingLocked(pl2, class_index,
+                                                      target_count - actual_count,
+                                                      taken2, &tail2);
                 if (p2) {
-                    if (FAST_UNLIKELY(!IsPlausibleHeapPtr(p2))) {
-                        ReportWildFreelistLink("AllocateBatch(steal head)",
-                                               class_index,
-                                               reinterpret_cast<std::uintptr_t>(p2));
-                        p2 = nullptr;
-                    }
-                }
-                if (p2) {
-                    FreeBlock* split2 = p2;
-                    std::size_t taken2 = 1;
-                    while (actual_count + taken2 < target_count && split2->next) {
-                        FreeBlock* nxt2 = split2->next;
-                        if (FAST_UNLIKELY(!IsPlausibleHeapPtr(nxt2))) {
-                            ReportWildFreelistLink("AllocateBatch(steal walk)",
-                                                   class_index,
-                                                   reinterpret_cast<std::uintptr_t>(nxt2));
-                            break;
-                        }
-                        split2 = nxt2;
-                        ++taken2;
-                    }
-                    FreeBlock* rest2 = split2->next;
-                    if (FAST_UNLIKELY(rest2 != nullptr &&
-                                      !IsPlausibleHeapPtr(rest2))) {
-                        rest2 = nullptr; // wild tail: cut, drop the rest
-                    }
-                    split2->next = nullptr;
-                    // Append the stolen batch to the result (result is short).
+                    PendingBytesSub(taken2 * ClassIndexToSize(class_index));
                     if (!result) {
                         result = p2;
+                        result_tail = tail2;
                         actual_count = taken2;
                     } else {
-                        FreeBlock* tailr = result;
-                        while (tailr->next) {
-                            if (FAST_UNLIKELY(!IsPlausibleHeapPtr(tailr->next))) {
-                                ReportWildFreelistLink("AllocateBatch(append walk)",
-                                                       class_index,
-                                                       reinterpret_cast<std::uintptr_t>(tailr->next));
-                                break;
-                            }
-                            tailr = tailr->next;
-                        }
-                        // If the append walk stopped on an invalid link, cut
-                        // the result there and append the stolen batch after
-                        // the cut.
-                        tailr->next = p2;
+                        // O(1) append (both segments' tails are exact).
+                        result_tail->next = p2;
+                        result_tail = tail2;
                         actual_count += taken2;
                     }
-                    if (rest2) {
-                        ProcessPendingListLocked(a2, class_index, rest2);
-                    }
+                    foreign = true; // foreign-arena blocks entered the batch
                 }
                 lk.clear(std::memory_order_release);
             }
@@ -672,26 +1050,31 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
 
         // ------------------------------------------------------------------
         // 3) Slab extraction: warm freelist blocks first (returned by the
-        // drain above), virgin carving only as the last resort.
+        // drain paths), virgin carving only as the last resort.
         // ------------------------------------------------------------------
         if (!result) {
             Slab* slab = arena.partial_slabs_[class_index];
             if (slab) {
-                result = ExtractBlocksFromSlab(slab, class_index, target_count, actual_count, arena_index);
+                result = ExtractBlocksFromSlab(slab, class_index, target_count, actual_count, arena_index, &result_tail);
             } else {
                 Slab* new_slab = AllocateNewSlab(class_index, arena_index);
                 if (new_slab) {
                     PushSlab(arena.partial_slabs_[class_index], new_slab);
-                    result = ExtractBlocksFromSlab(new_slab, class_index, target_count, actual_count, arena_index);
+                    result = ExtractBlocksFromSlab(new_slab, class_index, target_count, actual_count, arena_index, &result_tail);
                 }
             }
         }
     }
 
+    if (out_tail) *out_tail = result_tail;
+    if (out_foreign) *out_foreign = foreign;
     return result;
 }
 
 void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
+    // Compatibility path (not used by the TLS fast paths): route the block
+    // to its owning arena's pending queue with the O(1) splice so any
+    // caller benefits from the deferred drain as well.
     (void)slab;
     FreeBlock* block = static_cast<FreeBlock*>(ptr);
     // Validate block address and slab metadata before modifying block fields.
@@ -700,9 +1083,82 @@ void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
         return;
     }
     block->next = nullptr;
-    DeallocateBatchClass(block->class_index, block);
+    // The arena index rides the slab header (hot line shared by the slab's
+    // blocks); the block header itself is no longer consulted for routing.
+    uint32_t hint = ArenaToHint(block->slab->arena_index);
+    if (hint >= 1 && hint <= NUM_ARENAS) {
+        SpliceToPending(HintToArena(hint), block->class_index, block, block, 1);
+        EnforcePendingCap(HintToArena(hint), block->class_index);
+    } else {
+        DeallocateBatchClass(block->class_index, block);
+    }
 }
 
+// ----------------------------------------------------------------------------
+// O(1) splice plumbing (v12)
+// ----------------------------------------------------------------------------
+
+void GlobalHeap::SpliceToPending(uint32_t arena_index, std::size_t class_index,
+                                 FreeBlock* head, FreeBlock* tail, std::size_t count) {
+    PendingList& pl = arenas_[arena_index].pending_returns_[class_index];
+    FreeBlock* old_head = pl.head.load(std::memory_order_relaxed);
+    do {
+        tail->next = old_head;
+    } while (!pl.head.compare_exchange_weak(old_head, head,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed));
+    pl.len.fetch_add(static_cast<uint32_t>(count), std::memory_order_relaxed);
+    g_pending_bytes.fetch_add(count * ClassIndexToSize(class_index),
+                              std::memory_order_relaxed);
+    stats::CountPendingPush();
+}
+
+void GlobalHeap::EnforcePendingCap(uint32_t arena_index, std::size_t class_index) {
+    if (g_pending_bytes.load(std::memory_order_relaxed) <= PendingBytesCap()) {
+        return;
+    }
+    auto& lk = arenas_[arena_index].class_locks_[class_index];
+    if (lk.test_and_set(std::memory_order_acquire)) return; // someone else drains
+    PendingList& pl = arenas_[arena_index].pending_returns_[class_index];
+    FreeBlock* p = pl.head.exchange(nullptr, std::memory_order_acquire);
+    if (p) {
+        uint32_t n = pl.len.exchange(0, std::memory_order_relaxed);
+        ProcessPendingListLocked(arena_index, class_index, p);
+        PendingBytesSub(static_cast<std::size_t>(n) * ClassIndexToSize(class_index));
+    } else {
+        pl.len.store(0, std::memory_order_relaxed);
+    }
+    lk.clear(std::memory_order_release);
+}
+
+void GlobalHeap::FlushBinToPending(std::size_t class_index, FreeBlock* head, FreeBlock* tail,
+                                   std::size_t count, uint32_t hint, uint32_t my_arena) {
+    (void)my_arena;
+    if (!head) return;
+    if (FAST_UNLIKELY(!tail || tail->next != nullptr)) {
+        // Tail invariant broken (corruption upstream): fall back to the
+        // guarded, self-healing arena-split path.
+        DeallocateBatchClass(class_index, head);
+        return;
+    }
+    if (hint >= 1 && hint <= NUM_ARENAS) {
+        // Single-arena bin: zero-touch Treiber splice.
+        uint32_t arena = HintToArena(hint);
+        SpliceToPending(arena, class_index, head, tail, count);
+        EnforcePendingCap(arena, class_index);
+        return;
+    }
+    // Mixed / unknown: guarded split by each block's own slab arena.
+    FreeBlock* heads[NUM_ARENAS];
+    FreeBlock* tails_[NUM_ARENAS];
+    std::size_t counts[NUM_ARENAS];
+    SplitListByArena(head, heads, tails_, counts);
+    for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
+        if (!heads[i]) continue;
+        SpliceToPending(i, class_index, heads[i], tails_[i], counts[i]);
+        EnforcePendingCap(i, class_index);
+    }
+}
 // ---------------------------------------------------------------------------
 // Single-class batch return (TLS overflow flush) and lock-free deferred
 // return (thread exit).
@@ -713,18 +1169,21 @@ void GlobalHeap::DeallocateBlock(Slab* slab, void* ptr) {
 // is touched - the 512-entry per-class tables of the general path are
 // unnecessary because the class is known.
 // ---------------------------------------------------------------------------
-void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails) {
-    for (uint32_t i = 0; i < NUM_ARENAS; ++i) { heads[i] = nullptr; tails[i] = nullptr; }
-    while (head) {
+void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails,
+                                  std::size_t* counts) {
+    for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
+        heads[i] = nullptr;
+        tails[i] = nullptr;
+        if (counts) counts[i] = 0;
+    }
+    std::size_t walked = 0;
+    while (head && walked < kListWalkBound) {
         // Stop at the first invalid link and drop blocks with invalid slab metadata.
         if (FAST_UNLIKELY(!WalkLinkPlausible(head, "SplitListByArena", 0) ||
                           !BlockSlabUsable(head, "SplitListByArena(slab)", 0))) {
             return;
         }
         FreeBlock* next = head->next;
-        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "SplitListByArena(next)", 0))) {
-            next = nullptr;
-        }
         uint32_t arena_index = head->slab->arena_index;
         if (!heads[arena_index]) {
             heads[arena_index] = head;
@@ -734,7 +1193,13 @@ void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock*
             tails[arena_index] = head;
         }
         head->next = nullptr;
+        if (counts) counts[arena_index]++;
         head = next;
+        ++walked;
+    }
+    if (FAST_UNLIKELY(head != nullptr)) {
+        ReportWildFreelistLink("SplitListByArena(walk bound)", 0,
+                               reinterpret_cast<std::uintptr_t>(head));
     }
 }
 
@@ -742,22 +1207,11 @@ void GlobalHeap::DeferBinToPending(std::size_t class_index, FreeBlock* head) {
     if (!head) return;
     FreeBlock* heads[NUM_ARENAS];
     FreeBlock* tails[NUM_ARENAS];
-    SplitListByArena(head, heads, tails);
-
+    std::size_t counts[NUM_ARENAS];
+    SplitListByArena(head, heads, tails, counts);
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
-        FreeBlock* list = heads[i];
-        if (!list) continue;
-        FreeBlock* tail = tails[i];
-        // Lock-free MPSC hand-off (same protocol as the contended path of
-        // DeallocateBatch; established by the TSan soak evidence).
-        PendingList& pl = arenas_[i].pending_returns_[class_index];
-        FreeBlock* old_head = pl.head.load(std::memory_order_relaxed);
-        do {
-            tail->next = old_head;
-        } while (!pl.head.compare_exchange_weak(old_head, list,
-                                                std::memory_order_release,
-                                                std::memory_order_relaxed));
-        stats::CountPendingPush();
+        if (!heads[i]) continue;
+        SpliceToPending(i, class_index, heads[i], tails[i], counts[i]);
     }
 }
 
@@ -800,7 +1254,8 @@ void GlobalHeap::DeallocateBatchClass(std::size_t class_index, FreeBlock* head) 
 void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* list) {
     Arena& arena = arenas_[arena_index];
     FreeBlock* curr = list;
-    while (curr) {
+    std::size_t walked = 0;
+    while (curr && walked < kListWalkBound) {
         // Validate the node and its slab metadata before dereferencing;
         // a wild node or unusable slab ends the batch here.
         if (FAST_UNLIKELY(!WalkLinkPlausible(curr, "ProcessBatchLocked",
@@ -810,10 +1265,6 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
             return;
         }
         FreeBlock* next = curr->next;
-        if (FAST_UNLIKELY(!WalkLinkPlausible(next, "ProcessBatchLocked(next)",
-                                             class_index))) {
-            next = nullptr;
-        }
         Slab* slab = curr->slab;
         bool was_full = slab->IsFull();
         slab->Deallocate(curr);
@@ -825,11 +1276,15 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
 
         if (slab->IsEmpty()) {
             RemoveSlab(arena.partial_slabs_[class_index], slab);
-            std::size_t freed_size = slab->memory_size; // capture BEFORE unmap
-            PageHeapFree(slab, freed_size);
-            stats::CountOsFree(freed_size);
+            ParkEmptySlabLocked(arena_index, class_index, slab);
         }
         curr = next;
+        ++walked;
+    }
+    if (FAST_UNLIKELY(curr != nullptr)) {
+        ReportWildFreelistLink("ProcessBatchLocked(walk bound)", class_index,
+                               reinterpret_cast<std::uintptr_t>(curr));
+        return;
     }
     DrainPendingReturns(arena_index, class_index);
 }
@@ -932,6 +1387,16 @@ void* GlobalHeap::AllocateLarge(std::size_t size) {
     void* p = PageHeapAllocate(alloc_size);
     if (p) {
         stats::CountOsAlloc(alloc_size);
+        // Publish as a large span: the descriptor is the span base, where
+        // AllocateLargeCached writes the LargeAllocHeader immediately after.
+        // v13.1: a span recycled from the page cache usually kept its large
+        // identity (same base, same kind, same pool flag) - the entry check
+        // skips the O(pages) Map walk. Mismatch (new role, or a colliding
+        // entry) takes the full Map.
+        const bool pooled = OSMemory::IsPoolBacked(p);
+        if (FAST_UNLIKELY(!SpanMap::EntryMatches(p, p, SpanMap::kKindLarge, pooled))) {
+            SpanMap::Map(p, alloc_size, p, SpanMap::kKindLarge, pooled);
+        }
 #if FASTALLOC_DEBUG_ENABLED
         // A page-cache span may have previously served as a SLAB: its first
         // and last pages then carry slab/block metadata (pointers, counts,
@@ -966,11 +1431,14 @@ std::size_t GlobalHeap::PurgePageCache() {
     // forever. Draining here returns them to the slabs so step 2 can free
     // the emptied spans. This is what fast_alloc_purge() promises: "drop
     // every cached span back to the OS".
+    // Step 1b: release every retained empty slab the drains produced (and
+    // every one parked earlier) - purge returns EVERYTHING.
     for (uint32_t a = 0; a < NUM_ARENAS; ++a) {
         Arena& arena = arenas_[a];
         for (std::size_t c = 0; c < NUM_SIZE_CLASSES; ++c) {
             ScopedSpinLock lock(arena.class_locks_[c]);
             DrainPendingReturns(a, c);
+            ReleaseEmptySlabsOfClassLocked(a, c);
         }
     }
     // Step 2: drop every cached span back to the OS.
