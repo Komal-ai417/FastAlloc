@@ -11,9 +11,6 @@ namespace FastAlloc {
 
 FAST_THREAD_LOCAL TLSCache* fast_path_cache = nullptr;
 
-// Alloc-site hint filter table (see tls_cache.h): 1 KB per thread.
-FAST_THREAD_LOCAL std::uint64_t g_alloc_hints[kAllocHintSlots];
-
 // ===========================================================================
 // Invariant checking and telemetry for TLS bins
 // ===========================================================================
@@ -218,32 +215,12 @@ void TLSCache::InitTlsKey() {
 }
 #endif
 
-TLSCache::TLSCache() : bins_() {
+TLSCache::TLSCache() {
     arena_index_ = GlobalHeap::GetInstance().GetNextArena();
     stats::CountTlsCreate();
 #if FASTALLOC_LOGGING_ENABLED
     LogEvent(LogLevel::Debug, "tls-create", "cache=%p arena=%u", (void*)this, arena_index_);
 #endif
-}
-
-TLSCache::TLSCache(RecycledTag) {
-    // Pre-cleared by construction: pool entries only come from fully-flushed
-    // owners (RecycleOrFreeCache), and a fresh mmap is zero-filled. Every
-    // bin field (head/tail/count/next_refill/arena_hint), large bin and
-    // stats field is therefore already in the fresh-cache state - skip the
-    // 16 KB re-zero. arena_hint 0 == kArenaHintUnset matches zeroed memory.
-    //
-    // v13.6: a RECYCLED cache keeps its previous owner's arena. The previous
-    // owner's exit flush pushed its blocks to THAT arena's pending queues;
-    // the next short-lived owner's refills then hit its own arena's queue
-    // directly (no cross-arena steal scan, warmer lines). Long-lived threads
-    // still spread across arenas via the fresh-construction path below;
-    // recycled caches are the churn path, and consecutive churn threads
-    // sharing one arena exit quickly enough that contention stays bounded.
-    if (FAST_UNLIKELY(arena_index_ >= GlobalHeap::kNumArenas)) {
-        arena_index_ = GlobalHeap::GetInstance().GetNextArena(); // zeroed page
-    }
-    stats::CountTlsCreate();
 }
 
 TLSCache& TLSCache::GetSlow() {
@@ -265,7 +242,7 @@ TLSCache& TLSCache::GetSlow() {
         std::fprintf(stderr, "FastAlloc FATAL: cannot map memory for thread cache - aborting.\n");
         std::abort();
     }
-    TLSCache* cache = new (mem) TLSCache(RecycledTag{});
+    TLSCache* cache = new (mem) TLSCache();
     if (FAST_UNLIKELY(!FlsSetValue(tls_key_, cache))) {
         // Degrade gracefully: this thread keeps a working cache through
         // fast_path_cache, but the destructor will never run - log it.
@@ -290,7 +267,7 @@ TLSCache& TLSCache::GetSlow() {
         std::fprintf(stderr, "FastAlloc FATAL: cannot mmap memory for thread cache - aborting.\n");
         std::abort();
     }
-    TLSCache* cache = new (mem) TLSCache(RecycledTag{});
+    TLSCache* cache = new (mem) TLSCache();
     int rc = pthread_setspecific(tls_key_, cache);
     if (FAST_UNLIKELY(rc != 0)) {
         // Degrade gracefully: this thread keeps a working cache through
@@ -320,30 +297,33 @@ void TLSCache::FlushStats() {
 }
 
 void TLSCache::FlushToGlobalHeap() {
-    // v12: every bin takes the O(1) splice to the per-arena pending queues
-    // (single-arena bins: zero block touches; mixed bins: the guarded arena
-    // split inside FlushBinToPending). No class lock is taken and no
-    // per-block slab work happens here; the next thread that allocates one
-    // of these (arena, class) pairs drains the queue via the direct feed,
-    // and the global pending-bytes cap bounds retention when nobody does
-    // (the pusher then drains its own push - the same slab work the old
-    // locked path did, just deferred to the rare overflow case).
-    GlobalHeap& gh = GlobalHeap::GetInstance();
+    // Thread-exit deferral cap: small remnants (the interesting case for
+    // thread-churn - a handful of surplus refill blocks per class) take the
+    // lock-free pending hand-off. Bigger bins go through the locked path so
+    // their slabs actually drain and empty slabs are returned to the page
+    // cache: free-heavy patterns (overhead/ramp workloads) must not leave
+    // megabytes parked in pending lists that nobody ever refills.
+    constexpr uint32_t kDeferMaxBin = 64;
     for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
         if (bins_[i].head) {
 #if FASTALLOC_DEBUG_ENABLED
             AuditBin(i);
 #endif
-            gh.FlushBinToPending(i, bins_[i].head, bins_[i].tail,
-                                 bins_[i].count, bins_[i].arena_hint,
-                                 arena_index_);
+            if (bins_[i].count <= kDeferMaxBin) {
+                // Lock-free deferred hand-off: the dying thread parks the
+                // bin list on the per-arena pending queue without taking any
+                // class lock or doing per-block slab work (paid instead by
+                // the next thread that refills this class). Turns thread
+                // exit from O(blocks-with-locks) into O(one CAS).
+                GlobalHeap::GetInstance().DeferBinToPending(i, bins_[i].head);
+            } else {
+                GlobalHeap::GetInstance().DeallocateBatchClass(i, bins_[i].head);
+            }
         }
         // Reset all bin fields (head, count, and refill ramp) unconditionally
         // so that any recycled cache instance starts in a clean state.
         bins_[i].head = nullptr;
-        bins_[i].tail = nullptr;
         bins_[i].count = 0;
-        bins_[i].arena_hint = kArenaHintUnset;
         // Reset the adaptive refill ramp: the next owner of this (recycled
         // or fresh) cache starts from the initial small batch. Without
         // this, next_refill doubles on every thread's miss and each
@@ -389,7 +369,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     // Adaptive refill: start at initial refill target and double on consecutive misses, capped at max_cache/2.
     CacheBin& bin = bins_[class_index];
     std::size_t target_count = bin.next_refill;
-    if (target_count == 0) target_count = 4; // kInitialRefill (v13.6: 4 - short-lived threads touch ~8 blocks/class; a 16-batch drags 16 cold lines and flushes the surplus back at exit)
+    if (target_count == 0) target_count = 16; // kInitialRefill
     std::size_t hard_cap = max_cache / 2;
     if (hard_cap == 0) hard_cap = 1;
     if (target_count > hard_cap) target_count = hard_cap;
@@ -397,11 +377,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
             (target_count * 2 <= hard_cap) ? target_count * 2 : hard_cap);
 
     std::size_t actual_count = 0;
-    FreeBlock* batch_tail = nullptr;
-    bool foreign = false;
-    FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(
-            class_index, target_count, actual_count, arena_index_,
-            &batch_tail, &foreign);
+    FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(class_index, target_count, actual_count, arena_index_);
 
     if (!batch_head) return nullptr;
 
@@ -430,86 +406,63 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
                                reinterpret_cast<std::uintptr_t>(rest));
         rest = nullptr;
         if (actual_count > 1) actual_count = 1;
-        batch_tail = block;
     }
     bins_[class_index].head = rest;
-    // Exact tail bookkeeping (v12): the batch arrived pre-cut with a known
-    // tail, so the bin's tail stays O(1)-maintained for the next splice
-    // flush. The wild-tail cut above re-derives it locally.
-    bins_[class_index].tail = rest ? batch_tail : nullptr;
     bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
-    // Arena hint: the batch is single-arena (own pending queue / own
-    // slabs) unless the cross-arena steal contributed foreign blocks.
-    bins_[class_index].arena_hint =
-        foreign ? kArenaHintMixed : ArenaToHint(arena_index_);
-    // v13.4: the slow path hands out the batch head too - record it in the
-    // alloc-site hint filter (mirrors the fast pop path in tls_cache.h).
-    {
-        const uint32_t hint = bins_[class_index].arena_hint;
-        if (FAST_LIKELY(hint >= 1 && hint <= GlobalHeap::kNumArenas)) {
-            RecordAllocHint(reinterpret_cast<char*>(block) + USER_OFFSET,
-                            static_cast<uint32_t>(class_index),
-                            HintToArena(hint));
-        }
-    }
 
     return block;
 }
 
 void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
+    std::size_t max_cache = CACHE_LIMITS[class_index];
+    std::size_t batch_size = max_cache / 2;
+    if (batch_size == 0) batch_size = 1;
+
     CacheBin& bin = bins_[class_index];
     FreeBlock* head = bin.head;
 
-    if (FAST_UNLIKELY(head == nullptr)) {
-        // Empty list with a diverged count: nothing to splice - re-derive
-        // the counters and keep serving.
-        if (g_bin_heal_events.fetch_add(1, std::memory_order_relaxed) == 0) {
-            PrintInvariantEvent("bin count/list divergence (empty)", class_index,
-                                bin.count, 0);
+    // Bounded, plausibility-guarded batch walk.
+    FreeBlock* curr = head;
+    std::size_t walked = 1; // nodes in [head, curr]
+    while (walked < batch_size && curr != nullptr) {
+        FreeBlock* nxt = curr->next;
+        if (FAST_UNLIKELY(nxt != nullptr && !IsPlausibleHeapPtr(nxt))) {
+            ReportWildFreelistLink("DeallocateBlockSlow(walk)", class_index,
+                                   reinterpret_cast<std::uintptr_t>(nxt));
+            nxt = nullptr; // treat as list end -> self-heal path flushes
         }
-        bin.count = 0;
-        bin.tail = nullptr;
-        bin.arena_hint = kArenaHintUnset;
-        return;
+        curr = nxt;
+        ++walked;
     }
 
-    // v12 FLUSH-ALL SPLICE: the whole bin is handed to the global heap in
-    // O(1). Single-arena bins (the common case - the arena index rides the
-    // block headers) splice onto the owning arena's lock-free pending queue
-    // without touching a single block; mixed bins take one guarded
-    // arena-split walk inside FlushBinToPending. Either way, no per-block
-    // slab work happens on the free path - the owning arena's allocations
-    // drain the queue through the direct feed, and the pending-bytes cap
-    // makes the pusher drain when nobody allocates (free storms).
-    //
-    // Self-healing (v8/v11 discipline): a broken tail invariant (tail null
-    // with a non-empty list, or tail->next != nullptr - the fingerprint of
-    // a duplicated node / corrupted list) falls back to the guarded,
-    // self-healing split path instead of publishing a broken list.
-    if (FAST_UNLIKELY(bin.tail == nullptr || bin.tail->next != nullptr)) {
+    if (FAST_UNLIKELY(curr == nullptr)) {
+        // Invariant broken: the real list length is walked-1 while bin.count
+        // claimed >= CACHE_LIMITS[class_index]. Heal: flush the ENTIRE real
+        // list, re-derive count from reality, reset the refill ramp, keep
+        // this thread cache fully serviceable. (The next refill rewrites
+        // count from the batch's true length, so the bin is exact again.)
         if (g_bin_heal_events.fetch_add(1, std::memory_order_relaxed) == 0) {
-            PrintInvariantEvent("bin tail invariant broken", class_index,
-                                bin.count, 0);
+            PrintInvariantEvent("bin count/list divergence", class_index,
+                                bin.count, walked - 1);
         }
-        GlobalHeap::GetInstance().DeallocateBatchClass(class_index, head);
         bin.head = nullptr;
-        bin.tail = nullptr;
         bin.count = 0;
         bin.next_refill = 0;
-        bin.arena_hint = kArenaHintUnset;
+        GlobalHeap::GetInstance().DeallocateBatchClass(class_index, head);
         return;
     }
 
-    GlobalHeap::GetInstance().FlushBinToPending(
-            class_index, head, bin.tail, bin.count, bin.arena_hint, arena_index_);
+    bin.head = curr->next;
+    curr->next = nullptr;
+    bin.count -= static_cast<uint32_t>(batch_size);
 
-    bin.head = nullptr;
-    bin.tail = nullptr;
-    bin.count = 0;
-    bin.arena_hint = kArenaHintUnset;
-    // The adaptive refill ramp is intentionally kept: the refill target
-    // describes how much to PULL next time, independent of how much was
-    // just pushed out.
+    // Class-aware hand-off: the whole batch is known single-class (it came
+    // from one TLS bin), so the 512-entry per-class split (two 4 KB stack
+    // arrays zeroed per call) is skipped entirely. The arena split is still
+    // per-block because a bin may hold blocks foreign to this thread's arena
+    // (cross-thread frees), but it uses a 16-entry table and the per-arena
+    // lists go through the lock-free pending queue when contended.
+    GlobalHeap::GetInstance().DeallocateBatchClass(class_index, head);
 }
 
 void* TLSCache::AllocateLargeCached(std::size_t size) {
@@ -558,14 +511,6 @@ void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
     std::size_t cls = LargeSizeToClass(alloc_size);
     if (large_counts_[cls] < GetMaxLargeCacheSize(alloc_size)) {
         LargeFreeEntry* entry = reinterpret_cast<LargeFreeEntry*>(ptr);
-        // v13.3 double-free guard (mirrors the small-bin head guard): a
-        // second free of the span currently at this bin's head would store
-        // entry->next = entry (self-cycle) and hand the span out twice on
-        // the next two allocations. One compare on an already-loaded word.
-        if (FAST_UNLIKELY(large_free_bins_[cls] == entry)) {
-            ReportDoublePushGuard();
-            return;
-        }
         entry->alloc_size = alloc_size;
         entry->next = large_free_bins_[cls];
         large_free_bins_[cls] = entry;

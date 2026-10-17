@@ -165,9 +165,6 @@ inline std::size_t UsableSize(std::size_t class_index) {
 inline std::size_t MaxSmallRequest() { return MAX_SLAB_SIZE - USER_OFFSET; }
 #endif
 
-// Per-class TLS bin limits (original count-based policy; measured best on
-// the alloc side: refill batches stay large, and the pending-queue
-// inventory is bounded by the global pending-bytes cap instead).
 constexpr std::array<uint32_t, NUM_SIZE_CLASSES> ComputeCacheLimits() {
     std::array<uint32_t, NUM_SIZE_CLASSES> limits{};
     for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
@@ -182,29 +179,6 @@ constexpr std::array<uint32_t, NUM_SIZE_CLASSES> ComputeCacheLimits() {
     return limits;
 }
 constexpr std::array<uint32_t, NUM_SIZE_CLASSES> CACHE_LIMITS = ComputeCacheLimits();
-
-// ---------------------------------------------------------------------------
-// Division-free block-start validation (span-map free path).
-//
-// fast_free must verify that a freed pointer is exactly a BLOCK USER START
-// of the slab the span map returned: off = ptr - first_user must be an exact
-// multiple of block_size and below total_blocks * block_size. A hardware
-// div/mod costs ~20-40 cycles with a runtime divisor, so each class
-// precomputes the classic round-up magic: m = ceil(2^34 / d). For every
-// off < 2^21 (spans are <= 2 MB) and d <= 8192, q = (off * m) >> 34 equals
-// floor(off / d) EXACTLY (error term x*e/(d*2^34) < 1/d because
-// x*e < 2^21 * 2^13 = 2^34), so the check is q < total_blocks &&
-// q * block_size == off - six-ish instructions, no division.
-// ---------------------------------------------------------------------------
-constexpr std::array<uint64_t, NUM_SIZE_CLASSES> ComputeClassMagics() {
-    std::array<uint64_t, NUM_SIZE_CLASSES> magics{};
-    for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-        std::size_t d = (i + 1) * ALIGNMENT; // block_size of class i
-        magics[i] = ((1ull << 34) + d - 1) / d; // ceil(2^34 / d)
-    }
-    return magics;
-}
-constexpr std::array<uint64_t, NUM_SIZE_CLASSES> CLASS_MAGICS = ComputeClassMagics();
 
 struct alignas(16) LargeAllocHeader {
     // 'slab' does double duty:

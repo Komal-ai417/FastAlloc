@@ -44,23 +44,9 @@ public:
     ScopedSpinLock& operator=(const ScopedSpinLock&) = delete;
 };
 
-// TLS bin arena-hint encoding (TLSCache::CacheBin). A bin that only ever
-// saw blocks of one arena can be flushed to that arena's pending queue with
-// a single O(1) Treiber splice; unset/mixed forces the guarded arena-split
-// walk. 0 encodes "unset" so a freshly mmap'd (zero-filled) or recycled
-// (flush-cleared) thread cache starts in the correct state with no
-// initialization writes.
-constexpr uint32_t kArenaHintUnset = 0;
-constexpr uint32_t kArenaHintMixed = 0xFFu;
-inline constexpr uint32_t ArenaToHint(uint32_t arena) { return arena + 1; }
-inline constexpr uint32_t HintToArena(uint32_t hint) { return hint - 1; } // valid for 1..NUM_ARENAS
-
 class GlobalHeap {
 public:
     static GlobalHeap& GetInstance();
-
-    static constexpr std::size_t NUM_ARENAS = 16;
-    static constexpr std::size_t kNumArenas = NUM_ARENAS; // public: TLS hint checks
 
     uint32_t GetNextArena() {
         return next_arena_.fetch_add(1, std::memory_order_relaxed) % NUM_ARENAS;
@@ -69,15 +55,10 @@ public:
     // Fetch a block from a specific size class
     void* AllocateBlock(std::size_t class_index, uint32_t arena_index);
 
-    // Fetch a batch of blocks to re-fill thread cache. Returns the batch
-    // head; *out_tail receives the batch's last node (next == nullptr) so
-    // the caller can park the rest in its TLS bin while keeping an exact
-    // tail pointer for the next O(1) flush splice. *out_foreign is set when
-    // the batch contains blocks from a foreign arena (cross-arena steal).
-    FreeBlock* AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index,
-                             FreeBlock** out_tail = nullptr, bool* out_foreign = nullptr);
+    // Fetch a batch of blocks to re-fill thread cache
+    FreeBlock* AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index);
 
-    // Return a block directly to its slab (slow, kept for compatibility)
+    // Return a block directly to its slab
     void DeallocateBlock(Slab* slab, void* ptr);
 
     // Return a batched linked list of blocks back to their respective slabs.
@@ -92,19 +73,11 @@ public:
     // thread's arena (cross-thread frees).
     void DeallocateBatchClass(std::size_t class_index, FreeBlock* head);
 
-    // O(1) overflow flush: splice a whole TLS bin (head..tail, 'count'
-    // nodes, 'hint' = the bin's arena hint) to the per-arena pending
-    // queues. A valid single-arena hint avoids touching the blocks at all;
-    // a mixed hint takes the guarded arena-split walk. No per-block slab
-    // work happens here - the owning arena's allocations drain the queue
-    // via AllocateBatch's direct feed, and the global pending-bytes cap
-    // makes the pusher drain its own push when nobody allocates (pure
-    // free-storm workloads), so retention stays bounded.
-    void FlushBinToPending(std::size_t class_index, FreeBlock* head, FreeBlock* tail,
-                           std::size_t count, uint32_t hint, uint32_t my_arena);
-
     // Lock-free deferred hand-off of a single-class bin list to the
-    // per-arena pending queues (thread-exit path).
+    // per-arena pending queues (thread-exit path). No class lock is taken
+    // and no per-block slab work happens here; the next thread that
+    // refills one of these (arena, class) pairs pays that cost via
+    // DrainPendingReturns. Blocks are routed by their own slab's arena.
     void DeferBinToPending(std::size_t class_index, FreeBlock* head);
 
     // Bypasses slabs for allocations > MAX_SLAB_SIZE, uses global large block cache
@@ -135,18 +108,14 @@ private:
     GlobalHeap(const GlobalHeap&) = delete;
     GlobalHeap& operator=(const GlobalHeap&) = delete;
 
+    static constexpr std::size_t NUM_ARENAS = 16;
     std::atomic<uint32_t> next_arena_;
     std::atomic<bool> shutting_down_{false};
 
-    // Lock-free pending return queue per size class. 'len' is an advisory
-    // relaxed block count: it lets allocators skip empty queues without
-    // taking the bin lock, bounds the feed's remainder walk, and drives the
-    // global pending-bytes cap. It may transiently under/over-count across
-    // concurrent push/drain pairs - every consumer treats it as a hint.
+    // Lock-free pending return queue per size class
     struct alignas(64) PendingList {
         std::atomic<FreeBlock*> head{nullptr};
-        std::atomic<uint32_t> len{0};
-        char _padding[64 - sizeof(std::atomic<FreeBlock*>) - sizeof(std::atomic<uint32_t>)];
+        char _padding[64 - sizeof(std::atomic<FreeBlock*>)];
     };
     static_assert(sizeof(PendingList) == 64, "PendingList must fill one cache line");
 
@@ -154,13 +123,6 @@ private:
         std::array<std::atomic_flag, NUM_SIZE_CLASSES> class_locks_{};
         std::array<Slab*, NUM_SIZE_CLASSES> partial_slabs_{};
         std::array<Slab*, NUM_SIZE_CLASSES> full_slabs_{};
-        // Retained empty slabs per class (bounded: kEmptySlabKeepPerClass
-        // per class + the global empty-slab byte cap). An emptied slab is
-        // parked here instead of being released to the OS, so the next slab
-        // for the same class reuses a resident span: no madvise, no mmap,
-        // no first-touch fault cycle. fast_alloc_purge() releases them all.
-        std::array<Slab*, NUM_SIZE_CLASSES> empty_slab_cache_{};
-        std::array<uint32_t, NUM_SIZE_CLASSES> empty_slab_counts_{};
         std::array<PendingList, NUM_SIZE_CLASSES> pending_returns_{};
 
         Arena() {
@@ -179,35 +141,13 @@ private:
     void ProcessPendingListLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* pending);
 
     // Split a single-class free list by each block's own slab arena.
-    // heads/tails/counts are caller-provided arrays of NUM_ARENAS entries.
-    void SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails,
-                          std::size_t* counts = nullptr);
-
-    // Treiber splice of [head..tail] onto the (arena, class) pending queue.
-    void SpliceToPending(uint32_t arena_index, std::size_t class_index,
-                         FreeBlock* head, FreeBlock* tail, std::size_t count);
-
-    // Global pending-bytes cap enforcement: when the cap is exceeded the
-    // pusher drains the (arena, class) queue it just fed (bounded eager
-    // work) so pure free-storm workloads cannot park unbounded memory.
-    void EnforcePendingCap(uint32_t arena_index, std::size_t class_index);
+    // heads/tails are caller-provided arrays of NUM_ARENAS entries.
+    void SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails);
 
     Slab* AllocateNewSlab(std::size_t class_index, uint32_t arena_index);
 
-    // Empty-slab cache helpers (class lock of 'class_index' must be held).
-    void ParkEmptySlabLocked(uint32_t arena_index, std::size_t class_index, Slab* slab);
-    Slab* TakeEmptySlabLocked(uint32_t arena_index, std::size_t class_index);
-    void ReleaseEmptySlabsOfClassLocked(uint32_t arena_index, std::size_t class_index); // purge path
-
-    // Pop a pending queue, cut up to 'want' nodes for the caller and re-park
-    // the remainder with one CAS. Source (arena,class) lock must be held.
-    FreeBlock* FeedFromPendingLocked(PendingList& pl, std::size_t class_index,
-                                     std::size_t want, std::size_t& taken_out,
-                                     FreeBlock** taken_tail_out);
-
     // Helper to extract blocks and advance slab pointers
-    FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index,
-                                     FreeBlock** out_tail = nullptr);
+    FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index);
 
     // Shared logic of the two deallocation paths (locked processing of a
     // single-class, single-arena list).
