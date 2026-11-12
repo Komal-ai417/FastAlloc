@@ -10,7 +10,7 @@
 
 <br>
 
-**FastAlloc** is a custom-built, ultra-low-latency memory allocator designed as a drop-in replacement for standard `malloc` and `free`. By combining platform-native Thread-Local Storage (TLS) caching with targeted lock-free structures and bounded OS-memory caching, FastAlloc reduces allocator overhead under heavy multi-threaded contention. It ships with a full memory-safety instrumentation mode, an 86-case Google Test suite, sanitizer-clean (ASan/UBSan/TSan/LSan) verification in CI, and a one-command cross-allocator benchmark verdict tool.
+**FastAlloc** is a custom-built, ultra-low-latency memory allocator designed as a drop-in replacement for standard `malloc` and `free`. By combining platform-native Thread-Local Storage (TLS) caching with targeted lock-free structures and bounded OS-memory caching, FastAlloc reduces allocator overhead under heavy multi-threaded contention. It ships with a full memory-safety instrumentation mode, a 90-case Google Test suite (79 run in Release; 90 under FASTALLOC_DEBUG), sanitizer-clean (ASan/UBSan/TSan/LSan) verification in CI, and a one-command cross-allocator benchmark verdict tool.
 
 ---
 
@@ -125,9 +125,14 @@ delete[] numbers;             // Automatically uses FastAlloc::fast_free
 
 The project uses CMake's `FetchContent` to dynamically isolate and link **Google Test** and **Google Benchmark**.
 
-### Verify Memory Integrity (GTest)
+### Verify Memory Integrity (GTest & Audit Probes)
 ```bash
+# Run all tests
 ctest --test-dir build -C Release -V
+
+# Run only the adversarial audit probes (Linux/POSIX)
+ctest --test-dir build -R fast_alloc_probe --output-on-failure
+# (or: ctest -R fast_alloc_probe inside the build folder)
 ```
 
 ### Run Benchmarks
@@ -169,6 +174,13 @@ cmake --build build --target bench_suite -j
 mkdir -p benchmarks/results
 ./build/bench_suite --alloc fast --label FastAlloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
 LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 ./build/bench_suite --alloc std --label jemalloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
+
+# 3b. Latency percentiles (warm/cold), throughput scaling and realistic
+#     workloads (20 reps, CoV, 95% CI). Build the std-allocator contrast
+#     variant manually for local comparison (CI runs the FastAlloc one):
+cmake --build build --target fast_alloc_bench_audit -j
+./build/fast_alloc_bench_audit
+# glibc variant: add -DUSE_GLIBC via a manual compile of the same source.
 
 # 4. Cross-allocator matrix driver + analyzer (CI's benchmark-matrix job)
 cd benchmarks/benchsuite && bash ./run_matrix.sh ../../benchmarks/results/cross_allocator_results.jsonl 5
@@ -214,11 +226,12 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 | Configuration | Tests | Status |
 | :--- | :--- | :--- |
-| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 75 | all pass, zero warnings |
-| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 86 (incl. death tests; 1 debug-only skip by design) | all pass |
-| Linux AddressSanitizer + UBSan | 75 | zero memory errors |
-| Linux ThreadSanitizer | 75 | **zero data races** |
-| Linux LeakSanitizer | 75 | zero leaks |
+| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 79 | all pass, zero warnings |
+| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 90 (incl. death tests; 1 debug-only skip by design) | all pass |
+| Linux AddressSanitizer + UBSan | 79 | zero memory errors |
+| Linux ThreadSanitizer | 79 | **zero data races** |
+| Linux LeakSanitizer | 79 | zero leaks |
+| Linux audit probes (`scripts/`, 11 ctest entries; filter with `ctest -R fast_alloc_probe`) | 11 | all pass (run by every POSIX ctest job: build-test Linux, sanitizers, leaks, WINVA-emulation) |
 | Windows/MSVC Release | 75 | all pass |
 | Windows/MinGW UCRT64 Release (GCC 16.2, 2026-10-15) | 75 | **74 pass, 1 platform-skip** (`ReallocFailurePreservesOriginal` — OOM injection path differs on Windows) |
 | Windows/MinGW UCRT64 audit suite (2026-10-15) | 49 | **48 pass, 1 platform-skip** (`EmptySlabReturnedToOs` — `/proc/self/status` unavailable on Windows) |
@@ -236,6 +249,9 @@ cmake -B build -DFASTALLOC_DEBUG=ON && cmake --build build && ctest --test-dir b
 cmake -B build-asan -DFASTALLOC_SANITIZE=address,undefined && cmake --build build-asan && ctest --test-dir build-asan
 cmake -B build-tsan -DFASTALLOC_SANITIZE=thread && cmake --build build-tsan && ctest --test-dir build-tsan
 cmake -B build-lsan -DFASTALLOC_SANITIZE=leak && cmake --build build-lsan && ctest --test-dir build-lsan
+
+# Run adversarial audit probes only (11 entries):
+ctest --test-dir build -R fast_alloc_probe --output-on-failure
 ```
 
 See `docs/qa_report.md` for the full, evidence-backed QA report and

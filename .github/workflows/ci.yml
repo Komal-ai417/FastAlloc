@@ -11,8 +11,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build & run ALL unit tests: release + debug-instrumented, Linux + Windows.
   # The single gtest binary (fast_alloc_tests) registers every test case via
-  # ctest, so "Test" below runs the full suite (~69 cases Release / ~80 with
-  # FASTALLOC_DEBUG=ON) on every platform/compiler combination.
+  # ctest, so "Test" below runs the full suite (~79 cases Release / ~90 with
+  # FASTALLOC_DEBUG=ON) on every platform/compiler combination. On Linux,
+  # ctest also runs the audit suite (fast_alloc_audit_tests, 49 cases,
+  # registered in release configs) AND the adversarial audit probes
+  # (scripts/, 11 ctest entries incl. the FA-01/02/03 reproducers; see the
+  # probe loop in CMakeLists.txt). The env-tunable fork/exec cases skip
+  # with a justified reason on Windows (POSIX-only mechanism).
   # ---------------------------------------------------------------------------
   build-test:
     name: ${{ matrix.os }}-${{ matrix.compiler || 'default' }}-${{ matrix.config }}
@@ -378,7 +383,10 @@ jobs:
   #   2. fast_alloc_bench_extended — every google-benchmark case (filter '.*')
   #   3. fast_alloc_bench_memory   — full config sweep: threads {1,2,4}
   #                                  x sizes {64, 256, 4096}
-  #   4. bench_suite               — FULL matrix: all 11 workloads
+  #   4. fast_alloc_bench_audit    — latency percentiles (warm/cold),
+  #                                  throughput scaling, 4 realistic
+  #                                  workloads (20 reps, CoV, 95% CI)
+  #   5. bench_suite               — FULL matrix: all 11 workloads
   #                                  x allocators {std, fast}
   #                                  x threads {1, 2, 4}
   #                                  = 66 runs per OS, every one
@@ -498,7 +506,7 @@ jobs:
         run: |
           cmake --build build --config Release -j --target \
             fast_alloc_bench fast_alloc_bench_extended \
-            fast_alloc_bench_memory bench_suite
+            fast_alloc_bench_memory fast_alloc_bench_audit bench_suite
 
       - name: Locate binaries
         shell: bash
@@ -673,6 +681,28 @@ jobs:
             done
           done
           if [ $rc -ne 0 ]; then echo "bench_suite rc=$rc (see FAILURES.txt above)"; fi
+
+      # --- bench_audit: latency percentiles (warm/cold), throughput scaling
+      #     (2M ops/rep) and 4 realistic workloads, 20 reps with CoV/CI95.
+      #     Fixed-workload binary (no flags): full run is bounded by the
+      #     step timeout; crash -> one retry -> FLAKES/FAILURES like above. ---
+      - name: Run fast_alloc_bench_audit (percentiles + scaling + workloads)
+        shell: bash
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          r1=0
+          "$BIN/fast_alloc_bench_audit$EXT" || r1=$?
+          if [ $r1 -ne 0 ]; then
+            sleep 5
+            r2=0
+            "$BIN/fast_alloc_bench_audit$EXT" || r2=$?
+            if [ $r2 -eq 0 ]; then
+              echo "fast_alloc_bench_audit rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+            else
+              echo "fast_alloc_bench_audit rc=$r2 (failed twice)" | tee -a FAILURES.txt
+            fi
+          fi
 
       # --- v9/v10: surface HEALED invariant events. The guards above keep the
       #     benchmarks alive when the (Sep-2026) corruption class recurs, so

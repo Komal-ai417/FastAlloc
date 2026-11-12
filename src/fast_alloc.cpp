@@ -107,6 +107,20 @@ inline std::size_t PageRoundUp(std::size_t n) {
     return (n + page - 1) & ~(page - 1);
 }
 
+// Overflow-safe page rounding for request sizing. Returns false when
+// 'n + header + page slack' cannot be represented; callers must then fail
+// the request (nullptr) instead of wrapping to an invalid span.
+inline bool PageRoundUpChecked(std::size_t n, std::size_t header,
+                               std::size_t& out) {
+    const std::size_t page = EffectivePageSize();
+    // Page sizes are powers of two, so 'page - 1' never overflows.
+    if (n > (std::numeric_limits<std::size_t>::max)() - header - (page - 1)) {
+        return false;
+    }
+    out = (n + header + page - 1) & ~(page - 1);
+    return true;
+}
+
 #if FASTALLOC_DEBUG_ENABLED
 // --------------------------------------------------------------------------
 // Debug validation shared by the allocation entry points
@@ -635,7 +649,14 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         if (is_large) {
             LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
                 static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-            std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
+            std::size_t needed = 0;
+            if (FAST_UNLIKELY(!PageRoundUpChecked(new_size, sizeof(LargeAllocHeader),
+                                                  needed))) {
+                // new_size + header + page slack does not fit in
+                // size_t. The old block stays valid; realloc must fail.
+                errno = ENOMEM;
+                return nullptr;
+            }
             [[maybe_unused]] std::size_t span_usable =
                 header->alloc_size - sizeof(LargeAllocHeader);
 #if FASTALLOC_DEBUG_ENABLED
@@ -657,11 +678,18 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // shrunk == base for non-MAYMOVE calls.
             header->alloc_size = needed;
             stats::CountOsFree(released);
+            // Keep live-bytes in step with the span (fast_free will
+            // count the SHRUNK span; the original malloc counted the
+            // ORIGINAL span). Byte-only adjustment: n=0 leaves the block
+            // counters untouched.
+            stats::CountLargeFree(0, released);
 #elif defined(_WIN32) || defined(FASTALLOC_WINVA_EMULATION)
             std::size_t released = header->alloc_size - needed;
             OSMemory::DecommitPages(base + needed, released);
             stats::CountOsFree(released);
             header->alloc_size = needed;
+            // Mirror the Linux mremap-shrink accounting above.
+            stats::CountLargeFree(0, released);
 #else
             // No in-place shrink primitive on this platform: keep the span.
             (void)base; (void)needed;
@@ -688,8 +716,18 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         // ---- Large growth: try to grow in place first -------
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-        std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
+        std::size_t needed = 0;
+        if (FAST_UNLIKELY(!PageRoundUpChecked(new_size, sizeof(LargeAllocHeader),
+                                              needed))) {
+            // Impossible request size; fail with the original
+            // allocation left valid (documented realloc failure contract).
+            errno = ENOMEM;
+            return nullptr;
+        }
         if (needed > header->alloc_size) {
+            // Capture BEFORE mremap: on success 'header' may be unmapped
+            // (MREMAP_MAYMOVE) or alias the new header.
+            const std::size_t old_span = header->alloc_size;
 #if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
             // Pooled spans skip mremap growth: the kernel could grow the
             // mapping in place into bump space the pool will hand out again
@@ -703,6 +741,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
                     LargeAllocHeader* new_header = static_cast<LargeAllocHeader*>(grown);
                     void* new_ptr = reinterpret_cast<char*>(new_header) + sizeof(LargeAllocHeader);
                     new_header->alloc_size = needed;
+                    // Keep live-bytes in step with the span (fast_free
+                    // counts the GROWN span; the original malloc counted the
+                    // ORIGINAL span). 'old_span' is read from the pre-mremap
+                    // header: after a MAYMOVE the old header is unmapped and
+                    // must not be touched. Byte-only: n=0 leaves block
+                    // counters untouched.
+                    stats::CountLargeAlloc(0, needed - old_span);
 #if FASTALLOC_DEBUG_ENABLED
                     {
                         // Move the registry record to the new address.

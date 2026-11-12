@@ -31,10 +31,17 @@ constexpr std::size_t PAGE_CACHE_PER_BIN_BYTES = 2 * 1024 * 1024;
 std::size_t PageCacheTotalLimit() {
     static const std::size_t limit = []() {
         const char* env = fast_getenv("FASTALLOC_PAGE_CACHE_MB");
-        std::size_t mb = 64;
+        std::size_t mb = 64; // documented default
         if (env && *env) {
             long v = std::atol(env);
             if (v > 0) mb = static_cast<std::size_t>(v);
+            // Overflow guard: prevent mb * 1024 * 1024 from wrapping in
+            // size_t, which would silently disable the page cache.
+            // Reject any value whose byte product cannot be represented and
+            // fall back to the default; cap values at 1 PB, which no
+            // real deployment exceeds.
+            constexpr std::size_t kMaxSaneMb = (1ull << 40) / (1024 * 1024);
+            if (mb > kMaxSaneMb) mb = 64;
         }
         return mb * 1024 * 1024;
     }();

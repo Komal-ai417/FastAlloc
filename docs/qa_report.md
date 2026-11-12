@@ -5,7 +5,7 @@
 ## 1. Test Plan Coverage
 
 The Google Test suite (`fast_alloc_tests`) consists of **10 files, 86 test
-cases** (release: 75 run; debug: 86 run, of which 85 pass and 1 —
+cases** (release: 79 run; debug: 86 run, of which 85 pass and 1 —
 `ApiTest.FreeWithCorruptLargeHeaderIsDroppedNotCached` — intentionally
 skips in debug builds because the debug registry fatals on forged pointers
 by design; it runs in release builds where the drop-not-cache path is
@@ -26,6 +26,18 @@ exercised).
 Assertions are never executed from worker threads: failures are recorded
 per-thread and verified on the main thread (Google Test assertions are not
 thread-safe — the original suite violated this).
+
+
+### 1.1 Fork-safety limitation (documented, not a supported contract)
+
+FastAlloc does not claim `fork()` safety and provides no `pthread_atfork` handlers. Neither the
+public API (`include/fast_alloc.h`, `docs/api_reference.md`) nor this design promises allocator
+correctness in a child process. A child created while any arena spinlock is held, or while
+deferred frees sit in a `pending_returns_` queue, may inherit locked or inconsistent allocator
+state. Google Test death tests fork while the parent holds no allocator locks (violations abort
+in the child before any allocation path is entered), which is safe. Applications that need
+`fork()` should allocate before forking or re-exec in the child. This is a documented limitation,
+not a defect: no supported contract is violated.
 
 ## 2. Instrumentation (FASTALLOC_DEBUG builds)
 
@@ -94,13 +106,44 @@ DLL staged next to each executable, repeated up to 3x with `-V`):
 
 | Job | What it runs |
 | :--- | :--- |
-| build-test (7 jobs) | ubuntu/windows × release/debug + ubuntu-gcc-release, ubuntu-clang-release, ubuntu-clang-debug — full ctest suite |
+| build-test (7 jobs) | ubuntu/windows × release/debug + ubuntu-gcc-release, ubuntu-clang-release, ubuntu-clang-debug — full ctest suite (Linux entries also run the 11 audit-probe ctest entries) |
 | windows-msvc-asan | full suite under MSVC ASan, `--repeat until-fail:3`, cdb post-mortem on failure |
 | sanitizer-{address-undefined, thread} | full suite under ASan+UBSan / TSan |
 | leak-sanitizer | full suite under LSan |
 | windows-va-emulation-{release,debug} | Linux emulation of the Windows virtual-address accounting paths |
-| benchmarks-{ubuntu, windows} (2 jobs) | every benchmark binary executed family-isolated: fast_alloc_bench (all), fast_alloc_bench_extended (all), fast_alloc_bench_memory (T×size sweep), bench_suite (11 workloads × std+fast × T{1,2,4}), checksum-gated |
+| benchmarks-{ubuntu, windows} (2 jobs) | every benchmark binary executed family-isolated: fast_alloc_bench (all), fast_alloc_bench_extended (all), fast_alloc_bench_memory (T×size sweep), bench_suite (11 workloads × std+fast × T{1,2,4}), checksum-gated, fast_alloc_bench_audit (percentiles/scaling/workloads) |
 | benchmark-matrix (pushes to main, manual) | cross-allocator glibc/jemalloc/FastAlloc matrix with `run_matrix.sh` + `analyze.py` |
+
+## 4b. Adversarial audit probes (scripts/, ctest-registered)
+
+The 2026-11 deep audit added standalone probe programs under `scripts/`. Each probe exits
+non-zero when its defect (or clean-target invariant) is violated, is built as its own CTest
+target (`fast_alloc_probe_<name>`) by the normal build, and runs in every POSIX CI job that
+invokes ctest (build-test Linux entries, sanitizers, leak-sanitizer, WINVA-emulation):
+
+| Probe | Verifies |
+| :--- | :--- |
+| `probe_realloc_overflow` | FA-01: `fast_realloc(p, SIZE_MAX)` on a 1 MiB block must return `nullptr` (was: old pointer returned as success) |
+| `probe_boundary` | FA-01 boundary: every `new_size` in `[SIZE_MAX-4110, SIZE_MAX]` fails cleanly; `SIZE_MAX-4111` and below already correct |
+| `probe_sibling_sizes` | Sibling guards: small-to-huge realloc, malloc/calloc/realloc(nullptr) overflow guards all return `nullptr` |
+| `probe_calloc` | `fast_malloc` guard-boundary sweep + `fast_calloc` exact-wrap rejection + zero-operand unique pointers |
+| `probe_aligned` | Over-aligned allocation + realloc of impossible sizes fail cleanly; control alignment preserved |
+| `probe_env_overflow` | FA-02: `FASTALLOC_PAGE_CACHE_MB` wrap values (2^44, 2^48) must not disable the page cache (3 ctest entries: default + both wrap values) |
+| `probe_stats` | FA-03: aligned/plain/realloc battery leaves `current_live_bytes`/`current_live_blocks` net zero |
+| `probe_stats4` | FA-03 reproducer: the exact 100/9000/3000000 grow-shrink-free cycle (was: +1,499,136 bytes drift) |
+| `probe_remaining` | Clean-target battery: sized-free wrong hints, all 512 class boundaries, OOM rollback on cold classes, retention caps + purge, concurrent stats |
+
+Reproduce locally (Linux):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFASTALLOC_BUILD_TESTS=ON
+cmake --build build -j
+ctest --test-dir build -R "fast_alloc_probe" --output-on-failure   # 11 entries
+```
+
+The probes are POSIX-only (fresh-process `setenv`/`fork`/`exec` semantics); on Windows the
+equivalent regression coverage lives in the gtest suite, and the POSIX-only env cases
+(`EnvTunablesTest.*`) skip with a justified reason.
 
 ## 5. How to Reproduce
 

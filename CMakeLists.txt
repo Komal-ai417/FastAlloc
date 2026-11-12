@@ -147,6 +147,8 @@ if(FASTALLOC_BUILD_TESTS)
         tests/test_oom.cpp
         tests/test_aligned.cpp
         tests/test_stress.cpp
+        tests/test_env_tunables.cpp
+        tests/test_stats_balance.cpp
     )
     target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
@@ -160,10 +162,55 @@ if(FASTALLOC_BUILD_TESTS)
     # the FASTALLOC_BUILD_TESTS block.
     add_subdirectory(tests/audit)
 
+    # ---------------------------------------------------------------------------
+    # Adversarial audit probe programs (scripts/): standalone test harnesses
+    # and verification sweeps (realloc overflow, env-var wrap, stats drift,
+    # plus clean-target batteries).
+    # Each probe exits non-zero on test failure, registered as its own ctest
+    # entry and run in every CI job that invokes ctest with tests enabled.
+    # POSIX-only: the fresh-process env probes use setenv/fork/exec semantics;
+    # the equivalent Windows coverage lives in the gtest suite
+    # (tests/test_env_tunables.cpp skips with a justified reason there).
+    # ---------------------------------------------------------------------------
+    set(FASTALLOC_PROBE_SOURCES
+        scripts/probe_realloc_overflow.cpp
+        scripts/probe_boundary.cpp
+        scripts/probe_sibling_sizes.cpp
+        scripts/probe_calloc.cpp
+        scripts/probe_aligned.cpp
+        scripts/probe_env_overflow.cpp
+        scripts/probe_stats.cpp
+        scripts/probe_stats4.cpp
+        scripts/probe_remaining.cpp
+    )
+    set(FASTALLOC_PROBE_TARGETS "")
+    if(NOT WIN32)
+        foreach(probe_src IN LISTS FASTALLOC_PROBE_SOURCES)
+            get_filename_component(probe_name "${probe_src}" NAME_WE)
+            set(probe_target "fast_alloc_probe_${probe_name}")
+            add_executable("${probe_target}" "${probe_src}")
+            target_compile_options("${probe_target}" PRIVATE ${WARNING_FLAGS})
+            target_link_libraries("${probe_target}" PRIVATE fast_alloc Threads::Threads)
+            if(probe_name STREQUAL "probe_env_overflow")
+                # Default-arg control run plus wrap values that test the
+                # retention cap — the probe re-setenvs itself, so each value
+                # needs its own fresh process.
+                add_test(NAME "${probe_target}" COMMAND "${probe_target}")
+                add_test(NAME "${probe_target}_wrap2p44"
+                         COMMAND "${probe_target}" "17592186044416")
+                add_test(NAME "${probe_target}_wrap2p48"
+                         COMMAND "${probe_target}" "281474976710656")
+            else()
+                add_test(NAME "${probe_target}" COMMAND "${probe_target}")
+            endif()
+            list(APPEND FASTALLOC_PROBE_TARGETS "${probe_target}")
+        endforeach()
+    endif()
+
     # Convenience targets for the common verification matrix
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        DEPENDS fast_alloc_tests fast_alloc_audit_tests
+        DEPENDS fast_alloc_tests fast_alloc_audit_tests ${FASTALLOC_PROBE_TARGETS}
         COMMENT "Running FastAlloc test suite"
     )
 endif()
@@ -218,9 +265,20 @@ if(FASTALLOC_BUILD_BENCHMARKS)
     endif()
     target_link_libraries(bench_suite PRIVATE Threads::Threads)
 
+    # Latency/percentile + throughput-scaling + realistic-workload benchmark
+    # (20 reps with CoV and 95% CI per case). Build a second comparison
+    # variant with -DUSE_GLIBC manually (see benchmarks/bench_audit.cpp
+    # header) for local std-allocator contrast; CI runs the FastAlloc
+    # variant (cross-allocator contrast comes from bench_suite preloads).
+    add_executable(fast_alloc_bench_audit benchmarks/bench_audit.cpp)
+    target_compile_options(fast_alloc_bench_audit PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_audit PRIVATE fast_alloc)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_audit)
+
     target_link_libraries(fast_alloc_bench PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_extended PRIVATE Threads::Threads)
     target_link_libraries(fast_alloc_bench_memory PRIVATE Threads::Threads)
+    target_link_libraries(fast_alloc_bench_audit PRIVATE Threads::Threads)
 endif()
 
 # ---------------------------------------------------------------------------

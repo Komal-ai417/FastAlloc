@@ -10,10 +10,12 @@ This document outlines the internal architectural decisions, concurrency safety 
 FastAlloc uses a Slab-based memory layout, leveraging low-level OS utilities (`VirtualAlloc` on Windows, `mmap` on Linux) mapped to heavily-optimized caching structures.
 
 ### Adaptive Slab Sizing
-OS-level memory mappings scale dynamically based on allocation size. This balances throughput with memory efficiency, saving 50-88% virtual memory versus fixed-density slabs:
-- **Small Objects (up to 64B):** 64KB slabs (256 blocks)
-- **Medium Objects (64B to 1024B):** 128KB slabs (128 blocks)
-- **Large Objects (1024B to 8192B):** 128KB slabs (32 blocks)
+OS-level memory mappings scale dynamically based on allocation size. This balances throughput with memory efficiency, saving 50-88% virtual memory versus fixed-density slabs. Actual geometry (verified against `GlobalHeap::AllocateNewSlab`, `sizeof(Slab) == 72` release / `80` debug, 80-byte aligned first block):
+
+- **Blocks up to 1016 B user (class < 64):** 64 KB slab span (1022 blocks at 64 B; 4091 at 16 B)
+- **1024–2047 B blocks (classes 64–127):** 128 KB slab span, 127 blocks
+- **2048–4095 B blocks (classes 128–255):** 256 KB slab span, 127 blocks
+- **4096–8192 B blocks (classes 256–511):** 256 KB slab span, 31 blocks
 
 ### Intrusive Free List & Metadata Offset
 When a block is free, it acts as a node in an intrusive doubly-linked list. FastAlloc enforces a strict `16-byte` User Offset (`USER_OFFSET = 16`). When a user requests memory, FastAlloc returns a pointer that is exactly 16 bytes forward from the start of the `FreeBlock`. 
@@ -66,7 +68,7 @@ std::array<CacheBin, NUM_SIZE_CLASSES> bins_{};
 Interleaving the head pointer and active count ensures both values are fetched from memory in a single 64-byte L1 cache line transfer, halving cache-miss overheads during stack push/pop operations.
 
 ### Out-of-Lock OS Allocation & Aggressive Unmapping
-Critical system calls (`VirtualAlloc`/`mmap`) are executed *outside* of global spinlocks. This ensures that slow OS-level page mapping never blocks other threads from accessing the global heap. FastAlloc guarantees aggressive return of empty slabs to the OS outside the critical path spinlocks, ensuring a footprint often smaller than `malloc`.
+Critical OS-memory calls inside the arena layer are bounded: page-span inserts/removes go through the in-memory page cache, so `mmap`/`munmap`/`VirtualAlloc`/`VirtualFree` are reached only on a cache miss or overflow (slow paths). Note (audit 2026-11): slab-span allocation and empty-slab release DO occur while holding a per-class arena spinlock (`AllocateBatch`/`ProcessBatchLocked` call `AllocateNewSlab`/`PageHeapFree` under `class_locks_`), so a slow OS call can stall that one (class, arena) stripe; other classes/arenas remain available, and the page cache absorbs most release traffic. FastAlloc returns empty slabs aggressively; the measured footprint after purge is often smaller than `malloc`.
 
 ### Exponential Spinlock Backoff
 Global stripe locks implement exponential backoff with `std::this_thread::yield()`, drastically reducing cache-line bouncing and improving stability under extreme multi-core contention.

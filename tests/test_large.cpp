@@ -8,6 +8,7 @@
 #include "test_hooks.h"
 
 #include <cstring>
+#include <cerrno>
 #include <vector>
 
 using namespace FastAlloc;
@@ -117,6 +118,41 @@ TEST(LargeAllocTest, ReallocShrinkReleasesPagesInPlace) {
         ASSERT_EQ(q[i], 0x42);
     }
     fast_free(q);
+}
+
+// Verify that fast_realloc guards against overflow when rounding up request sizes.
+// For new_size values near SIZE_MAX where new_size + header wraps or overflows,
+// realloc must cleanly return nullptr and preserve the original allocation intact.
+TEST(LargeAllocTest, ReallocToImpossibleSizesReturnsNull) {
+    const std::size_t kMax = static_cast<std::size_t>(-1);
+    // A genuine large block (1 MiB) first.
+    unsigned char* p = static_cast<unsigned char*>(fast_malloc(1 << 20));
+    ASSERT_NE(p, nullptr);
+    for (std::size_t i = 0; i < (1u << 20); i += 7) p[i] = 0x5A;
+
+    // Sweep the wrap window of PageRoundUp(new_size + 16):
+    //   new_size + 16 wraps          for new_size in [SIZE_MAX-15,   SIZE_MAX]
+    //   new_size + 16 + page-1 wraps for new_size in [SIZE_MAX-4110, SIZE_MAX-16]
+    // Every value in [SIZE_MAX-4110, SIZE_MAX] must fail cleanly and keep
+    // the original allocation valid (documented realloc failure contract).
+    for (std::size_t d = 0; d <= 4110; ++d) {
+        const std::size_t impossible = kMax - d;
+        errno = 0;
+        void* r = fast_realloc(p, impossible);
+        EXPECT_EQ(r, nullptr) << "d=" << d << ": impossible size returned success";
+        if (r != nullptr) { fast_free(r); FAIL() << "stopped at d=" << d; }
+    }
+    // The original block must still be intact and valid after the failures.
+    for (std::size_t i = 0; i < (1u << 20); i += 7) {
+        ASSERT_EQ(p[i], 0x5A) << "original block corrupted at " << i;
+    }
+    // Control: a legal grow still works after all the rejections.
+    void* grown = fast_realloc(p, (1u << 20) + 4096);
+    ASSERT_NE(grown, nullptr);
+    for (std::size_t i = 0; i < (1u << 20); i += 7) {
+        ASSERT_EQ(static_cast<unsigned char*>(grown)[i], 0x5A) << "grow lost data";
+    }
+    fast_free(grown);
 }
 
 TEST(LargeAllocTest, PageCachePurgeReleasesMemory) {

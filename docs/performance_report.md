@@ -28,7 +28,8 @@ Run it yourself (one command, every benchmark, full verdict report):
 
 ```bash
 cmake -B build && cmake --build build -j --target bench_suite \
-    fast_alloc_bench fast_alloc_bench_extended fast_alloc_bench_memory
+    fast_alloc_bench fast_alloc_bench_extended fast_alloc_bench_memory \
+    fast_alloc_bench_audit
 mkdir -p benchmarks/results
 # point the tool at jemalloc/mimalloc (auto-detected if in default paths):
 python3 benchmarks/benchsuite/bench_compare.py \
