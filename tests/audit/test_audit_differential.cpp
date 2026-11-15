@@ -238,11 +238,17 @@ TEST(AuditMemory, ScribbleAroundBlockThenFreeGuardsHold) {
     // Release-only: simulate user overflow/underflow by 1-8 bytes around live
     // blocks, then free and verify self-healing. In DEBUG the canary checks
     // FATAL on this by design (DebugAidsDeathTest covers it).
+    // FA-06 note: c[-1] lands on the canary dword's high byte, which since
+    // FA-06 carries the release live/free state stamp. A scribbled block is
+    // therefore DROPPED (leaked) at free instead of recycled - strictly
+    // safer than the old padding behaviour, and symmetric with DEBUG's
+    // fatal canary. The post-storm recycling assertion below only uses
+    // unscribbled blocks, so it is unaffected.
     for (int round = 0; round < 200; ++round) {
         void* p = fast_malloc(100);
         ASSERT_NE(p, nullptr);
         auto* c = static_cast<unsigned char*>(p);
-        c[-1] ^= 0xFF;   // 1-byte underflow into canary/padding (header stays)
+        c[-1] ^= 0xFF;   // 1-byte underflow into the canary/stamp dword
         c[100] ^= 0xFF;  // 1-byte overflow into next block's header territory?
         // NOTE: c[100] lands inside THIS block's class slack (class 8: block
         // 128, user region 112) -> stays in-bounds of the block itself.
@@ -291,6 +297,80 @@ TEST(AuditMemory, DoubleFreeReleaseAbsorbed) {
     EXPECT_LE(got, 0) << "live-blocks grew: this test leaked for real";
 }
 
+TEST(AuditMemory, NonHeadDoubleFreeGuardedByStateStamp) {
+#if !FASTALLOC_DEBUG_ENABLED
+    // FA-06 regression: the release double-free guards compared only against
+    // the CURRENT freelist head. Freeing A, then B, then A again left A
+    // non-head - the old code silently linked A twice (cycle A->B->A) and
+    // later handed one block to two owners. The canary dword now carries a
+    // live/free state stamp, so the second free of A is dropped and
+    // reported, and the bin holds exactly {B, A}.
+    void* a = fast_malloc(72);
+    void* b = fast_malloc(72);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    fast_free(a);   // bin: A (head)
+    fast_free(b);   // bin: B -> A (B is head; A is NOT head)
+    fast_free(a);   // non-head double free: must be dropped, not linked
+    // The next two same-class allocations must return exactly the two
+    // freed blocks (either LIFO order), never a duplicate.
+    void* x = fast_malloc(72);
+    void* y = fast_malloc(72);
+    void* z = fast_malloc(72);
+    ASSERT_NE(x, nullptr);
+    ASSERT_NE(y, nullptr);
+    ASSERT_NE(z, nullptr);
+    EXPECT_TRUE((x == a && y == b) || (x == b && y == a))
+        << "bin did not contain exactly {A, B} after the guarded double free";
+    EXPECT_NE(z, a);
+    EXPECT_NE(z, b);
+    EXPECT_NE(x, y) << "one block handed to two owners";
+    // Both owners' blocks stay writable and independent.
+    std::memset(x, 0x11, 72);
+    std::memset(y, 0x22, 72);
+    std::memset(z, 0x33, 72);
+    ASSERT_EQ(static_cast<unsigned char*>(x)[71], 0x11);
+    ASSERT_EQ(static_cast<unsigned char*>(y)[71], 0x22);
+    fast_free(x);
+    fast_free(y);
+    fast_free(z);
+#endif
+    // Heavy same-class churn after the guarded event.
+    for (int i = 0; i < 5000; ++i) {
+        void* p = fast_malloc(72);
+        ASSERT_NE(p, nullptr);
+        std::memset(p, 0x44, 72);
+        fast_free(p);
+    }
+}
+
+TEST(AuditMemory, CorruptClassIndexReallocRejectedNotRead) {
+#if !FASTALLOC_DEBUG_ENABLED
+    // FA-08 regression (audit finding 6): the realloc copy path computed
+    // old_size = UsableSize(block->class_index) without the bounds check
+    // fast_free performs, so a corrupted class_index (0xFFFF) read past the
+    // size table and used out-of-bounds garbage as the shrink/copy bound.
+    // Must be rejected with EINVAL instead.
+    void* p = fast_malloc(64);
+    ASSERT_NE(p, nullptr);
+    // class_index lives at header offset 8 = user pointer - 8.
+    *reinterpret_cast<std::uint32_t*>(static_cast<char*>(p) - 8) = 0xFFFFu;
+    errno = 0;
+    void* q = fast_realloc(p, 128);
+    EXPECT_EQ(q, nullptr) << "corrupt class_index accepted by realloc";
+    EXPECT_EQ(errno, EINVAL);
+    // The corrupted block is dropped (leak-by-contract); the allocator must
+    // remain fully serviceable.
+    for (int i = 0; i < 200; ++i) {
+        void* w = fast_malloc(64);
+        ASSERT_NE(w, nullptr);
+        std::memset(w, 0x55, 64);
+        fast_free(w);
+    }
+#endif
+    SUCCEED();
+}
+
 TEST(AuditMemory, ReadAfterFreeDoesNotCrash) {
     // Reading freed memory is UB; FastAlloc documents POISON 0xDD in debug.
     // In release we only assert the read does not SEGV (pages stay mapped:
@@ -304,4 +384,136 @@ TEST(AuditMemory, ReadAfterFreeDoesNotCrash) {
         (void)c[0]; (void)c[s / 2]; (void)c[s - 1];   // must not fault
     }
     SUCCEED();
+}
+
+// ---- FA-05: aligned stash validation + >1 GiB aligned blocks -----------------
+
+TEST(AuditMemory, AlignedReallocAboveOneGiBIsLegitimate) {
+    // Regression (audit FA-05): fast_realloc's aligned branch used to cap the
+    // stashed old_size at 1 GiB, so a perfectly valid fast_aligned_alloc(64,
+    // 1.5 GiB) failed ANY subsequent realloc with EINVAL and a bogus
+    // "corrupt large header" report. The span is lazily faulted, so this
+    // costs ~no RSS: only the shrink-in-place path is exercised (stash
+    // update, no copy).
+    const std::size_t big = (1ull << 30) + (512ull << 20);  // 1.5 GiB
+    void* p = fast_aligned_alloc(64, big);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p) % 64u, 0u);
+    void* q = fast_realloc(p, (1ull << 30) + (256ull << 20));  // 1.25 GiB
+    EXPECT_EQ(q, p) << "in-place shrink of a >1 GiB aligned block rejected";
+    // And a size update must round-trip through the stash.
+    EXPECT_EQ(fast_realloc(q, (1ull << 30)), q);
+    fast_free(q);
+}
+
+TEST(AuditMemory, ForgedAlignedStashRoundTripGuarded) {
+#if !FASTALLOC_DEBUG_ENABLED
+    // Release-only misuse simulation (debug registry FATALs on corrupted
+    // provenance by design). The aligned stash ([alignment][raw][MAGIC]
+    // [size] at ptr-32..-8) is user-writable: a forged raw must NOT be
+    // recursively freed (audit FA-05: round-trip validation), and a forged
+    // size must NOT become a memcpy bound (capacity cross-check).
+    void* victim = fast_malloc(64);
+    ASSERT_NE(victim, nullptr);
+    std::memset(victim, 0x5A, 64);
+
+    // (a) Forged raw pointing at an unrelated LIVE block: fast_free must
+    // drop the aligned pointer instead of freeing the victim.
+    void* p = fast_aligned_alloc(64, 128);
+    ASSERT_NE(p, nullptr);
+    *reinterpret_cast<void**>(static_cast<char*>(p) - 24) = victim;
+    // Precondition: the forged raw must not accidentally round-trip to p
+    // (victim would then look like a legitimate raw and the free would be
+    // correct behaviour, making this sub-case vacuous). Victim must sit
+    // outside the 64-byte window below p.
+    ASSERT_NE((reinterpret_cast<std::uintptr_t>(victim) + 32 + 63) &
+                  ~std::uintptr_t{63},
+              reinterpret_cast<std::uintptr_t>(p))
+        << "test setup: victim accidentally round-trips to p";
+    fast_free(p);  // must be rejected and dropped (leaked by contract)
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_EQ(static_cast<unsigned char*>(victim)[i], 0x5A)
+            << "forged raw freed a live block";
+    }
+
+    // (b) Forged size far beyond the raw block's capacity: realloc must
+    // fail cleanly instead of using it as a copy bound (OOB read under
+    // the old code, caught by the ASan jobs).
+    void* r = fast_aligned_alloc(64, 64);
+    ASSERT_NE(r, nullptr);
+    *reinterpret_cast<std::size_t*>(static_cast<char*>(r) - 8) = 100 * 1024;
+    errno = 0;
+    void* s = fast_realloc(r, 100 * 1024);
+    EXPECT_EQ(s, nullptr) << "forged stash size accepted as a copy bound";
+    EXPECT_EQ(errno, EINVAL);
+    // r was rejected, not freed or moved: the allocator must stay healthy.
+    void* u = fast_malloc(64);
+    ASSERT_NE(u, nullptr);
+    EXPECT_NE(u, r);
+    fast_free(u);
+    fast_free(r);      // still the owner; normal free of the (restored-size) block
+    fast_free(victim); // never freed by the forged path
+#endif
+    // Serviceability churn after the misuse pair.
+    for (int i = 0; i < 500; ++i) {
+        void* w = fast_malloc(97);
+        ASSERT_NE(w, nullptr);
+        std::memset(w, 0x33, 97);
+        fast_free(w);
+    }
+}
+
+// ---- FA-09: page-cache parked-bytes accounting + per-bin budget -------------
+
+TEST(AuditMemory, PageCacheBytesStatTracksParking) {
+    // Regression (audit FA-09, findings 1 + 8): page_cache_bytes used to be
+    // adjusted only by stores and evicts. The POP paths (exact-bin hit and
+    // best-fit split) subtracted the internal retention counter but left the
+    // public parked-bytes stat untouched - every store->hit cycle left bytes
+    // counted as parked forever. The cap-bypass path subtracted never-stored
+    // bytes and drove the stat negative. And the per-bin retention floor of
+    // 2 entries parked up to 4 MB of 2 MB spans per bin vs the documented
+    // 2 MB budget.
+    constexpr std::size_t kSpan = 2u * 1024 * 1024 - 4096;  // -> 512-page span
+    // Order matters: flush the thread caches FIRST, then empty the global
+    // page cache - flushing afterwards would park spans after the purge and
+    // pollute the parked-bytes baseline with residue from earlier tests.
+    fast_alloc_purge_thread_cache();
+    FastAllocTestPurgePageCache();
+
+    // 1) store -> hit cycle: parked bytes must return to zero on the pop.
+    {
+        void* a = fast_malloc(kSpan);
+        ASSERT_NE(a, nullptr);
+        fast_free(a);
+        fast_alloc_purge_thread_cache();  // span leaves TLS large cache
+        EXPECT_GT(fast_alloc_stats().page_cache_bytes, 0u)
+            << "freed 2 MB span never parked (setup failed)";
+        void* b = fast_malloc(kSpan);      // exact-bin page-cache hit
+        ASSERT_NE(b, nullptr);
+        EXPECT_EQ(fast_alloc_stats().page_cache_bytes, 0u)
+            << "hit path never subtracted parked bytes";
+        fast_free(b);
+        fast_alloc_purge_thread_cache();
+        FastAllocTestPurgePageCache();
+        EXPECT_EQ(fast_alloc_stats().page_cache_bytes, 0u);
+    }
+
+    // 2) cap-bypass: two same-size spans freed together - the bin holds one
+    //    (2 MB budget), the second bypasses; the stat must neither underflow
+    //    (never-stored bytes subtracted) nor exceed the per-bin budget.
+    {
+        void* x = fast_malloc(kSpan);
+        void* y = fast_malloc(kSpan);
+        ASSERT_NE(x, nullptr);
+        ASSERT_NE(y, nullptr);
+        fast_free(x);
+        fast_free(y);
+        fast_alloc_purge_thread_cache();
+        EXPECT_LE(fast_alloc_stats().page_cache_bytes, 2u * 1024 * 1024)
+            << "per-bin retention exceeded the documented 2 MB budget";
+        FastAllocTestPurgePageCache();
+        EXPECT_EQ(fast_alloc_stats().page_cache_bytes, 0u)
+            << "parked-bytes stat drifted (bypass subtracted never-stored bytes)";
+    }
 }

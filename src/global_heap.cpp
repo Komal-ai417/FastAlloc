@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <tuple>
 #include <thread>
 #include <cstdlib>
 #include <new>
@@ -73,6 +74,15 @@ inline void MarkMaybeEmpty(std::size_t pages) {
 }
 // Smallest hinted bin index > 'pages', or 0 if none (index 0 is unused).
 inline std::size_t FirstNonEmptyAbove(std::size_t pages) {
+    // FA-08 (audit finding 10c): the indexing is only in-bounds thanks to
+    // the +64 slack in the array bound; pin that coupling with a
+    // static_assert and make the 'no bin above the last one' case explicit.
+    static_assert(
+        (MAX_CACHED_PAGES + 1 + 63) / 64 <=
+            std::tuple_size<decltype(page_nonempty_)>::value,
+        "page_nonempty_ must cover every bit index through "
+        "MAX_CACHED_PAGES + 1");
+    if (pages >= MAX_CACHED_PAGES) return 0;
     std::size_t need = pages + 1;
     std::size_t w = need >> 6;
     std::uint64_t word = page_nonempty_[w].load(std::memory_order_relaxed) & (~0ull << (need & 63));
@@ -110,7 +120,12 @@ void AcquireBinLock(std::atomic_flag& lock) {
 std::size_t BinRetentionCount(std::size_t span_pages) {
     std::size_t span_size = span_pages * OSMemory::GetPageSize();
     std::size_t by_size = PAGE_CACHE_PER_BIN_BYTES / span_size;
-    std::size_t cap = by_size < 2 ? 2 : (by_size > 64 ? 64 : by_size);
+    // FA-09 (audit finding 8): the floor used to be 2 entries, so any span
+    // larger than half the per-bin budget (e.g. the 2 MB spans that fill
+    // bin[MAX_CACHED_PAGES]) parked up to 4 MB - double the documented
+    // "2 MB per bin". A floor of 1 keeps every bin inside its budget; the
+    // 64-entry ceiling is unchanged.
+    std::size_t cap = by_size < 1 ? 1 : (by_size > 64 ? 64 : by_size);
     return cap;
 }
 
@@ -140,6 +155,19 @@ void* PageHeapAllocate(std::size_t size) {
                 bin.lock.clear(std::memory_order_release);
                 page_cache_total_bytes.fetch_sub(size, std::memory_order_relaxed);
                 stats::CountPageCacheHit();
+                // FA-09 (audit finding 1): the popped span leaves the cache;
+                // keep the public parked-bytes stat in step with the
+                // internal retention counter (it used to stay parked
+                // forever, drifting upward on every store->hit cycle).
+                stats::CountPageCacheRemove(size);
+                // FA-06 (partial, audit finding 5): scrub the span-base
+                // header region. The span retains stale metadata from its
+                // previous life (PageNode/Slab/LargeAllocHeader/FreeBlock),
+                // and while it sits cached a stale pointer to the span base
+                // could otherwise re-validate through the value-only
+                // guards. 256 B covers every header type the base region
+                // can carry; the caller writes its own header here anyway.
+                std::memset(node, 0, 256);
                 return node;
             }
             bin.lock.clear(std::memory_order_release);
@@ -162,6 +190,10 @@ void* PageHeapAllocate(std::size_t size) {
                 if (!bin.head) MarkMaybeEmpty(p);
                 std::size_t span_bytes = p * page_size;
                 page_cache_total_bytes.fetch_sub(span_bytes, std::memory_order_relaxed);
+                // FA-09 (audit finding 1): full popped span leaves the cache
+                // (the split tail re-parks below and re-adds its bytes via
+                // CountPageCacheStore, so the net stat is exact).
+                stats::CountPageCacheRemove(span_bytes);
 
                 std::size_t rem_pages = p - pages;
                 if (rem_pages > 0) {
@@ -186,6 +218,9 @@ void* PageHeapAllocate(std::size_t size) {
                 }
                 bin.lock.clear(std::memory_order_release);
                 stats::CountPageCacheHit();
+                // FA-06 (partial, audit finding 5): same span-base scrub
+                // as the exact-bin path above.
+                std::memset(node, 0, 256);
                 return node;
             }
             MarkMaybeEmpty(p); // stale hint
@@ -212,8 +247,22 @@ void PageHeapFree(void* ptr, std::size_t size) {
         auto& bin = page_bins_[pages];
         // Global high-water mark: never let the whole cache exceed the cap
         // because of this insertion.
-        std::size_t total = page_cache_total_bytes.fetch_add(size, std::memory_order_relaxed) + size;
-        if (total <= PageCacheTotalLimit()) {
+        // FA-08 (audit finding 7): admission used to fetch_add first and
+        // roll back on rejection. Concurrent inserters could each observe
+        // total <= limit from their own post-add snapshot and collectively
+        // overshoot the cap (bounded by threads x span), and the rollback
+        // window published inflated totals to every concurrent admission
+        // check. CAS admission decides against the counter's actual value.
+        std::size_t total = page_cache_total_bytes.load(std::memory_order_relaxed);
+        bool admitted = false;
+        while (total + size <= PageCacheTotalLimit()) {
+            if (page_cache_total_bytes.compare_exchange_weak(
+                    total, total + size, std::memory_order_relaxed)) {
+                admitted = true;
+                break;
+            }
+        }
+        if (admitted) {
             AcquireBinLock(bin.lock);
             if (bin.count < BinRetentionCount(pages)) {
                 PageNode* node = static_cast<PageNode*>(ptr);
@@ -226,9 +275,14 @@ void PageHeapFree(void* ptr, std::size_t size) {
                 return;
             }
             bin.lock.clear(std::memory_order_release);
+            // Retention cap full: undo the admission.
+            page_cache_total_bytes.fetch_sub(size, std::memory_order_relaxed);
         }
-        page_cache_total_bytes.fetch_sub(size, std::memory_order_relaxed);
-        stats::CountPageCacheEvict(size);
+        // FA-09 (audit finding 1): this span never parked any bytes (either
+        // the global cap rejected it or the per-bin retention cap was full),
+        // so only the eviction counter moves - the parked-bytes stat used to
+        // subtract these never-stored bytes and drift negative.
+        stats::CountPageCacheBypass();
     }
     OSMemory::FreePages(ptr, size);
 }
@@ -241,14 +295,22 @@ std::size_t PurgePageCacheLocked() {
         AcquireBinLock(bin.lock);
         PageNode* node = bin.head;
         bin.head = nullptr;
+        std::size_t detached = bin.count;
         bin.count = 0;
         MarkMaybeEmpty(p);
+        // FA-08 (audit finding 7): account the detached spans while the bin
+        // lock is still held, so concurrent PageHeapFree admission decisions
+        // never count already-detached spans as retained retention budget.
+        // The munmap itself stays outside the bin lock.
+        if (detached > 0) {
+            page_cache_total_bytes.fetch_sub(detached * p * page_size,
+                                             std::memory_order_relaxed);
+        }
         bin.lock.clear(std::memory_order_release);
         while (node) {
             PageNode* next = node->next;
             std::size_t span_size = p * page_size;
             OSMemory::FreePages(node, span_size);
-            page_cache_total_bytes.fetch_sub(span_size, std::memory_order_relaxed);
             stats::CountPageCacheEvict(span_size);
             released += span_size;
             node = next;

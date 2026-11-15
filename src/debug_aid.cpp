@@ -169,6 +169,16 @@ void CountOsFree (std::size_t bytes) { ++g_os_frees;  g_os_bytes_live.fetch_sub(
 void CountPageCacheHit()  { ++g_page_cache_hits; }
 void CountPageCacheStore(std::size_t bytes) { g_page_cache_bytes.fetch_add(bytes, std::memory_order_relaxed); }
 void CountPageCacheEvict(std::size_t bytes) { g_page_cache_bytes.fetch_sub(bytes, std::memory_order_relaxed); ++g_page_cache_evictions; }
+// FA-09 (audit finding 1): a span popped back into service leaves the cache;
+// subtract the parked-bytes stat without counting an eviction. The pop paths
+// used to adjust only the internal retention counter, so every store->hit
+// cycle left the public page_cache_bytes parked forever.
+void CountPageCacheRemove(std::size_t bytes) { g_page_cache_bytes.fetch_sub(bytes, std::memory_order_relaxed); }
+// FA-09: a span dropped on free because a retention cap was full never parked
+// any bytes; count the eviction decision but leave the parked-bytes stat
+// alone (the old shared path subtracted never-stored bytes and drove the
+// stat negative).
+void CountPageCacheBypass() { ++g_page_cache_evictions; }
 void CountPendingPush() { ++g_pending_pushes; }
 void CountTlsMisses()  { ++g_tls_misses; }
 void CountTlsCreate()  { ++g_tls_created; }
@@ -280,9 +290,41 @@ bool AllocRegistry::Insert(const AllocRecord& rec, AllocRecord* existing) {
     // tombstones which would otherwise slow probes indefinitely.
     if ((s.count + s.tombstones) * 10 >= s.capacity * 7) GrowShard(s);
 
+    // FA-09 (audit finding 4, pre-check): if GrowShard failed under OOM and
+    // the shard is completely full (no empty slot, no tombstone), the insert
+    // cannot succeed - fail fast with a fatal diagnostic instead of scanning
+    // a whole probe cycle first (the in-loop bail remains as the backstop).
+    // Not `return false`: callers read that as "already live / double
+    // alloc", which would misreport a registry problem as a user bug.
+    if (FAST_UNLIKELY(s.count + s.tombstones >= s.capacity)) {
+        ViolationInfo info{};
+        info.kind = Violation::InternalInvariant;
+        info.ptr = rec.ptr;
+        info.where = "AllocRegistry::Insert: shard 100% full and "
+                     "GrowShard cannot allocate (OOM); aborting instead "
+                     "of probing a full table";
+        info.caller = FAST_RETURN_ADDRESS();
+        ReportViolation(info);
+    }
+
     std::size_t slot = HashPtr(rec.ptr, s.capacity - 1);
     std::size_t first_tombstone = static_cast<std::size_t>(-1);
+    std::size_t probes = 0;
     while (s.table[slot].ptr) {
+        // FA-08 (audit finding 10e): GrowShard stays at its current capacity
+        // when malloc fails; if the shard then reaches 100% occupancy (no
+        // empty slot, no tombstone) this probe loop would never terminate.
+        // Bail out with a fatal diagnostic instead of spinning.
+        if (FAST_UNLIKELY(++probes > s.capacity)) {
+            ViolationInfo info{};
+            info.kind = Violation::InternalInvariant;
+            info.ptr = rec.ptr;
+            info.where = "AllocRegistry::Insert: shard 100% full and "
+                         "GrowShard cannot allocate (OOM); aborting instead "
+                         "of looping forever";
+            info.caller = FAST_RETURN_ADDRESS();
+            ReportViolation(info);
+        }
         if (IsTombstone(s.table[slot].ptr)) {
             if (first_tombstone == static_cast<std::size_t>(-1)) first_tombstone = slot;
         } else if (s.table[slot].ptr == rec.ptr) {
@@ -306,7 +348,21 @@ bool AllocRegistry::Erase(void* ptr, AllocRecord* out) {
     Shard& s = shards_[HashShard(ptr)];
     std::lock_guard<std::mutex> lock(s.mtx);
     std::size_t slot = HashPtr(ptr, s.capacity - 1);
+    std::size_t probes = 0;
     while (s.table[slot].ptr) {
+        // FA-08 (audit finding 10e): same 100%-occupancy bail as Insert -
+        // a lookup for a key not in a completely full, tombstone-free
+        // shard would otherwise probe forever.
+        if (FAST_UNLIKELY(++probes > s.capacity)) {
+            ViolationInfo info{};
+            info.kind = Violation::InternalInvariant;
+            info.ptr = ptr;
+            info.where = "AllocRegistry::Erase: shard 100% full and "
+                         "GrowShard cannot allocate (OOM); aborting instead "
+                         "of looping forever";
+            info.caller = FAST_RETURN_ADDRESS();
+            ReportViolation(info);
+        }
         if (!IsTombstone(s.table[slot].ptr) && s.table[slot].ptr == ptr) {
             if (out) *out = s.table[slot];
             if (s.live_bytes >= s.table[slot].size) s.live_bytes -= s.table[slot].size;

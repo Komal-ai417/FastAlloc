@@ -65,6 +65,9 @@ namespace stats {
     void CountPageCacheHit();
     void CountPageCacheStore(std::size_t bytes);
     void CountPageCacheEvict(std::size_t bytes);
+    // FA-09: parked-bytes accounting for span pop (hit) and cap-bypass.
+    void CountPageCacheRemove(std::size_t bytes);
+    void CountPageCacheBypass();
     void CountPendingPush();
     void CountTlsMisses();
     void CountTlsCreate();

@@ -1,4 +1,4 @@
-# FastAlloc audit suite — 49 gtest cases in 5 files: functional boundaries,
+# FastAlloc audit suite — 54 gtest cases in 5 files: functional boundaries,
 # property-based, differential vs glibc, concurrency, slab/OOM/fragmentation.
 add_executable(fast_alloc_audit_tests
     test_audit_functional.cpp

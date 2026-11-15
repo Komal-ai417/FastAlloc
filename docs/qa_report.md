@@ -82,7 +82,7 @@ Run locally on 2026-10-15 via `python -m cmake` + MinGW Makefiles.
 | Suite | Tests | Result | Notes |
 | :--- | :--- | :--- | :--- |
 | `fast_alloc_tests` (main) | 75 | **74 PASS, 1 FAIL** | `ApiTest.ReallocFailurePreservesOriginal` — OOM injection does not fire on Windows (VirtualAlloc doesn't obey the countdown in the same code path as `mmap`); platform-expected |
-| `fast_alloc_audit_tests` (49 cases) | 49 | **48 PASS, 1 FAIL** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
+| `fast_alloc_audit_tests` (49 cases at run time; 53 since audit round FA-05/06/08) | 49 | **48 PASS, 1 FAIL** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
 | `bench_suite` small-mixed T=1 | — | **41.2 M ops/s** (24.25 ns/op median) | Checksum OK |
 | `fast_alloc_bench` MallocFree 8B T=1 | — | **5.99 µs/iter** vs std 33.4 µs → **5.6× faster** | MinGW UCRT64, Release |
 | `fast_alloc_bench_memory` 4 threads | — | std 0.111 s / FastAlloc 0.347 s | VirtualAlloc reservation overhead dominates at T=4; expected on Windows |

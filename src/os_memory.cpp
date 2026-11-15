@@ -120,7 +120,22 @@ public:
         if (!ptr || size == 0) return;
         std::lock_guard<std::mutex> guard(mu_);
         auto it = FindRegion(static_cast<char*>(ptr), size);
-        if (it == regions_.end()) return; // unknown span; nothing safe to do
+        if (it == regions_.end()) {
+            // FA-08 (audit finding 10g): an unknown span used to return
+            // silently - a silent VA leak with no diagnostic trail. Log
+            // once; the release attempt is still dropped (there is nothing
+            // safe to do with an untracked span).
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[fastalloc-winva] ReleaseSpan: untracked span "
+                             "%p (+%zu bytes) - reservation leaked (unknown "
+                             "span, nothing safe to release).\n",
+                             ptr, size);
+                std::fflush(stderr);
+            }
+            return; // unknown span; nothing safe to do
+        }
         char* base = it->first;
         WinRegion& region = it->second;
 
@@ -143,7 +158,21 @@ public:
         if (!ptr || size == 0) return;
         std::lock_guard<std::mutex> guard(mu_);
         auto it = FindRegion(static_cast<char*>(ptr), size);
-        if (it == regions_.end()) return;
+        if (it == regions_.end()) {
+            // FA-08 (audit finding 10g): same log-once treatment as
+            // ReleaseSpan - silent VA bookkeeping divergence is invisible
+            // without a diagnostic.
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[fastalloc-winva] DecommitRange: untracked span "
+                             "%p (+%zu bytes) - decommit skipped (unknown "
+                             "span).\n",
+                             ptr, size);
+                std::fflush(stderr);
+            }
+            return;
+        }
         WinRegion& region = it->second;
         if (!WinOps::Decommit(ptr, size)) return;
         region.live = (region.live >= size) ? (region.live - size) : 0;

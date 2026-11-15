@@ -81,10 +81,15 @@ TEST(AuditSlab, EmptySlabReturnedToOs) {
     // we verify the test's OWN balance and post-purge serviceability.
     FastAllocStats before = fast_alloc_stats();
     FastAllocTestPurgePageCache();
-    std::vector<void*> hold;
-    for (int i = 0; i < 4000; ++i) hold.push_back(fast_malloc(192));
-    for (void* p : hold) fast_free(p);       // whole slab empties at once
-    FastAllocTestPurgePageCache();
+    // The hold vector is scoped INSIDE the measured window: under
+    // FASTALLOC_OVERRIDE_NEW its buffer is itself a FastAlloc large block
+    // and must be freed before the closing snapshot.
+    {
+        std::vector<void*> hold;
+        for (int i = 0; i < 4000; ++i) hold.push_back(fast_malloc(192));
+        for (void* p : hold) fast_free(p);   // whole slab empties at once
+        FastAllocTestPurgePageCache();
+    }
     FastAllocStats st = fast_alloc_stats();
     EXPECT_EQ(st.current_live_blocks, before.current_live_blocks)
         << "this test leaked (delta vs its own start)";
@@ -136,25 +141,30 @@ TEST(AuditOom, OomDuringSlabAllocationRecover) {
     for (int i = 0; i < 3000; ++i) { void* w = fast_malloc(1237); ASSERT_NE(w, nullptr); fast_free(w); }
     FastAllocTestSetOOMCountdown(3);   // fail the next 3 page allocations
     int nulls = 0;
-    std::vector<void*> hold;
-    for (int i = 0; i < 200000; ++i) {  // force fresh slabs until countdown fires
-        void* p = fast_malloc(1237);
-        if (!p) { ++nulls; continue; }
-        hold.push_back(p);
-        if (nulls >= 3) break;
-        if (hold.size() > 100000) break;
+    // Scoped like EmptySlabReturnedToOs: under FASTALLOC_OVERRIDE_NEW the
+    // vector's own buffer is a FastAlloc block and must die before the
+    // closing snapshot.
+    {
+        std::vector<void*> hold;
+        for (int i = 0; i < 200000; ++i) {  // force fresh slabs until countdown fires
+            void* p = fast_malloc(1237);
+            if (!p) { ++nulls; continue; }
+            hold.push_back(p);
+            if (nulls >= 3) break;
+            if (hold.size() > 100000) break;
+        }
+        FastAllocTestSetOOMCountdown(0);
+        EXPECT_GE(nulls, 1) << "OOM never fired";
+        EXPECT_LE(nulls, 3);
+        // previously allocated memory stays valid: verify pattern
+        for (void* p : hold) { ASSERT_NE(p, nullptr); std::memset(p, 0x77, 1237); }
+        // allocator recovers fully
+        void* q = fast_malloc(1237);
+        ASSERT_NE(q, nullptr);
+        std::memset(q, 0x88, 1237);
+        fast_free(q);
+        for (void* p : hold) fast_free(p);
     }
-    FastAllocTestSetOOMCountdown(0);
-    EXPECT_GE(nulls, 1) << "OOM never fired";
-    EXPECT_LE(nulls, 3);
-    // previously allocated memory stays valid: verify pattern
-    for (void* p : hold) { ASSERT_NE(p, nullptr); std::memset(p, 0x77, 1237); }
-    // allocator recovers fully
-    void* q = fast_malloc(1237);
-    ASSERT_NE(q, nullptr);
-    std::memset(q, 0x88, 1237);
-    fast_free(q);
-    for (void* p : hold) fast_free(p);
     FastAllocStats st = fast_alloc_stats();
     EXPECT_EQ(st.current_live_blocks, t0.current_live_blocks)
         << "this test leaked (delta vs its own start)";

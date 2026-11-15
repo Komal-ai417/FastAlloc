@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <new>
 
 // ============================================================================
 // FastAlloc public API
@@ -123,11 +124,39 @@ void fast_alloc_log_set_level(int level);
 // Optional global operator overrides (usually provided in a separate file or
 // conditionally enabled). The sized-delete override forwards the size hint
 // to fast_free_sized() to avoid an extra header lookup.
+//
+// The full replacement set is mandatory: plain forms alone leave gaps that
+// turn into cross-allocator frees. `new (std::nothrow) T` would fall back to
+// libc while the plain `delete p` on the very same pointer routes here, and
+// C++17 over-aligned types (alignas(64), std::vector<alignas(32) T>) select
+// the align_val_t family. Every form below is therefore provided as a set:
+// plain, nothrow and (C++17) aligned new/delete plus the sized and nothrow
+// matching deallocation forms. Aligned forms support alignments up to
+// fast_aligned_alloc's documented maximum (4096); larger align_val_t values
+// throw std::bad_alloc (throwing forms) or return nullptr (nothrow forms).
 #ifdef FAST_ALLOC_OVERRIDE_NEW
 void* operator new(std::size_t size);
 void* operator new[](std::size_t size);
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept;
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept;
 void operator delete(void* ptr) noexcept;
 void operator delete[](void* ptr) noexcept;
 void operator delete(void* ptr, std::size_t size) noexcept;
 void operator delete[](void* ptr, std::size_t size) noexcept;
+void operator delete(void* ptr, const std::nothrow_t&) noexcept;
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept;
+#if defined(__cpp_aligned_new)
+void* operator new(std::size_t size, std::align_val_t alignment);
+void* operator new[](std::size_t size, std::align_val_t alignment);
+void* operator new(std::size_t size, std::align_val_t alignment,
+                   const std::nothrow_t&) noexcept;
+void* operator new[](std::size_t size, std::align_val_t alignment,
+                     const std::nothrow_t&) noexcept;
+void operator delete(void* ptr, std::align_val_t alignment) noexcept;
+void operator delete[](void* ptr, std::align_val_t alignment) noexcept;
+void operator delete(void* ptr, std::size_t size,
+                     std::align_val_t alignment) noexcept;
+void operator delete[](void* ptr, std::size_t size,
+                       std::align_val_t alignment) noexcept;
+#endif
 #endif

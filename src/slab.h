@@ -8,6 +8,20 @@ namespace FastAlloc {
 
 struct Slab;
 
+// FA-06: release-only live/free state stamps, carried in the canary dword.
+// The double-free guards used to compare only against the CURRENT freelist
+// head, so a second free of any non-head block silently built a freelist
+// cycle (A->B->A) or handed one block to two owners - the classic
+// allocator-exploitation primitive. Invariants: a block handed to a user is
+// stamped LIVE; freeing requires LIVE and stamps FREE; blocks in any free
+// container (TLS bin, MPSC pending queue, slab freelist, virgin) are FREE.
+// Debug builds keep the canary for underflow detection; the debug registry
+// catches double frees there.
+#if !FASTALLOC_DEBUG_ENABLED
+constexpr uint32_t kBlockLiveStamp = 0xF7EEF7EEu;
+constexpr uint32_t kBlockFreeStamp = 0x5BEE5BEEu;
+#endif
+
 /**
  * @brief Node for intrusive singly-linked free list
  *
@@ -19,11 +33,14 @@ struct Slab;
  *
  * DEBUG: 'canary' (formerly padding) holds a front canary written at
  * allocation time and validated at free time to catch buffer underflows.
+ * RELEASE: 'canary' carries the FA-06 live/free state stamp instead (see
+ * kBlockLiveStamp); it is never overwritten by user data, which starts at
+ * offset 16.
  */
 struct FreeBlock {
     Slab* slab;           // Always valid (never overwritten by user data)
     uint32_t class_index; // Store class index
-    uint32_t canary;      // DEBUG front canary; padding in release builds
+    uint32_t canary;      // DEBUG front canary; RELEASE live/free state stamp
     FreeBlock* next;      // Overwritten by user data when allocated!
 };
 
@@ -89,7 +106,11 @@ struct Slab {
                 reinterpret_cast<char*>(this) + first_block_offset + next_new * block_size);
             block->slab = this;
             block->class_index = class_idx;
+#if FASTALLOC_DEBUG_ENABLED
             block->canary = 0;
+#else
+            block->canary = kBlockFreeStamp;  // FA-06: enters free-container space
+#endif
             next_new++;
             free_blocks--;
             return block;

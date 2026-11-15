@@ -181,3 +181,32 @@ TEST(DebugAidsTest, DumpLeaksDoesNotCrash) {
     fast_alloc_dump_leaks(); // clean
     SUCCEED();
 }
+
+// FA-09 (audit finding 6): the aligned in-place shrink used to update the
+// stash but not the registry record, so current_live_bytes over-reported by
+// (old - new) until the block was freed. The registry is the source of truth
+// for live-bytes in debug builds, so the deltas must be exact - the test is
+// debug-only (release live-bytes are approximate by contract).
+#if FASTALLOC_DEBUG_ENABLED && !defined(_WIN32)
+TEST(DebugAidsTest, AlignedReallocShrinkUpdatesRegistry) {
+    fast_alloc_purge_thread_cache();
+    FastAllocStats t0 = fast_alloc_stats();
+
+    void* p = fast_aligned_alloc(64, 100 * 1024);
+    ASSERT_NE(p, nullptr);
+    FastAllocStats t1 = fast_alloc_stats();
+    EXPECT_EQ(t1.current_live_bytes - t0.current_live_bytes, 100u * 1024)
+        << "aligned allocation not counted at its logical size";
+
+    void* q = fast_realloc(p, 40 * 1024);  // in-place shrink, same alignment
+    ASSERT_EQ(q, p);
+    FastAllocStats t2 = fast_alloc_stats();
+    EXPECT_EQ(t2.current_live_bytes - t0.current_live_bytes, 40u * 1024)
+        << "aligned shrink did not update the registry size";
+
+    fast_free(q);
+    FastAllocStats t3 = fast_alloc_stats();
+    EXPECT_EQ(t3.current_live_bytes, t0.current_live_bytes)
+        << "aligned block free did not return live bytes to the baseline";
+}
+#endif // FASTALLOC_DEBUG_ENABLED && !_WIN32

@@ -101,11 +101,20 @@ int main() {
     // ---- T8: concurrent stats during churn ----
     {
         std::atomic<bool> stop{false};
-        std::atomic<long> bad{0};
         std::thread stats([&] {
+            // In-flight polling only exercises concurrent reads (crash/tear
+            // freedom). It must NOT gate on the aggregate value: release
+            // live counters are per-thread batched, and under
+            // FASTALLOC_OVERRIDE_NEW std::thread machinery itself allocates
+            // via FastAlloc across threads, so a freeing thread's flushed
+            // batch can legitimately outrun the allocating thread's
+            // unflushed one for the whole churn window. A GENUINE wrap -
+            // lost updates, torn aggregation - survives thread exit, and
+            // all batches flush at thread exit; the post-join reads below
+            // are therefore exact and are the real gate.
             while (!stop.load(std::memory_order_relaxed)) {
                 FastAllocStats s = fast_alloc_stats();
-                if (s.current_live_blocks > (1ull << 40)) ++bad; // wrapped?
+                (void)s;
             }
         });
         std::vector<std::thread> churn;
@@ -118,7 +127,15 @@ int main() {
         for (auto& th : churn) th.join();
         stop.store(true, std::memory_order_relaxed);
         stats.join();
-        CHECK(bad.load() == 0, "concurrent stats never wrapped");
+        // Every participant has exited (batches flushed at thread exit) and
+        // this call flushes this thread's own batch: the aggregate is now
+        // exact. A wrapped value here is real counter corruption.
+        long bad = 0;
+        for (int i = 0; i < 100; ++i) {
+            FastAllocStats s = fast_alloc_stats();
+            if (s.current_live_blocks > (1ull << 40)) ++bad;
+        }
+        CHECK(bad == 0, "concurrent stats never wrapped");
     }
     std::printf(failures ? "PROBE-FAILURES=%d\n" : "PROBE-DONE\n", failures);
     return failures ? 2 : 0;

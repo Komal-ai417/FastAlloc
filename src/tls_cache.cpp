@@ -138,6 +138,11 @@ CachePool& CachePoolInstance() {
 }
 
 // Park a retired cache in the pool or return to the OS.
+// flushed_ok == false is the shutdown path: the destructor was skipped
+// (other statics may be mid-teardown) and the raw storage is freed
+// directly. VirtualFree / munmap are exit-safe, and the pool is never used
+// - no thread will ever recycle a cache again (FA-09, audit finding 7:
+// the old comments claimed "never syscall" here while the code freed).
 void RecycleOrFreeCache(TLSCache* cache, bool flushed_ok) {
     if (flushed_ok) {
         CachePoolInstance().Push(cache);
@@ -164,7 +169,11 @@ static void WINAPI FlsCleanupCallback(PVOID ptr) {
         if (!process_exiting) {
             cache->~TLSCache(); // flush cached blocks back to the global heap
         } else {
-            flushed_ok = false;  // shutting down: leak the raw memory, never syscall
+            // Shutting down: skip the flush (statics may be mid-teardown);
+            // the storage is freed directly by RecycleOrFreeCache.
+            // VirtualFree is one of the exit-safe calls; the pool is never
+            // parked into (no thread will reuse a cache).
+            flushed_ok = false;
         }
         fast_path_cache = nullptr;
         stats::CountTlsDestroy();
@@ -192,7 +201,11 @@ void TLSCache::TlsDestructor(void* ptr) {
         if (!process_exiting) {
             cache->~TLSCache(); // flush cached blocks back to the global heap
         } else {
-            flushed_ok = false; // shutting down: park/leak, never munmap under a reaper
+            // Shutting down: skip the flush (statics may be mid-teardown);
+            // the storage is freed directly by RecycleOrFreeCache. Pthread
+            // key destructors run on the exiting thread itself, so the
+            // direct munmap carries no reaper hazard.
+            flushed_ok = false;
         }
         fast_path_cache = nullptr;
         stats::CountTlsDestroy();
@@ -410,6 +423,9 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     bins_[class_index].head = rest;
     bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
 
+#if !FASTALLOC_DEBUG_ENABLED
+    block->canary = kBlockLiveStamp;  // FA-06: direct user handoff
+#endif
     return block;
 }
 
@@ -558,11 +574,27 @@ std::size_t AuditCurrentThreadCache(const void* lo, const void* hi) {
     std::size_t hits = TLSCache::GetFast().AuditPointers(lo, hi);
     // The cross-thread recycling pool: retired TLSCache objects. A pool slot
     // pointing into the audited range means a recycled cache was corrupted.
+    // FA-08 (audit finding 10d): snapshot the slots under the pool lock -
+    // Push/Pop write slots[] under it, and an unlocked read can see torn or
+    // stale slots (benign for diagnostics, but racy and TSan-visible).
     CachePool& pool = CachePoolInstance();
-    std::size_t n = pool.count.load(std::memory_order_relaxed);
-    if (n > kCachePoolCap) n = kCachePoolCap;
+    TLSCache* snapshot[kCachePoolCap];
+    std::size_t n = 0;
+    {
+        int spins = 0;
+        while (pool.lock.test_and_set(std::memory_order_acquire)) {
+            if (++spins > 64) { std::this_thread::yield(); spins = 0; }
+            else FAST_CPU_PAUSE();
+        }
+        n = pool.count.load(std::memory_order_relaxed);
+        if (n > kCachePoolCap) n = kCachePoolCap;
+        for (std::size_t i = 0; i < n; ++i) snapshot[i] = pool.slots[i];
+        pool.lock.clear(std::memory_order_release);
+    }
+    // Report outside the lock: the audit prints to stderr, and holding the
+    // pool spinlock across I/O would serialize thread churn against it.
     for (std::size_t i = 0; i < n; ++i) {
-        TLSCache* c = pool.slots[i];
+        TLSCache* c = snapshot[i];
         if (reinterpret_cast<std::uintptr_t>(c) >=
                 reinterpret_cast<std::uintptr_t>(lo) &&
             reinterpret_cast<std::uintptr_t>(c) <

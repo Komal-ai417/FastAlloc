@@ -102,11 +102,6 @@ inline void ReportWildReturnValue(void* ptr) {
     }
 }
 
-inline std::size_t PageRoundUp(std::size_t n) {
-    std::size_t page = EffectivePageSize();
-    return (n + page - 1) & ~(page - 1);
-}
-
 // Overflow-safe page rounding for request sizing. Returns false when
 // 'n + header + page slack' cannot be represented; callers must then fail
 // the request (nullptr) instead of wrapping to an invalid span.
@@ -419,15 +414,32 @@ void fast_free(void* ptr) {
     if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(slab_field) == ALIGN_MAGIC)) {
         // Over-aligned block: recover the raw pointer from the stash and
         // recurse. The stash also lets realloc recover the original size.
+        // The stash is user-writable, so revalidate before recursing
+        // (audit FA-05): alignment must be a supported power of two and
+        // raw must round-trip (round_up(raw + 32, alignment) == ptr).
+        // Without the round-trip, a forged raw converts an adjacent-buffer
+        // overflow into a constrained invalid-free primitive.
+        std::size_t alignment = *reinterpret_cast<std::size_t*>(
+            static_cast<char*>(ptr) - 32);
         void* raw = *reinterpret_cast<void**>(static_cast<char*>(ptr) - 24);
+        bool stash_ok = alignment >= ALIGNMENT && alignment <= 4096 &&
+                        (alignment & (alignment - 1)) == 0;
+        if (FAST_LIKELY(stash_ok)) {
+            char* expect = reinterpret_cast<char*>(
+                (reinterpret_cast<std::uintptr_t>(raw) + 32 + alignment - 1) &
+                ~(alignment - 1));
+            stash_ok = expect == static_cast<char*>(ptr);
+        }
+        if (FAST_UNLIKELY(!stash_ok)) {
+            ReportCorruptLargeHeader(ptr, alignment);
+            return;  // drop (leak) rather than free a forged raw
+        }
 #if FASTALLOC_DEBUG_ENABLED
         {
             // The registry tracks the ALIGNED pointer; rebuild the raw
             // pointer's record so fast_free(raw) validates normally.
             AllocRecord rec{};
             if (AllocRegistry::GetInstance().Erase(ptr, &rec)) {
-                std::size_t alignment = *reinterpret_cast<std::size_t*>(
-                    static_cast<char*>(ptr) - 32);
                 rec.ptr = raw;
                 rec.size = rec.size + alignment + 32;
                 AllocRegistry::GetInstance().Insert(rec, nullptr);
@@ -557,14 +569,70 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 
     // ---- Over-aligned blocks ------------------------------------------------
     if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(slab_field) == ALIGN_MAGIC)) {
+        // Stash (written by fast_aligned_alloc): [alignment][raw][MAGIC][size]
+        // at ptr-32/-24/-16/-8. The stash lives in user-writable memory, so
+        // every field is revalidated before use (audit FA-05):
+        //   1. alignment: power of two within the supported range.
+        //   2. old_size: at most what fast_aligned_alloc could have stashed
+        //      (raw_size = size + alignment + 32 must not have overflowed)
+        //      AND at most the raw block's real capacity (old_size + 32 <=
+        //      usable(raw)) so a forged size cannot make the grow-copy read
+        //      past the span. NOTE: this replaces a former 'old_size > 1 GiB'
+        //      cap that misread every legitimate aligned block above 1 GiB
+        //      as header corruption.
+        //   3. raw: round-trips - round_up(raw + 32, alignment) == ptr - so
+        //      a forged raw cannot aim the recursive fast_free at an
+        //      unrelated block.
         std::size_t alignment = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 32);
+        void* raw = *reinterpret_cast<void**>(static_cast<char*>(ptr) - 24);
         std::size_t old_size = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 8);
-        // Validate alignment and size fields recovered from stash.
-        if (FAST_UNLIKELY(alignment < ALIGNMENT || alignment > 4096 ||
-                          (alignment & (alignment - 1)) != 0 ||
-                          old_size > (1ull << 30))) {
+        bool stash_ok = alignment >= ALIGNMENT && alignment <= 4096 &&
+                        (alignment & (alignment - 1)) == 0 &&
+                        old_size <=
+                            (std::numeric_limits<std::size_t>::max)() -
+                                alignment - 32;
+        if (FAST_LIKELY(stash_ok)) {
+            // A round-trip-passing raw always lies inside this allocation's
+            // own span, so reading the raw block's header below is safe.
+            char* expect = reinterpret_cast<char*>(
+                (reinterpret_cast<std::uintptr_t>(raw) + 32 + alignment - 1) &
+                ~(alignment - 1));
+            stash_ok = expect == static_cast<char*>(ptr);
+        }
+        if (FAST_LIKELY(stash_ok)) {
+            // Capacity cross-check against the raw block's true size.
+            // NOTE (FA-09): large blocks are discriminated by a nullptr
+            // 'slab' field in release but by debug::LARGE_MAGIC in DEBUG
+            // builds - without the magic check, every legitimately-large
+            // aligned block failed this cross-check under FASTALLOC_DEBUG.
+            FreeBlock* raw_block = reinterpret_cast<FreeBlock*>(
+                static_cast<char*>(raw) - USER_OFFSET);
+            void* raw_slab = raw_block->slab;
+            bool raw_is_large = (raw_slab == nullptr);
+#if FASTALLOC_DEBUG_ENABLED
+            if (reinterpret_cast<std::uintptr_t>(raw_slab) == debug::LARGE_MAGIC) {
+                raw_is_large = true;
+            }
+#endif
+            if (raw_is_large) {
+                LargeAllocHeader* raw_header = reinterpret_cast<LargeAllocHeader*>(
+                    static_cast<char*>(raw) - sizeof(LargeAllocHeader));
+                if (FAST_UNLIKELY(!LargeHeaderSizePlausible(raw_header->alloc_size))) {
+                    stash_ok = false;  // forged raw: not a real block start
+                } else {
+                    stash_ok = old_size + 32 <=
+                               raw_header->alloc_size - sizeof(LargeAllocHeader);
+                }
+            } else if (FAST_UNLIKELY(static_cast<std::size_t>(
+                           raw_block->class_index) >= NUM_SIZE_CLASSES)) {
+                stash_ok = false;      // forged raw: not a real block start
+            } else {
+                stash_ok = old_size + 32 <= UsableSize(raw_block->class_index);
+            }
+        }
+        if (FAST_UNLIKELY(!stash_ok)) {
             ReportCorruptLargeHeader(ptr, old_size);
             errno = EINVAL;
             return nullptr;
@@ -573,6 +641,32 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // Keep alignment; record the new logical size in the stash so a
             // later grow-copy moves exactly the live bytes.
             *reinterpret_cast<std::size_t*>(static_cast<char*>(ptr) - 8) = new_size;
+#if FASTALLOC_DEBUG_ENABLED
+            // FA-09 (audit finding 6): the registry record must track the
+            // new logical size exactly like the small/large in-place paths
+            // do; without this, current_live_bytes over-reported by
+            // (old_size - new_size) until the block was freed. The rear
+            // red zone must be repainted for the same reason: the aligned
+            // free path reconstructs the RAW record at
+            // rec.size + alignment + 32 and validates the zone from there
+            // to the raw span end - originally painted for the OLD size,
+            // that region now contains live shrunken-payload bytes.
+            {
+                AllocRecord rec{};
+                if (AllocRegistry::GetInstance().Erase(ptr, &rec)) {
+                    rec.size = new_size;
+                    AllocRegistry::GetInstance().Insert(rec, nullptr);
+                    void* raw = *reinterpret_cast<void**>(
+                        static_cast<char*>(ptr) - 24);
+                    std::size_t zone_begin_offset = new_size + alignment + 32;
+                    if (rec.usable > zone_begin_offset) {
+                        debug_check::FillRearRedZone(
+                            static_cast<char*>(raw) + zone_begin_offset,
+                            rec.usable - zone_begin_offset);
+                    }
+                }
+            }
+#endif
             return ptr;
         }
         void* new_ptr = fast_aligned_alloc(alignment, new_size);
@@ -599,6 +693,27 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         }
         old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
+        // FA-08 (audit finding 6): fast_free validates class_index before
+        // indexing the size tables; this path did not, so a corrupted header
+        // made UsableSize read past the table and use garbage as the
+        // shrink/copy bound. Same guard, same contract: reject, never read.
+        // DEBUG keeps its fatal-by-design contract (registry machinery).
+        if (FAST_UNLIKELY(static_cast<std::size_t>(block->class_index) >=
+                          NUM_SIZE_CLASSES)) {
+#if FASTALLOC_DEBUG_ENABLED
+            ViolationInfo info{};
+            info.kind = Violation::InternalInvariant;
+            info.ptr = ptr;
+            info.where = "fast_realloc: block header class_index out of "
+                         "range (corrupt header)";
+            info.caller = FAST_RETURN_ADDRESS();
+            ReportViolation(info);
+#else
+            ReportCorruptClassIndex(ptr, block->class_index);
+            errno = EINVAL;
+            return nullptr;
+#endif
+        }
         old_size = UsableSize(block->class_index);
     }
 
@@ -725,10 +840,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             return nullptr;
         }
         if (needed > header->alloc_size) {
-            // Capture BEFORE mremap: on success 'header' may be unmapped
-            // (MREMAP_MAYMOVE) or alias the new header.
-            const std::size_t old_span = header->alloc_size;
 #if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
+            // Capture BEFORE mremap: on success 'header' may be unmapped
+            // (MREMAP_MAYMOVE) or alias the new header. The capture lives
+            // INSIDE the linux guard: hoisting it out leaves the variable
+            // unused on Windows/WINVA builds, which -Werror turns into a
+            // build break (the red CI jobs at a6fe85f).
+            const std::size_t old_span = header->alloc_size;
             // Pooled spans skip mremap growth: the kernel could grow the
             // mapping in place into bump space the pool will hand out again
             // later (overlap hazard), or move it (leaving a hole in the
@@ -914,16 +1032,55 @@ void fast_alloc_log_set_level(int level) {
 // ===========================================================================
 // Optional global operator overrides
 // ===========================================================================
+// The family is replaced as a COMPLETE SET. Partial replacement is a silent
+// cross-allocator corruption bug: with only the plain forms, `new (std::
+// nothrow) T` allocates from libc while the plain `delete p` on the same
+// pointer routes the foreign pointer into fast_free (audit 2026-11, finding
+// FA-04), and C++17 over-aligned types select the align_val_t family.
 #ifdef FAST_ALLOC_OVERRIDE_NEW
+namespace {
+
+// Standard-conformant OOM protocol for the throwing forms ([basic.stc.
+// dynamic]): attempt, then loop { run the installed new_handler, retry }
+// until success or no handler remains. A handler that throws propagates out
+// of operator new as required. The nothrow forms make a single attempt and
+// return nullptr instead (documented choice: running a throwing handler
+// from a noexcept deallocation context is the caller's job, not ours).
+void* NewRetryMalloc(std::size_t size) {
+    if (void* p = FastAlloc::fast_malloc(size)) return p;
+    for (;;) {
+        std::new_handler h = std::get_new_handler();
+        if (!h) return nullptr;
+        h();
+        if (void* p = FastAlloc::fast_malloc(size)) return p;
+    }
+}
+
+void* NewRetryAlignedMalloc(std::size_t alignment, std::size_t size) {
+    if (void* p = FastAlloc::fast_aligned_alloc(alignment, size)) return p;
+    for (;;) {
+        std::new_handler h = std::get_new_handler();
+        if (!h) return nullptr;
+        h();
+        if (void* p = FastAlloc::fast_aligned_alloc(alignment, size)) return p;
+    }
+}
+
+} // namespace
+
 void* operator new(std::size_t size) {
-    void* ptr = FastAlloc::fast_malloc(size);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    if (void* p = NewRetryMalloc(size)) return p;
+    throw std::bad_alloc();
 }
 void* operator new[](std::size_t size) {
-    void* ptr = FastAlloc::fast_malloc(size);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    if (void* p = NewRetryMalloc(size)) return p;
+    throw std::bad_alloc();
+}
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    return FastAlloc::fast_malloc(size);
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    return FastAlloc::fast_malloc(size);
 }
 void operator delete(void* ptr) noexcept {
     FastAlloc::fast_free(ptr);
@@ -938,4 +1095,53 @@ void operator delete(void* ptr, std::size_t size) noexcept {
 void operator delete[](void* ptr, std::size_t size) noexcept {
     FastAlloc::fast_free_sized(ptr, size);
 }
+void operator delete(void* ptr, const std::nothrow_t&) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+#if defined(__cpp_aligned_new)
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    if (void* p = NewRetryAlignedMalloc(static_cast<std::size_t>(alignment),
+                                        size)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+    if (void* p = NewRetryAlignedMalloc(static_cast<std::size_t>(alignment),
+                                        size)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void* operator new(std::size_t size, std::align_val_t alignment,
+                   const std::nothrow_t&) noexcept {
+    return FastAlloc::fast_aligned_alloc(static_cast<std::size_t>(alignment),
+                                         size);
+}
+void* operator new[](std::size_t size, std::align_val_t alignment,
+                     const std::nothrow_t&) noexcept {
+    return FastAlloc::fast_aligned_alloc(static_cast<std::size_t>(alignment),
+                                         size);
+}
+// Aligned deallocation: fast_free discriminates aligned blocks via the
+// ALIGN_MAGIC stash, so no alignment dispatch is needed on this side; the
+// sized forms forward the hint exactly like the plain sized deletes.
+void operator delete(void* ptr, std::align_val_t) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete[](void* ptr, std::align_val_t) noexcept {
+    FastAlloc::fast_free(ptr);
+}
+void operator delete(void* ptr, std::size_t size,
+                     std::align_val_t) noexcept {
+    FastAlloc::fast_free_sized(ptr, size);
+}
+void operator delete[](void* ptr, std::size_t size,
+                       std::align_val_t) noexcept {
+    FastAlloc::fast_free_sized(ptr, size);
+}
+#endif
 #endif

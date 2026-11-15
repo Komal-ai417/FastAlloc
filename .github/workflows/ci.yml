@@ -11,9 +11,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build & run ALL unit tests: release + debug-instrumented, Linux + Windows.
   # The single gtest binary (fast_alloc_tests) registers every test case via
-  # ctest, so "Test" below runs the full suite (~79 cases Release / ~90 with
+  # ctest, so "Test" below runs the full suite (~79 cases Release / ~91 with
   # FASTALLOC_DEBUG=ON) on every platform/compiler combination. On Linux,
-  # ctest also runs the audit suite (fast_alloc_audit_tests, 49 cases,
+  # ctest also runs the audit suite (fast_alloc_audit_tests, 54 cases,
   # registered in release configs) AND the adversarial audit probes
   # (scripts/, 11 ctest entries incl. the FA-01/02/03 reproducers; see the
   # probe loop in CMakeLists.txt). The env-tunable fork/exec cases skip
@@ -58,6 +58,34 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
                 -DFASTALLOC_BUILD_TESTS=ON `
                 -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Global operator new/delete override (FA-04): FASTALLOC_OVERRIDE_NEW=ON
+  # replaces the classic, nothrow AND C++17 align_val_t families as a
+  # complete set. This job compiles the WHOLE program - gtest included -
+  # against the overrides, so the run doubles as a drop-in stress test,
+  # and tests/test_override_new.cpp pins the routing of every family
+  # (plain, nothrow, aligned, vector<alignas(32) T>) plus the regression
+  # case: nothrow-new + plain-delete used to be a cross-allocator free
+  # (libc allocation freed through FastAlloc).
+  # ---------------------------------------------------------------------------
+  override-new-test:
+    name: ubuntu-latest-override-new
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_OVERRIDE_NEW=ON
 
       - name: Build
         run: cmake --build build --config Release -j

@@ -149,6 +149,7 @@ if(FASTALLOC_BUILD_TESTS)
         tests/test_stress.cpp
         tests/test_env_tunables.cpp
         tests/test_stats_balance.cpp
+        tests/test_override_new.cpp
     )
     target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
     target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
@@ -157,7 +158,7 @@ if(FASTALLOC_BUILD_TESTS)
     include(CTest)
     add_test(NAME fast_alloc_validate_tests COMMAND fast_alloc_tests)
 
-    # Audit test suite (49 gtest cases: functional, property, differential,
+    # Audit test suite (54 gtest cases: functional, property, differential,
     # concurrency, slab/OOM/fragmentation). Requires GTest, so it lives inside
     # the FASTALLOC_BUILD_TESTS block.
     add_subdirectory(tests/audit)

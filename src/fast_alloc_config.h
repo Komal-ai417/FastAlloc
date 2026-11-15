@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <array>
 
 // ============================================================================
@@ -107,16 +109,46 @@ constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 // Memory below 64 KB is reserved or unmapped across supported operating systems.
 constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
 
-// Upper canonical address bound for 48-bit user virtual address space.
-constexpr std::uintptr_t kMaxCanonicalUserPtr = 0x0000800000000000ull;
+// Upper canonical address bound for user-space pointers, detected once at
+// first use (audit FA-07): a hard-coded 2^47 ceiling rejected every pointer
+// an LA57 (5-level paging) host can return once the lower half of the
+// address space fills - the allocation exit gate leaked the block, fast_free
+// dropped the pointer, freelist walks severed tails. On 4-level x86-64 and
+// all other supported platforms the bound stays 2^47; the Windows user VA is
+// below 2^47 regardless. The WINVA emulation keeps the 2^47 contract its
+// reservations are built around.
+inline std::uintptr_t DetectMaxUserPtr() {
+#if defined(__x86_64__) && defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
+    // /proc/cpuinfo 'flags' line carries la57 on 5-level-capable CPUs.
+    if (std::FILE* f = std::fopen("/proc/cpuinfo", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f)) {
+            if (line[0] == 'f' && line[1] == 'l' && line[2] == 'a' &&
+                line[3] == 'g' && line[4] == 's' &&
+                (line[5] == '\t' || line[5] == ' ' || line[5] == ':')) {
+                const bool la57 = std::strstr(line, " la57") != nullptr;
+                std::fclose(f);
+                return la57 ? (1ull << 56) : (1ull << 47);
+            }
+        }
+        std::fclose(f);
+    }
+#endif
+    return 1ull << 47;  // 48-bit VA user-space bound
+}
+
+inline std::uintptr_t MaxCanonicalUserPtr() {
+    static const std::uintptr_t kCeiling = DetectMaxUserPtr();
+    return kCeiling;
+}
 
 // Validates whether a pointer is plausible for a FastAlloc allocation:
 //   - >= 64 KB (avoids null page and small-integer values)
-//   - < 2^47 (canonical user-space address)
+//   - < user VA ceiling (2^47, or 2^56 on LA57 hosts; runtime-detected)
 //   - 16-byte aligned (all FastAlloc blocks maintain 16-byte alignment)
 inline bool IsPlausibleHeapPtr(const void* p) {
     const std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
-    return v >= kMinCanonicalUserPtr && v < kMaxCanonicalUserPtr &&
+    return v >= kMinCanonicalUserPtr && v < MaxCanonicalUserPtr() &&
            (v & (std::uintptr_t)0xF) == 0;
 }
 
