@@ -182,11 +182,12 @@ TEST(DebugAidsTest, DumpLeaksDoesNotCrash) {
     SUCCEED();
 }
 
-// FA-09 (audit finding 6): the aligned in-place shrink used to update the
-// stash but not the registry record, so current_live_bytes over-reported by
-// (old - new) until the block was freed. The registry is the source of truth
-// for live-bytes in debug builds, so the deltas must be exact - the test is
-// debug-only (release live-bytes are approximate by contract).
+// Regression guard: the aligned in-place shrink must update BOTH the stash
+// and the registry record - skipping the registry over-reports
+// current_live_bytes by (old - new) until the block is freed. The registry
+// is the source of truth for live-bytes in debug builds, so the deltas
+// must be exact - the test is debug-only (release live-bytes are
+// approximate by contract).
 #if FASTALLOC_DEBUG_ENABLED && !defined(_WIN32)
 TEST(DebugAidsTest, AlignedReallocShrinkUpdatesRegistry) {
     fast_alloc_purge_thread_cache();

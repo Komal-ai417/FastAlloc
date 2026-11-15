@@ -5,7 +5,7 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
   [![C++17](https://img.shields.io/badge/C++-17-blue.svg)]()
   [![Platform: Windows | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgray.svg)]()
-  [![CI: passing](https://img.shields.io/badge/CI-all%2016%20jobs%20green-brightgreen.svg)](.github/workflows/ci.yml)
+  [![CI](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF.svg)](.github/workflows/ci.yml)
 </div>
 
 <br>
@@ -22,7 +22,7 @@ FastAlloc is engineered for extreme multi-core scalability:
 - **Adaptive Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects use 64KB slabs, while larger objects scale up to 128KB (and up to 2MB dynamically). This balances throughput with memory efficiency, saving massive amounts of virtual memory versus fixed-density slabs.
 - **Lock-Free Memory Handoff:** Returning memory to other arenas is handled via isolated, lock-free MPSC (Multi-Producer, Single-Consumer) pending queues (`std::atomic::compare_exchange_weak`), eliminating O(N²) lock contention when threads deallocate cross-thread.
 - **Aggressive Memory Unmapping:** FastAlloc returns empty slabs to the OS aggressively (page-span cache with capped retention), keeping the footprint often smaller than the system `malloc` — measured 16 MB retained after purging a 1M-object workload vs 46.7 / 171.8 / 552.2 MB for glibc / jemalloc / mimalloc.
-- **Out-of-Lock Fresh Allocation:** fresh OS mappings (`VirtualAlloc` / `mmap`) for new slabs and large spans are made outside every spinlock, so slow page mapping on the growth path never blocks other threads. Known trade-off (audit 2026-11, documented in `docs/technical_design.md`): page-cache insertions and the release of fully-emptied slabs run under the short per-bin / per-class arena locks — bounded, syscall-only work; deferring span release out of the locks is tracked as future work.
+- **Out-of-Lock Fresh Allocation:** fresh OS mappings (`VirtualAlloc` / `mmap`) for new slabs and large spans are made outside every spinlock, so slow page mapping on the growth path never blocks other threads. Known trade-off (documented in `docs/technical_design.md`): page-cache insertions and the release of fully-emptied slabs run under the short per-bin / per-class arena locks — bounded, syscall-only work; deferring span release out of the locks is tracked as future work.
 - **Exponential Spinlock Backoff:** Global stripe locks implement hardware-aware backoff (using `_mm_pause()` / `__builtin_ia32_pause()`) and `std::this_thread::yield()`, drastically improving stability under extreme contention.
 - **Memory-Safety Instrumentation (`FASTALLOC_DEBUG`):** front canaries, rear red zones, freed-block poisoning (use-after-free detection), slab/large-header magic validation, an exact allocation registry with double-free/invalid-free detection, leak reporting, a full statistics API and level-gated logging — all compiled out in release builds.
 - **Deterministic OOM Behaviour:** allocation failure returns `nullptr` cleanly; the allocator stays usable (verified by an OOM-injection test seam).
@@ -187,7 +187,7 @@ cd benchmarks/benchsuite && bash ./run_matrix.sh ../../benchmarks/results/cross_
 python3 analyze.py ../../benchmarks/results/cross_allocator_results.jsonl
 ```
 
-*Note (honest, re-measured 2026-09-10 on a 2-vCPU VM vs glibc 2.41 /
+*Note (honest, re-measured on a 2-vCPU VM vs glibc 2.41 /
 jemalloc 5.3.0 / mimalloc 2.1.7, median of 5, one allocator per process):*
 FastAlloc **wins 20/33 throughput cells vs glibc, 21/33 vs jemalloc and
 12/33 vs mimalloc**. It is fastest in every small-block pair workload at
@@ -233,11 +233,11 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 | Linux LeakSanitizer | 79 | zero leaks |
 | Linux audit probes (`scripts/`, 11 ctest entries; filter with `ctest -R fast_alloc_probe`) | 11 | all pass (run by every POSIX ctest job: build-test Linux, sanitizers, leaks, WINVA-emulation) |
 | Windows/MSVC Release | 75 | all pass |
-| Windows/MinGW UCRT64 Release (GCC 16.2, 2026-10-15) | 75 | **74 pass, 1 platform-skip** (`ReallocFailurePreservesOriginal` — OOM injection path differs on Windows) |
-| Windows/MinGW UCRT64 audit suite (2026-10-15) | 49 | **48 pass, 1 platform-skip** (`EmptySlabReturnedToOs` — `/proc/self/status` unavailable on Windows) |
+| Windows/MinGW UCRT64 Release (GCC 16.2) | 75 | **74 pass, 1 platform-skip** (`ReallocFailurePreservesOriginal` — OOM injection path differs on Windows) |
+| Windows/MinGW UCRT64 audit suite | 49 | **48 pass, 1 platform-skip** (`EmptySlabReturnedToOs` — `/proc/self/status` unavailable on Windows) |
 | Benchmark checksums (132 suite cells + 92 gbench configs) | — | zero failures |
 
-CI (all 16 jobs green on every push): ubuntu/windows × release/debug +
+CI runs on every push: ubuntu/windows × release/debug +
 clang builds, windows-msvc-asan (3x repeat), ASan+UBSan, TSan, LSan,
 Windows-VA emulation, and both benchmark jobs that execute *every*
 benchmark binary — see `docs/qa_report.md` §4 for the job table.

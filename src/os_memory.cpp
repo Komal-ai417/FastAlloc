@@ -1,5 +1,6 @@
 #include <new>
 #include "os_memory.h"
+#include "tsan_bridge.h"
 
 // ============================================================================
 // Platform model
@@ -121,10 +122,10 @@ public:
         std::lock_guard<std::mutex> guard(mu_);
         auto it = FindRegion(static_cast<char*>(ptr), size);
         if (it == regions_.end()) {
-            // FA-08 (audit finding 10g): an unknown span used to return
-            // silently - a silent VA leak with no diagnostic trail. Log
-            // once; the release attempt is still dropped (there is nothing
-            // safe to do with an untracked span).
+            // An unknown span must not be dropped silently - that is a VA
+            // leak with no diagnostic trail. Log once; the release attempt
+            // is still dropped (there is nothing safe to do with an
+            // untracked span).
             static std::atomic<bool> reported{false};
             if (!reported.exchange(true, std::memory_order_relaxed)) {
                 std::fprintf(stderr,
@@ -159,9 +160,8 @@ public:
         std::lock_guard<std::mutex> guard(mu_);
         auto it = FindRegion(static_cast<char*>(ptr), size);
         if (it == regions_.end()) {
-            // FA-08 (audit finding 10g): same log-once treatment as
-            // ReleaseSpan - silent VA bookkeeping divergence is invisible
-            // without a diagnostic.
+            // Same log-once treatment as ReleaseSpan - silent VA
+            // bookkeeping divergence is invisible without a diagnostic.
             static std::atomic<bool> reported{false};
             if (!reported.exchange(true, std::memory_order_relaxed)) {
                 std::fprintf(stderr,
@@ -373,7 +373,11 @@ void* OSMemory::AllocatePages(std::size_t size) {
 #if defined(_WIN32) || FASTALLOC_WINVA
     // One fresh, tracked reservation per allocation.
     void* ptr = WinOps::Reserve(size);
-    if (ptr) WinRegistry().Add(ptr, size);
+    if (ptr) {
+        WinRegistry().Add(ptr, size);
+        // Fresh VA arrived from the kernel (mmap / VirtualAlloc).
+        tsan_bridge::AcquireOnVaArrival();
+    }
     return ptr;
 #else
 #if !defined(_WIN32) && defined(__linux__) && !FASTALLOC_WINVA
@@ -387,6 +391,8 @@ void* OSMemory::AllocatePages(std::size_t size) {
     if (ptr == MAP_FAILED) {
         return nullptr;
     }
+    // Fresh VA arrived from the kernel.
+    tsan_bridge::AcquireOnVaArrival();
     return ptr;
 #endif
 }
@@ -398,6 +404,9 @@ void OSMemory::FreePages(void* ptr, std::size_t size) {
     // MEM_RELEASE the whole reservation only when its last live span is
     // gone. A blind VirtualFree(ptr, 0, MEM_RELEASE) here either leaks
     // interior sub-spans or wipes still-cached split tails (0xC0000005).
+    // The release path may munmap the reservation back to the
+    // kernel, which is free to re-issue that VA to any thread.
+    tsan_bridge::ReleaseOnVaReturn();
     WinRegistry().ReleaseSpan(ptr, size);
 #else
 #if !defined(_WIN32) && defined(__linux__) && !FASTALLOC_WINVA
@@ -409,6 +418,9 @@ void OSMemory::FreePages(void* ptr, std::size_t size) {
         return;
     }
 #endif
+    // The VA returns to the kernel; it may be re-issued to any
+    // thread via a later mmap/mremap.
+    tsan_bridge::ReleaseOnVaReturn();
     munmap(ptr, size);
 #endif
 }

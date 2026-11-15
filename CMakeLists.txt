@@ -208,10 +208,20 @@ if(FASTALLOC_BUILD_TESTS)
         endforeach()
     endif()
 
+    # Umbrella for every binary ctest may invoke (both gtest suites plus all
+    # probes). CI jobs that build explicit targets instead of `all` MUST build
+    # this: ctest runs every registered test, and a registered test whose
+    # binary was not built shows up as "Not Run" and fails the job (exactly
+    # what bit the va-emulation job when it listed only the two suites).
+    add_custom_target(fast_alloc_test_binaries
+        DEPENDS fast_alloc_tests fast_alloc_audit_tests ${FASTALLOC_PROBE_TARGETS}
+        COMMENT "Building every ctest-invoked binary"
+    )
+
     # Convenience targets for the common verification matrix
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        DEPENDS fast_alloc_tests fast_alloc_audit_tests ${FASTALLOC_PROBE_TARGETS}
+        DEPENDS fast_alloc_test_binaries
         COMMENT "Running FastAlloc test suite"
     )
 endif()

@@ -8,10 +8,10 @@ namespace FastAlloc {
 
 struct Slab;
 
-// FA-06: release-only live/free state stamps, carried in the canary dword.
-// The double-free guards used to compare only against the CURRENT freelist
-// head, so a second free of any non-head block silently built a freelist
-// cycle (A->B->A) or handed one block to two owners - the classic
+// Release-only live/free state stamps, carried in the canary dword.
+// Comparing double frees against only the CURRENT freelist head lets a
+// second free of any non-head block silently build a freelist cycle
+// (A->B->A) or hand one block to two owners - the classic
 // allocator-exploitation primitive. Invariants: a block handed to a user is
 // stamped LIVE; freeing requires LIVE and stamps FREE; blocks in any free
 // container (TLS bin, MPSC pending queue, slab freelist, virgin) are FREE.
@@ -33,7 +33,7 @@ constexpr uint32_t kBlockFreeStamp = 0x5BEE5BEEu;
  *
  * DEBUG: 'canary' (formerly padding) holds a front canary written at
  * allocation time and validated at free time to catch buffer underflows.
- * RELEASE: 'canary' carries the FA-06 live/free state stamp instead (see
+ * RELEASE: 'canary' carries the live/free state stamp instead (see
  * kBlockLiveStamp); it is never overwritten by user data, which starts at
  * offset 16.
  */
@@ -109,7 +109,7 @@ struct Slab {
 #if FASTALLOC_DEBUG_ENABLED
             block->canary = 0;
 #else
-            block->canary = kBlockFreeStamp;  // FA-06: enters free-container space
+            block->canary = kBlockFreeStamp;  // enters free-container space
 #endif
             next_new++;
             free_blocks--;

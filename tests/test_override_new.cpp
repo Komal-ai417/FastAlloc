@@ -1,5 +1,5 @@
 // ============================================================================
-// Global operator new/delete override tests (FA-04).
+// Global operator new/delete override tests.
 //
 // Built unconditionally; the case bodies exist only when the program is
 // compiled with FASTALLOC_OVERRIDE_NEW (the dedicated CI job configures with
@@ -64,8 +64,9 @@ TEST(OverrideNew, PlainNewDeleteRoutesThroughFastAlloc) {
 }
 
 TEST(OverrideNew, NothrowNewPlusPlainDeleteIsConsistent) {
-    // THE regression case for FA-04: nothrow new used to fall back to libc
-    // while plain delete routed into FastAlloc - a cross-allocator free.
+    // THE regression case: nothrow new must allocate through FastAlloc -
+    // falling back to libc while plain delete routes into FastAlloc is a
+    // cross-allocator free.
     const std::size_t before = AllocCount();
     CacheLine* p = new (std::nothrow) CacheLine;
     ASSERT_NE(p, nullptr);
