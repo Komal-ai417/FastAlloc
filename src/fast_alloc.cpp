@@ -4,7 +4,6 @@
 #include "fast_alloc_config.h"
 #include "os_memory.h"
 #include "debug_aid.h"
-#include "tsan_bridge.h"
 
 #include <cstring>
 #include <cerrno>
@@ -792,9 +791,6 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             if (OSMemory::IsPoolBacked(base)) { debug_keep(); return ptr; } // pooled: keep span
             // mremap shrink: releases the tail pages, never moves the base.
             std::size_t released = header->alloc_size - needed;
-            // The tail range returns to the kernel (partial unmap);
-            // it may be re-issued to any thread later.
-            tsan_bridge::ReleaseOnVaReturn();
             void* shrunk = mremap(base, header->alloc_size, needed, 0);
             if (shrunk == MAP_FAILED) { debug_keep(); return ptr; } // keep the old span
             // shrunk == base for non-MAYMOVE calls.
@@ -860,18 +856,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // chunk). The copy path is safe for both; spans > 2 MB are never
             // pooled and keep the zero-copy fast path.
             if (!OSMemory::IsPoolBacked(reinterpret_cast<char*>(header))) {
-                // A MAYMOVE mremap returns the old range to the
-                // kernel (it may be re-issued) and delivers a fresh one.
                 // The old-size argument is the pre-captured 'old_span', NOT
-                // a re-read of header->alloc_size: the header lives in the
-                // range being returned, so a read after the release edge
-                // would be orphaned for TSan (the move consumes the old
-                // range; no later release on this thread can cover it).
-                tsan_bridge::ReleaseOnVaReturn();
+                // a re-read of header->alloc_size: a successful MAYMOVE
+                // unmaps the old range, so the old header is gone once the
+                // call returns and must not be read again.
                 void* grown = mremap(reinterpret_cast<char*>(header), old_span,
                                      needed, MREMAP_MAYMOVE);
                 if (grown != MAP_FAILED) {
-                    tsan_bridge::AcquireOnVaArrival();
                     LargeAllocHeader* new_header = static_cast<LargeAllocHeader*>(grown);
                     void* new_ptr = reinterpret_cast<char*>(new_header) + sizeof(LargeAllocHeader);
                     new_header->alloc_size = needed;

@@ -1,6 +1,5 @@
 #include <new>
 #include "os_memory.h"
-#include "tsan_bridge.h"
 
 // ============================================================================
 // Platform model
@@ -375,8 +374,6 @@ void* OSMemory::AllocatePages(std::size_t size) {
     void* ptr = WinOps::Reserve(size);
     if (ptr) {
         WinRegistry().Add(ptr, size);
-        // Fresh VA arrived from the kernel (mmap / VirtualAlloc).
-        tsan_bridge::AcquireOnVaArrival();
     }
     return ptr;
 #else
@@ -392,7 +389,6 @@ void* OSMemory::AllocatePages(std::size_t size) {
         return nullptr;
     }
     // Fresh VA arrived from the kernel.
-    tsan_bridge::AcquireOnVaArrival();
     return ptr;
 #endif
 }
@@ -404,9 +400,6 @@ void OSMemory::FreePages(void* ptr, std::size_t size) {
     // MEM_RELEASE the whole reservation only when its last live span is
     // gone. A blind VirtualFree(ptr, 0, MEM_RELEASE) here either leaks
     // interior sub-spans or wipes still-cached split tails (0xC0000005).
-    // The release path may munmap the reservation back to the
-    // kernel, which is free to re-issue that VA to any thread.
-    tsan_bridge::ReleaseOnVaReturn();
     WinRegistry().ReleaseSpan(ptr, size);
 #else
 #if !defined(_WIN32) && defined(__linux__) && !FASTALLOC_WINVA
@@ -418,9 +411,6 @@ void OSMemory::FreePages(void* ptr, std::size_t size) {
         return;
     }
 #endif
-    // The VA returns to the kernel; it may be re-issued to any
-    // thread via a later mmap/mremap.
-    tsan_bridge::ReleaseOnVaReturn();
     munmap(ptr, size);
 #endif
 }
