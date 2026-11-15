@@ -904,13 +904,15 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Cross-allocator matrix (glibc + jemalloc + FastAlloc): the same bench_suite
-  # workloads again, but with LD_PRELOAD'd allocators for allocator-vs-allocator
-  # comparisons. Runs on every push to main and on manual dispatch (not on PRs,
-  # which already run the full std+fast sweep above). mimalloc is auto-skipped
-  # unless MIMALLOC_SO points at a prebuilt libmimalloc.so. Results are noise
-  # on shared runners — treat them as smoke/regression data, not publishable
-  # numbers.
+  # Cross-allocator matrix (glibc + jemalloc + mimalloc + FastAlloc): the same
+  # bench_suite workloads again, but with LD_PRELOAD'd allocators for
+  # allocator-vs-allocator comparisons. Runs on every push to main and on
+  # manual dispatch (not on PRs, which already run the full std+fast sweep
+  # above). mimalloc is BUILT here (pinned v3.6.1, shared lib with malloc
+  # override) so the column can never be silently dropped again, and T=4 is
+  # part of the sweep (the standard runner's 4 vCPU saturate exactly at T=4).
+  # Results are noise on shared runners — treat them as smoke/regression data,
+  # not publishable numbers.
   # ---------------------------------------------------------------------------
   benchmark-matrix:
     name: benchmark-matrix
@@ -928,6 +930,28 @@ jobs:
           sudo apt-get install -y libjemalloc2 \
             || (sleep 10 && sudo apt-get install -y libjemalloc2)
 
+      # Pinned source build (not an apt package): guaranteed present on every
+      # runner image, and the version is part of the record. MI_OVERRIDE is
+      # mimalloc's malloc/new override layer, which is what makes the shared
+      # lib interceptable via LD_PRELOAD. The glob resolves the fully-versioned
+      # file (libmimalloc.so.<version>) regardless of the tag's naming.
+      - name: Build mimalloc (pinned v3.6.1, preloadable shared lib)
+        run: |
+          git clone --depth 1 --branch v3.6.1 \
+            https://github.com/microsoft/mimalloc.git mimalloc
+          cmake -S mimalloc -B mimalloc/build \
+            -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF \
+            -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
+            -DMI_OVERRIDE=ON
+          cmake --build mimalloc/build -j
+          MI_SO="$(ls -1 mimalloc/build/libmimalloc.so.* | sort -V | tail -1)"
+          if [ -z "$MI_SO" ] || [ ! -f "$MI_SO" ]; then
+            echo "libmimalloc.so not produced by the build" >&2
+            exit 1
+          fi
+          echo "MIMALLOC_SO=$MI_SO" >> "$GITHUB_ENV"
+          echo "prebuilt mimalloc: $MI_SO"
+
       - name: Configure (Release)
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -937,11 +961,12 @@ jobs:
       - name: Build bench_suite
         run: cmake --build build -j --target bench_suite
 
-      - name: Run reduced cross-allocator matrix
+      - name: Run full cross-allocator matrix
         run: |
           cd benchmarks/benchsuite
           BENCH_SUITE="$PWD/../../build/bench_suite" \
-            OPS=300000 THREADS="1 2" bash ./run_matrix.sh ci_matrix.jsonl 3
+            MIMALLOC_SO="$MIMALLOC_SO" \
+            OPS=300000 THREADS="1 2 4" bash ./run_matrix.sh ci_matrix.jsonl 3
           python3 analyze.py ci_matrix.jsonl | tee ci_matrix_summary.md \
             || echo "analyze.py failed (raw jsonl still uploaded)" \
                | tee -a matrix_failures.txt
