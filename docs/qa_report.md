@@ -82,7 +82,7 @@ Run locally on 2026-10-15 via `python -m cmake` + MinGW Makefiles.
 | Suite | Tests | Result | Notes |
 | :--- | :--- | :--- | :--- |
 | `fast_alloc_tests` (main) | 75 | **74 PASS, 1 FAIL** | `ApiTest.ReallocFailurePreservesOriginal` — OOM injection does not fire on Windows (VirtualAlloc doesn't obey the countdown in the same code path as `mmap`); platform-expected |
-| `fast_alloc_audit_tests` (49 cases at run time; 53 since audit round FA-05/06/08) | 49 | **48 PASS, 1 FAIL** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
+| `fast_alloc_audit_tests` (49 cases at run time; 54 in the current tree) | 49 | **48 PASS, 1 FAIL** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
 | `bench_suite` small-mixed T=1 | — | **41.2 M ops/s** (24.25 ns/op median) | Checksum OK |
 | `fast_alloc_bench` MallocFree 8B T=1 | — | **5.99 µs/iter** vs std 33.4 µs → **5.6× faster** | MinGW UCRT64, Release |
 | `fast_alloc_bench_memory` 4 threads | — | std 0.111 s / FastAlloc 0.347 s | VirtualAlloc reservation overhead dominates at T=4; expected on Windows |
@@ -116,21 +116,21 @@ DLL staged next to each executable, repeated up to 3x with `-V`):
 
 ## 4b. Adversarial audit probes (scripts/, ctest-registered)
 
-The 2026-11 deep audit added standalone probe programs under `scripts/`. Each probe exits
+A deep audit added standalone probe programs under `scripts/`. Each probe exits
 non-zero when its defect (or clean-target invariant) is violated, is built as its own CTest
 target (`fast_alloc_probe_<name>`) by the normal build, and runs in every POSIX CI job that
 invokes ctest (build-test Linux entries, sanitizers, leak-sanitizer, WINVA-emulation):
 
 | Probe | Verifies |
 | :--- | :--- |
-| `probe_realloc_overflow` | FA-01: `fast_realloc(p, SIZE_MAX)` on a 1 MiB block must return `nullptr` (was: old pointer returned as success) |
-| `probe_boundary` | FA-01 boundary: every `new_size` in `[SIZE_MAX-4110, SIZE_MAX]` fails cleanly; `SIZE_MAX-4111` and below already correct |
+| `probe_realloc_overflow` | `fast_realloc(p, SIZE_MAX)` on a 1 MiB block must return `nullptr` (was: old pointer returned as success) |
+| `probe_boundary` | every `new_size` in `[SIZE_MAX-4110, SIZE_MAX]` fails cleanly; `SIZE_MAX-4111` and below already correct |
 | `probe_sibling_sizes` | Sibling guards: small-to-huge realloc, malloc/calloc/realloc(nullptr) overflow guards all return `nullptr` |
 | `probe_calloc` | `fast_malloc` guard-boundary sweep + `fast_calloc` exact-wrap rejection + zero-operand unique pointers |
 | `probe_aligned` | Over-aligned allocation + realloc of impossible sizes fail cleanly; control alignment preserved |
-| `probe_env_overflow` | FA-02: `FASTALLOC_PAGE_CACHE_MB` wrap values (2^44, 2^48) must not disable the page cache (3 ctest entries: default + both wrap values) |
-| `probe_stats` | FA-03: aligned/plain/realloc battery leaves `current_live_bytes`/`current_live_blocks` net zero |
-| `probe_stats4` | FA-03 reproducer: the exact 100/9000/3000000 grow-shrink-free cycle (was: +1,499,136 bytes drift) |
+| `probe_env_overflow` | `FASTALLOC_PAGE_CACHE_MB` wrap values (2^44, 2^48) must not disable the page cache (3 ctest entries: default + both wrap values) |
+| `probe_stats` | aligned/plain/realloc battery leaves `current_live_bytes`/`current_live_blocks` net zero |
+| `probe_stats4` | reproducer: the exact 100/9000/3000000 grow-shrink-free cycle (was: +1,499,136 bytes drift) |
 | `probe_remaining` | Clean-target battery: sized-free wrong hints, all 512 class boundaries, OOM rollback on cold classes, retention caps + purge, concurrent stats |
 
 Reproduce locally (Linux):

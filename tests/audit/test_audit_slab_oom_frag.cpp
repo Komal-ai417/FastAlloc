@@ -136,8 +136,9 @@ TEST(AuditSizeClass, UsableCapacityPerClass) {
 TEST(AuditOom, OomDuringSlabAllocationRecover) {
     FastAllocTestPurgePageCache();
     FastAllocStats t0 = fast_alloc_stats();  // this test's own balance
-    // Warm the class so the OOM test is deterministic (avoid F2-style order
-    // dependence): touch class of 1237 first.
+    // Warm the class so the OOM test is deterministic (no order dependence
+    // between the class's first-touch allocation and the OOM countdown):
+    // touch class of 1237 first.
     for (int i = 0; i < 3000; ++i) { void* w = fast_malloc(1237); ASSERT_NE(w, nullptr); fast_free(w); }
     FastAllocTestSetOOMCountdown(3);   // fail the next 3 page allocations
     int nulls = 0;

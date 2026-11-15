@@ -4,6 +4,7 @@
 #include "fast_alloc_config.h"
 #include "os_memory.h"
 #include "debug_aid.h"
+#include "tsan_bridge.h"
 
 #include <cstring>
 #include <cerrno>
@@ -414,8 +415,8 @@ void fast_free(void* ptr) {
     if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(slab_field) == ALIGN_MAGIC)) {
         // Over-aligned block: recover the raw pointer from the stash and
         // recurse. The stash also lets realloc recover the original size.
-        // The stash is user-writable, so revalidate before recursing
-        // (audit FA-05): alignment must be a supported power of two and
+        // The stash is user-writable, so revalidate before recursing:
+        // alignment must be a supported power of two and
         // raw must round-trip (round_up(raw + 32, alignment) == ptr).
         // Without the round-trip, a forged raw converts an adjacent-buffer
         // overflow into a constrained invalid-free primitive.
@@ -571,7 +572,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(slab_field) == ALIGN_MAGIC)) {
         // Stash (written by fast_aligned_alloc): [alignment][raw][MAGIC][size]
         // at ptr-32/-24/-16/-8. The stash lives in user-writable memory, so
-        // every field is revalidated before use (audit FA-05):
+        // every field is revalidated before use:
         //   1. alignment: power of two within the supported range.
         //   2. old_size: at most what fast_aligned_alloc could have stashed
         //      (raw_size = size + alignment + 32 must not have overflowed)
@@ -603,7 +604,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         }
         if (FAST_LIKELY(stash_ok)) {
             // Capacity cross-check against the raw block's true size.
-            // NOTE (FA-09): large blocks are discriminated by a nullptr
+            // NOTE: large blocks are discriminated by a nullptr
             // 'slab' field in release but by debug::LARGE_MAGIC in DEBUG
             // builds - without the magic check, every legitimately-large
             // aligned block failed this cross-check under FASTALLOC_DEBUG.
@@ -642,10 +643,10 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // later grow-copy moves exactly the live bytes.
             *reinterpret_cast<std::size_t*>(static_cast<char*>(ptr) - 8) = new_size;
 #if FASTALLOC_DEBUG_ENABLED
-            // FA-09 (audit finding 6): the registry record must track the
-            // new logical size exactly like the small/large in-place paths
-            // do; without this, current_live_bytes over-reported by
-            // (old_size - new_size) until the block was freed. The rear
+            // The registry record must track the new logical size exactly
+            // like the small/large in-place paths do; skipping it would
+            // over-report current_live_bytes by (old_size - new_size) until
+            // the block was freed. The rear
             // red zone must be repainted for the same reason: the aligned
             // free path reconstructs the RAW record at
             // rec.size + alignment + 32 and validates the zone from there
@@ -656,12 +657,15 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
                 if (AllocRegistry::GetInstance().Erase(ptr, &rec)) {
                     rec.size = new_size;
                     AllocRegistry::GetInstance().Insert(rec, nullptr);
-                    void* raw = *reinterpret_cast<void**>(
+                    // NOTE: distinct name from the validation block's 'raw'
+                    // above - MSVC /W4 flags the shadowing as C4456 and the
+                    // project compiles with warnings-as-errors.
+                    void* raw_base = *reinterpret_cast<void**>(
                         static_cast<char*>(ptr) - 24);
                     std::size_t zone_begin_offset = new_size + alignment + 32;
                     if (rec.usable > zone_begin_offset) {
                         debug_check::FillRearRedZone(
-                            static_cast<char*>(raw) + zone_begin_offset,
+                            static_cast<char*>(raw_base) + zone_begin_offset,
                             rec.usable - zone_begin_offset);
                     }
                 }
@@ -693,10 +697,10 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         }
         old_size = header->alloc_size - sizeof(LargeAllocHeader);
     } else {
-        // FA-08 (audit finding 6): fast_free validates class_index before
-        // indexing the size tables; this path did not, so a corrupted header
-        // made UsableSize read past the table and use garbage as the
-        // shrink/copy bound. Same guard, same contract: reject, never read.
+        // fast_free validates class_index before indexing the size tables;
+        // this path must too, or a corrupted header makes UsableSize read
+        // past the table and use garbage as the shrink/copy bound. Same
+        // guard, same contract: reject, never read.
         // DEBUG keeps its fatal-by-design contract (registry machinery).
         if (FAST_UNLIKELY(static_cast<std::size_t>(block->class_index) >=
                           NUM_SIZE_CLASSES)) {
@@ -788,6 +792,9 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             if (OSMemory::IsPoolBacked(base)) { debug_keep(); return ptr; } // pooled: keep span
             // mremap shrink: releases the tail pages, never moves the base.
             std::size_t released = header->alloc_size - needed;
+            // The tail range returns to the kernel (partial unmap);
+            // it may be re-issued to any thread later.
+            tsan_bridge::ReleaseOnVaReturn();
             void* shrunk = mremap(base, header->alloc_size, needed, 0);
             if (shrunk == MAP_FAILED) { debug_keep(); return ptr; } // keep the old span
             // shrunk == base for non-MAYMOVE calls.
@@ -845,7 +852,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // (MREMAP_MAYMOVE) or alias the new header. The capture lives
             // INSIDE the linux guard: hoisting it out leaves the variable
             // unused on Windows/WINVA builds, which -Werror turns into a
-            // build break (the red CI jobs at a6fe85f).
+            // build break.
             const std::size_t old_span = header->alloc_size;
             // Pooled spans skip mremap growth: the kernel could grow the
             // mapping in place into bump space the pool will hand out again
@@ -853,9 +860,18 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             // chunk). The copy path is safe for both; spans > 2 MB are never
             // pooled and keep the zero-copy fast path.
             if (!OSMemory::IsPoolBacked(reinterpret_cast<char*>(header))) {
-                void* grown = mremap(reinterpret_cast<char*>(header), header->alloc_size,
+                // A MAYMOVE mremap returns the old range to the
+                // kernel (it may be re-issued) and delivers a fresh one.
+                // The old-size argument is the pre-captured 'old_span', NOT
+                // a re-read of header->alloc_size: the header lives in the
+                // range being returned, so a read after the release edge
+                // would be orphaned for TSan (the move consumes the old
+                // range; no later release on this thread can cover it).
+                tsan_bridge::ReleaseOnVaReturn();
+                void* grown = mremap(reinterpret_cast<char*>(header), old_span,
                                      needed, MREMAP_MAYMOVE);
                 if (grown != MAP_FAILED) {
+                    tsan_bridge::AcquireOnVaArrival();
                     LargeAllocHeader* new_header = static_cast<LargeAllocHeader*>(grown);
                     void* new_ptr = reinterpret_cast<char*>(new_header) + sizeof(LargeAllocHeader);
                     new_header->alloc_size = needed;
@@ -1035,8 +1051,8 @@ void fast_alloc_log_set_level(int level) {
 // The family is replaced as a COMPLETE SET. Partial replacement is a silent
 // cross-allocator corruption bug: with only the plain forms, `new (std::
 // nothrow) T` allocates from libc while the plain `delete p` on the same
-// pointer routes the foreign pointer into fast_free (audit 2026-11, finding
-// FA-04), and C++17 over-aligned types select the align_val_t family.
+// pointer routes the foreign pointer into fast_free, and C++17
+// over-aligned types select the align_val_t family.
 #ifdef FAST_ALLOC_OVERRIDE_NEW
 namespace {
 
