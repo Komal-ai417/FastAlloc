@@ -238,8 +238,8 @@ TEST(AuditMemory, ScribbleAroundBlockThenFreeGuardsHold) {
     // Release-only: simulate user overflow/underflow by 1-8 bytes around live
     // blocks, then free and verify self-healing. In DEBUG the canary checks
     // FATAL on this by design (DebugAidsDeathTest covers it).
-    // c[-1] lands on the canary dword's high byte, which carries the
-    // release live/free state stamp. A scribbled block is
+    // FA-06 note: c[-1] lands on the canary dword's high byte, which since
+    // FA-06 carries the release live/free state stamp. A scribbled block is
     // therefore DROPPED (leaked) at free instead of recycled - strictly
     // safer than the old padding behaviour, and symmetric with DEBUG's
     // fatal canary. The post-storm recycling assertion below only uses
@@ -267,7 +267,7 @@ TEST(AuditMemory, ScribbleAroundBlockThenFreeGuardsHold) {
 TEST(AuditMemory, DoubleFreeReleaseAbsorbed) {
     // Release: the TLS push guard turns the second push into a no-op; the heap
     // stays consistent. In DEBUG a double free FATALs by design (registry).
-    // The release stats counter
+    // FINDING F3 (documented in the report): the release stats counter
     // current_live_blocks is decremented BEFORE the push guard fires,
     // so N double-frees underflow it by up to N (observed: 2^64-99 after 100).
     FastAllocStats t0 = fast_alloc_stats();
@@ -289,7 +289,7 @@ TEST(AuditMemory, DoubleFreeReleaseAbsorbed) {
     // The allocator itself must remain fully serviceable (no crash, no hang,
     // no corruption of the churn blocks above) -- that is the contract.
     // Stats: balanced (0) or underflowed by at most the double-free count
-    // (a release run observed -99 when one push is absorbed by the
+    // (F3; observed -99 in release when one push is absorbed by the
     // duplicate-hand-out guard). Anything outside [0, -100] is a NEW defect.
     FastAllocStats st = fast_alloc_stats();
     std::ptrdiff_t got = static_cast<std::ptrdiff_t>(st.current_live_blocks - t0.current_live_blocks);
@@ -299,10 +299,10 @@ TEST(AuditMemory, DoubleFreeReleaseAbsorbed) {
 
 TEST(AuditMemory, NonHeadDoubleFreeGuardedByStateStamp) {
 #if !FASTALLOC_DEBUG_ENABLED
-    // Regression: double-free detection must not depend on the victim being
-    // the CURRENT freelist head. Freeing A, then B, then A again leaves A
-    // non-head - linking A twice builds a cycle (A->B->A) and later hands
-    // one block to two owners. The canary dword carries a
+    // FA-06 regression: the release double-free guards compared only against
+    // the CURRENT freelist head. Freeing A, then B, then A again left A
+    // non-head - the old code silently linked A twice (cycle A->B->A) and
+    // later handed one block to two owners. The canary dword now carries a
     // live/free state stamp, so the second free of A is dropped and
     // reported, and the bin holds exactly {B, A}.
     void* a = fast_malloc(72);
@@ -346,11 +346,11 @@ TEST(AuditMemory, NonHeadDoubleFreeGuardedByStateStamp) {
 
 TEST(AuditMemory, CorruptClassIndexReallocRejectedNotRead) {
 #if !FASTALLOC_DEBUG_ENABLED
-    // Regression: the realloc copy path must bounds-check class_index the
-    // way fast_free does. Computing old_size =
-    // UsableSize(block->class_index) unchecked lets a corrupted class_index
-    // (0xFFFF) read past the size table and use out-of-bounds garbage as the
-    // shrink/copy bound - it must be rejected with EINVAL instead.
+    // FA-08 regression (audit finding 6): the realloc copy path computed
+    // old_size = UsableSize(block->class_index) without the bounds check
+    // fast_free performs, so a corrupted class_index (0xFFFF) read past the
+    // size table and used out-of-bounds garbage as the shrink/copy bound.
+    // Must be rejected with EINVAL instead.
     void* p = fast_malloc(64);
     ASSERT_NE(p, nullptr);
     // class_index lives at header offset 8 = user pointer - 8.
@@ -386,12 +386,12 @@ TEST(AuditMemory, ReadAfterFreeDoesNotCrash) {
     SUCCEED();
 }
 
-// ---- aligned stash validation + >1 GiB aligned blocks ------------------------
+// ---- FA-05: aligned stash validation + >1 GiB aligned blocks -----------------
 
 TEST(AuditMemory, AlignedReallocAboveOneGiBIsLegitimate) {
-    // Regression: fast_realloc's aligned branch must not cap the stashed
-    // old_size at 1 GiB - a perfectly valid fast_aligned_alloc(64,
-    // 1.5 GiB) would fail ANY subsequent realloc with EINVAL and a bogus
+    // Regression (audit FA-05): fast_realloc's aligned branch used to cap the
+    // stashed old_size at 1 GiB, so a perfectly valid fast_aligned_alloc(64,
+    // 1.5 GiB) failed ANY subsequent realloc with EINVAL and a bogus
     // "corrupt large header" report. The span is lazily faulted, so this
     // costs ~no RSS: only the shrink-in-place path is exercised (stash
     // update, no copy).
@@ -411,7 +411,7 @@ TEST(AuditMemory, ForgedAlignedStashRoundTripGuarded) {
     // Release-only misuse simulation (debug registry FATALs on corrupted
     // provenance by design). The aligned stash ([alignment][raw][MAGIC]
     // [size] at ptr-32..-8) is user-writable: a forged raw must NOT be
-    // recursively freed (round-trip validation), and a forged
+    // recursively freed (audit FA-05: round-trip validation), and a forged
     // size must NOT become a memcpy bound (capacity cross-check).
     void* victim = fast_malloc(64);
     ASSERT_NE(victim, nullptr);
@@ -463,16 +463,17 @@ TEST(AuditMemory, ForgedAlignedStashRoundTripGuarded) {
     }
 }
 
-// ---- page-cache parked-bytes accounting + per-bin budget ---------------------
+// ---- FA-09: page-cache parked-bytes accounting + per-bin budget -------------
 
 TEST(AuditMemory, PageCacheBytesStatTracksParking) {
-    // Regression: page_cache_bytes must track every state change, not just
-    // stores and evicts. The POP paths (exact-bin hit and best-fit split)
-    // also remove parked bytes - missing that strands bytes counted as
-    // parked forever on every store->hit cycle. The cap-bypass path must not
-    // subtract never-stored bytes (that drives the stat negative). And the
-    // per-bin retention floor must be 1, not 2: 2 entries park up to 4 MB
-    // of 2 MB spans per bin vs the documented 2 MB budget.
+    // Regression (audit FA-09, findings 1 + 8): page_cache_bytes used to be
+    // adjusted only by stores and evicts. The POP paths (exact-bin hit and
+    // best-fit split) subtracted the internal retention counter but left the
+    // public parked-bytes stat untouched - every store->hit cycle left bytes
+    // counted as parked forever. The cap-bypass path subtracted never-stored
+    // bytes and drove the stat negative. And the per-bin retention floor of
+    // 2 entries parked up to 4 MB of 2 MB spans per bin vs the documented
+    // 2 MB budget.
     constexpr std::size_t kSpan = 2u * 1024 * 1024 - 4096;  // -> 512-page span
     // Order matters: flush the thread caches FIRST, then empty the global
     // page cache - flushing afterwards would park spans after the purge and

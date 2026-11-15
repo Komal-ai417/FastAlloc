@@ -141,7 +141,8 @@ CachePool& CachePoolInstance() {
 // flushed_ok == false is the shutdown path: the destructor was skipped
 // (other statics may be mid-teardown) and the raw storage is freed
 // directly. VirtualFree / munmap are exit-safe, and the pool is never used
-// - no thread will ever recycle this cache again.
+// - no thread will ever recycle a cache again (FA-09, audit finding 7:
+// the old comments claimed "never syscall" here while the code freed).
 void RecycleOrFreeCache(TLSCache* cache, bool flushed_ok) {
     if (flushed_ok) {
         CachePoolInstance().Push(cache);
@@ -423,7 +424,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
 
 #if !FASTALLOC_DEBUG_ENABLED
-    block->canary = kBlockLiveStamp;  // user handoff: mark live
+    block->canary = kBlockLiveStamp;  // FA-06: direct user handoff
 #endif
     return block;
 }
@@ -573,9 +574,9 @@ std::size_t AuditCurrentThreadCache(const void* lo, const void* hi) {
     std::size_t hits = TLSCache::GetFast().AuditPointers(lo, hi);
     // The cross-thread recycling pool: retired TLSCache objects. A pool slot
     // pointing into the audited range means a recycled cache was corrupted.
-    // Snapshot the slots under the pool lock - Push/Pop write slots[]
-    // under it, and an unlocked read can see torn or stale slots (benign
-    // for diagnostics, but racy and TSan-visible).
+    // FA-08 (audit finding 10d): snapshot the slots under the pool lock -
+    // Push/Pop write slots[] under it, and an unlocked read can see torn or
+    // stale slots (benign for diagnostics, but racy and TSan-visible).
     CachePool& pool = CachePoolInstance();
     TLSCache* snapshot[kCachePoolCap];
     std::size_t n = 0;

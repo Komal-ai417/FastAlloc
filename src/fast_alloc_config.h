@@ -110,11 +110,10 @@ constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
 
 // Upper canonical address bound for user-space pointers, detected once at
-// first use. A hard-coded 2^47 ceiling would reject every pointer an LA57
-// (5-level paging) host can return once the lower half of the address
-// space fills - the allocation exit gate would leak the block, fast_free
-// would drop the pointer, freelist walks would sever tails. On 4-level
-// x86-64 and
+// first use (audit FA-07): a hard-coded 2^47 ceiling rejected every pointer
+// an LA57 (5-level paging) host can return once the lower half of the
+// address space fills - the allocation exit gate leaked the block, fast_free
+// dropped the pointer, freelist walks severed tails. On 4-level x86-64 and
 // all other supported platforms the bound stays 2^47; the Windows user VA is
 // below 2^47 regardless. The WINVA emulation keeps the 2^47 contract its
 // reservations are built around.

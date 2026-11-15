@@ -60,7 +60,7 @@ public:
             bin.head = block->next;
             bin.count--;
 #if !FASTALLOC_DEBUG_ENABLED
-            block->canary = kBlockLiveStamp;  // user handoff: mark live
+            block->canary = kBlockLiveStamp;  // FA-06: user handoff
 #endif
             return block;
         }
@@ -85,12 +85,12 @@ public:
             return;
         }
 #if !FASTALLOC_DEBUG_ENABLED
-        // Non-head double-free guard. The canary dword carries the
+        // FA-06: non-head double-free guard. The canary dword carries the
         // live/free state: a block must be LIVE (handed to a user, not yet
         // returned) to be freed. This catches EVERY double free and every
-        // wild free that lands on a real block boundary - comparing only
-        // against the free-list head would catch just the head. Drop +
-        // report, keep the bin intact.
+        // wild free that lands on a real block boundary - the old head-only
+        // comparison only caught the free-list head. Drop + report, keep the
+        // bin intact.
         if (FAST_UNLIKELY(block->canary != kBlockLiveStamp)) {
             ReportDoublePushGuard();
             return;
@@ -100,7 +100,7 @@ public:
         CacheBin& bin = bins_[class_index];
         if (FAST_UNLIKELY(bin.head == block)) {
             // Guard against double-pushing the current head block.
-            // (Subsumed by the canary state check; kept as defense in depth.)
+            // (Subsumed by the FA-06 state check; kept as defense in depth.)
             ReportDoublePushGuard();
             return;
         }
