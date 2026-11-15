@@ -944,11 +944,19 @@ jobs:
             -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
             -DMI_OVERRIDE=ON
           cmake --build mimalloc/build -j
-          MI_SO="$(ls -1 mimalloc/build/libmimalloc.so.* | sort -V | tail -1)"
+          # ABSOLUTE path: the consumer (run_matrix.sh) runs after
+          # 'cd benchmarks/benchsuite', so a workspace-relative path does not
+          # resolve there — that exact bug failed the first CI run (26 s,
+          # "MIMALLOC_SO=mimalloc/build/libmimalloc.so.3.6 not found").
+          MI_SO="$(ls -1 "$PWD"/mimalloc/build/libmimalloc.so.* | sort -V | tail -1)"
           if [ -z "$MI_SO" ] || [ ! -f "$MI_SO" ]; then
             echo "libmimalloc.so not produced by the build" >&2
             exit 1
           fi
+          case "$MI_SO" in
+            /*) ;;
+            *) echo "MIMALLOC_SO must be absolute, got: $MI_SO" >&2; exit 1 ;;
+          esac
           echo "MIMALLOC_SO=$MI_SO" >> "$GITHUB_ENV"
           echo "prebuilt mimalloc: $MI_SO"
 
