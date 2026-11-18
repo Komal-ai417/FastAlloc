@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <algorithm>
+#include <limits>
 
 #if defined(__linux__) && defined(__GLIBC__)
 #define FASTALLOC_HAVE_BACKTRACE 1
@@ -128,20 +129,44 @@ std::atomic<std::size_t> g_page_cache_evictions{0};
 std::atomic<std::size_t> g_tls_misses{0}, g_pending_pushes{0};
 std::atomic<std::size_t> g_tls_created{0}, g_tls_destroyed{0};
 
+// Sanity ceiling for peak ratcheting: batched cross-thread flushes can
+// apply a free batch before the matching alloc batch lands, transiently
+// wrapping the running counters (relaxed atomics, diagnostics only - the
+// hot path stays atomic-free by contract, AGENTS.md 2.3). A wrapped
+// snapshot is ~SIZE_MAX and must never ratchet a peak; anything above
+// 2^63 blocks/bytes is not a plausible live-set reading.
+constexpr std::size_t kPeakSanityCeiling = (std::size_t)1 << 63;
+
 inline void BumpLive(uint64_t n, std::size_t bytes) {
     g_live_blocks.fetch_add(n, std::memory_order_relaxed);
     g_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
     // Peak maintenance at flush granularity: values are monotone snapshots
     // of the running totals, so peaks can only be under-reported between
-    // flushes (documented as approximate in release builds).
+    // flushes (documented as approximate in release builds). Snapshots
+    // above the sanity ceiling are wrapped transients (see DropLive) and
+    // are skipped - underflow-tolerant peaks, flush-side only.
     std::size_t b = g_live_blocks.load(std::memory_order_relaxed);
     std::size_t by = g_live_bytes.load(std::memory_order_relaxed);
-    std::size_t pb = g_peak_live_blocks.load(std::memory_order_relaxed);
-    while (b > pb && !g_peak_live_blocks.compare_exchange_weak(pb, b, std::memory_order_relaxed)) {}
-    std::size_t pby = g_peak_live_bytes.load(std::memory_order_relaxed);
-    while (by > pby && !g_peak_live_bytes.compare_exchange_weak(pby, by, std::memory_order_relaxed)) {}
+    if (b < kPeakSanityCeiling) {
+        std::size_t pb = g_peak_live_blocks.load(std::memory_order_relaxed);
+        while (b > pb && !g_peak_live_blocks.compare_exchange_weak(pb, b, std::memory_order_relaxed)) {}
+    }
+    if (by < kPeakSanityCeiling) {
+        std::size_t pby = g_peak_live_bytes.load(std::memory_order_relaxed);
+        while (by > pby && !g_peak_live_bytes.compare_exchange_weak(pby, by, std::memory_order_relaxed)) {}
+    }
 }
 inline void DropLive(uint64_t n, std::size_t bytes) {
+    // Plain subtract, NO zero-clamp: batched cross-thread flushes can land a
+    // free batch before its alloc batch, transiently wrapping the counter
+    // near SIZE_MAX until the matching add arrives. Clamping to zero instead
+    // would DESTROY the net-zero alloc/free balance: the clamp discards the
+    // deficit and the running total ends up over-reporting live bytes
+    // forever (probe_stats asserts the net-zero balance, so it must
+    // tolerate the transient wrap, not clamp it). The transient wrap is
+    // instead tolerated read-side: BumpLive's sanity ceiling refuses
+    // to ratchet peaks from a wrapped snapshot, so peaks stay clean while
+    // the totals remain exact in the steady state.
     g_live_blocks.fetch_sub(n, std::memory_order_relaxed);
     g_live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
@@ -247,15 +272,31 @@ std::size_t AllocRegistry::HashShard(void* p) const {
 
 AllocRegistry::AllocRegistry() {
     for (auto& s : shards_) {
-        s.capacity = kInitialShardCapacity;
         s.count = 0;
         s.live_bytes = 0;
-        s.table = static_cast<AllocRecord*>(std::malloc(s.capacity * sizeof(AllocRecord)));
         // Registry memory comes from std::malloc on purpose: it must never
         // be served by FastAlloc itself (re-entrancy hazard).
-        if (s.table) {
-            std::memset(s.table, 0, s.capacity * sizeof(AllocRecord));
+        //
+        // Construction-time OOM is FATAL, not degradable: a debug build
+        // running with a dead registry would silently miss every double
+        // free / invalid free / leak it exists to catch, which contradicts
+        // the FASTALLOC_DEBUG contract (fatal-by-design, never silently
+        // weakened - AGENTS.md 2.1/7). Same treatment as the 100%-full
+        // shard bail in Insert/Erase below.
+        AllocRecord* table = static_cast<AllocRecord*>(
+            std::malloc(kInitialShardCapacity * sizeof(AllocRecord)));
+        if (!table) {
+            std::fprintf(stderr,
+                         "FastAlloc FATAL: AllocRegistry shard table "
+                         "allocation failed at startup (std::malloc OOM); "
+                         "refusing to run a debug build with a dead "
+                         "registry - aborting.\n");
+            std::fflush(stderr);
+            std::abort();
         }
+        std::memset(table, 0, kInitialShardCapacity * sizeof(AllocRecord));
+        s.table = table;
+        s.capacity = kInitialShardCapacity;
     }
 }
 
@@ -264,6 +305,15 @@ AllocRegistry::~AllocRegistry() {
 }
 
 void AllocRegistry::GrowShard(Shard& shard) {
+    // Overflow guard: new_cap * sizeof(AllocRecord) must be representable.
+    // Capacity only reaches the danger zone (~2^59) after ~56 doublings
+    // from 1024, i.e. never in practice - but the multiply is unchecked
+    // otherwise, and a wrapped byte count would ask malloc for a small
+    // buffer and then index it far out of bounds during the rehash copy.
+    if (shard.capacity > (std::numeric_limits<std::size_t>::max)() /
+                              (2 * sizeof(AllocRecord))) {
+        return; // stay at current capacity; load factor degrades, stays correct
+    }
     std::size_t new_cap = shard.capacity * 2;
     AllocRecord* nt = static_cast<AllocRecord*>(std::malloc(new_cap * sizeof(AllocRecord)));
     if (!nt) return; // stay at current capacity; load factor degrades but stays correct

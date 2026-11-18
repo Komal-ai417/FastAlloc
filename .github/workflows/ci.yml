@@ -7,6 +7,11 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Least-privilege defaults for every job in this workflow; jobs needing more
+# (none today) must opt back in explicitly.
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build & run ALL unit tests: release + debug-instrumented, Linux + Windows.
@@ -47,7 +52,12 @@ jobs:
         run: |
           CC=gcc CXX=g++
           if [ "${{ matrix.compiler }}" = "clang" ]; then CC=clang CXX=clang++; fi
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+          # Debug matrix rows build an actual Debug (unoptimized,
+          # non-NDEBUG) configuration; FASTALLOC_DEBUG instrumentation is
+          # orthogonal to the build type and stays matrix-driven.
+          BUILD_TYPE=Release
+          if [ "${{ matrix.config }}" = "debug" ]; then BUILD_TYPE=Debug; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
                 -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX \
                 -DFASTALLOC_BUILD_TESTS=ON \
                 -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
@@ -494,6 +504,9 @@ jobs:
 
       - name: libFuzzer campaign (clang, fuzzer+address+undefined, 300 s)
         run: |
+          # pipefail: a raw abort()/SIGSEGV in the fuzzer must fail the step
+          # even though 'tee' is the last command in the pipeline and exits 0.
+          set -o pipefail
           # Identical flag set to audit-scripts/build_fuzz.sh, which produced
           # the audit's 480 s campaign (0 sanitizer findings). The library
           # sources are compiled INTO the harness so ASan/UBSan instrument
@@ -509,8 +522,10 @@ jobs:
             -print_final_stats=1 -artifact_prefix=fuzz-artifacts/ corpus/ \
             2>&1 | tee fuzz-libfuzzer-campaign.log
           # A crash/leak exits non-zero (fails this step). Belt-and-braces:
-          # no sanitizer error lines may be present in the log either.
-          ! grep -q -E "ERROR: (AddressSanitizer|LeakSanitizer)|runtime error:" fuzz-libfuzzer-campaign.log
+          # no sanitizer or libFuzzer crash lines may be present in the log
+          # either. "deadly signal" catches raw SIGSEGV/abort crashes that
+          # exit before any sanitizer report is printed.
+          ! grep -q -E "ERROR: (AddressSanitizer|LeakSanitizer)|runtime error:|ERROR: libFuzzer: deadly signal" fuzz-libfuzzer-campaign.log
 
       - name: Upload fuzz campaign logs + crash artifacts
         if: always()

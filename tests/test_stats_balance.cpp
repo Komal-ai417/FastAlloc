@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <vector>
+#include <thread>
 
 using namespace FastAlloc;
 
@@ -67,4 +68,57 @@ TEST(StatsBalanceTest, ReallocGrowShrinkFreeNetsToZero) {
         << "live bytes drifted over a balanced battery: "
         << "current_live_bytes before=" << before.current_live_bytes
         << " after=" << after.current_live_bytes;
+}
+
+// Regression: cross-thread batched stats must never wrap the live counters
+// or poison the peaks. Threads allocate and free in overlapping waves so
+// free batches can land before the matching alloc batches; a transient
+// wrap of g_live_bytes near SIZE_MAX must never ratchet peak_live_bytes
+// to a garbage value. Post-condition: peaks are sane (< 2^63),
+// current_live returns exactly to baseline.
+TEST(StatsBalanceTest, CrossThreadPeakSanity) {
+    FastAllocStats before = fast_alloc_stats();
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 40;
+    {
+        // Scoped so the vector's own buffer (routed through FastAlloc when
+        // new/delete are overridden) is freed before the after-snapshot.
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([t] {
+                for (int r = 0; r < kRounds; ++r) {
+                    std::vector<void*> live;
+                    live.reserve(64);
+                    std::size_t sz = 32 + (t * 7 + r * 13) % 4000;
+                    for (int i = 0; i < 64; ++i) live.push_back(fast_malloc(sz));
+                    if ((t + r) % 2 == 0) {
+                        for (void* p : live) fast_free(p);
+                    } else {
+                        // Interleaved pattern: free two thirds, allocate a
+                        // fresh wave while the rest are still live, then free
+                        // the remainder. Every block is freed EXACTLY once
+                        // (double frees are dropped by the release stamp guard
+                        // but still count free bytes, breaking balance).
+                        for (std::size_t i = 0; i < live.size(); ++i)
+                            if (i % 3 != 0) fast_free(live[i]);
+                        std::vector<void*> second;
+                        second.reserve(16);
+                        for (int i = 0; i < 16; ++i) second.push_back(fast_malloc(sz));
+                        for (std::size_t i = 0; i < live.size(); ++i)
+                            if (i % 3 == 0) fast_free(live[i]);
+                        for (void* p : second) fast_free(p);
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+    }
+    FastAllocStats after = fast_alloc_stats();
+    // Peaks must stay under the sanity ceiling (a wrapped snapshot would
+    // have ratcheted a peak to ~SIZE_MAX).
+    EXPECT_LT(after.peak_live_blocks, (std::size_t)1 << 63);
+    EXPECT_LT(after.peak_live_bytes, (std::size_t)1 << 63);
+    // Live counters return exactly to baseline after a balanced battery.
+    EXPECT_EQ(after.current_live_blocks, before.current_live_blocks);
+    EXPECT_EQ(after.current_live_bytes, before.current_live_bytes);
 }

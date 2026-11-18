@@ -4,12 +4,14 @@
 
 ## 1. Test Plan Coverage
 
-The Google Test suite (`fast_alloc_tests`) consists of **10 files, 86 test
-cases** (release: 79 run; debug: 86 run, of which 85 pass and 1 —
+The Google Test suite (`fast_alloc_tests`) spans **12 files** (80 cases run
+in a default Release build; 92 under `FASTALLOC_DEBUG` — debug adds the
+death-test/registry battery; enabling `FASTALLOC_OVERRIDE_NEW` adds 7 more
+from `test_override_new.cpp`). Of the debug run, 91 pass and 1 —
 `ApiTest.FreeWithCorruptLargeHeaderIsDroppedNotCached` — intentionally
 skips in debug builds because the debug registry fatals on forged pointers
 by design; it runs in release builds where the drop-not-cache path is
-exercised).
+exercised.
 
 | File | Focus | Key tests |
 | :--- | :--- | :--- |
@@ -22,6 +24,9 @@ exercised).
 | `test_oom.cpp` | Memory exhaustion | deterministic OOM injection: clean `nullptr` returns, existing memory stays valid, allocator fully recovers, countdown semantics, TLS fast path unaffected |
 | `test_aligned.cpp` | Over-aligned allocations | alignments 32..4096, odd sizes, large aligned, realloc preserves alignment, invalid alignments rejected |
 | `test_stress.cpp` | Randomized soak | 5 pattern-verified churns (every byte of every block verified before free), multi-threaded soak, reverse and round-robin free orders |
+| `test_env_tunables.cpp` | Environment variables | `FASTALLOC_PAGE_CACHE_MB` overflow never disables the cache, small limits honoured (fresh-process fork/exec probes; POSIX-only, skip-stubs on Windows) |
+| `test_stats_balance.cpp` | Live-stats net-zero balance | aligned/plain/realloc batteries net `current_live_bytes`/`current_live_blocks` to zero; 8-thread cross-thread peak sanity (wrapped flush snapshots must never ratchet peaks) |
+| `test_override_new.cpp` | `new`/`delete` overrides (built when `FASTALLOC_OVERRIDE_NEW=ON`) | sized/unsized delete dispatch, array forms, exception paths, alignment forwarding |
 
 Assertions are never executed from worker threads: failures are recorded
 per-thread and verified on the main thread (Google Test assertions are not
@@ -68,11 +73,11 @@ CI runs this battery on every push across Linux and Windows (see §4).
 
 | Configuration | Suite | Result | Wall time |
 | :--- | :--- | :--- | ---: |
-| Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 75 tests | **PASS** — zero warnings | 5.5 s |
-| Debug (`-g -DFASTALLOC_DEBUG`) | 86 tests | **PASS** (85 run + 1 by-design skip; all detections verified) | 114 s |
-| AddressSanitizer + UBSan (release) | 75 tests | **PASS** — zero memory errors | 45 s |
-| ThreadSanitizer | 75 tests | **PASS — zero data races** across the cross-thread MPSC handoff, thread-exit flush, and 8-thread contended churn tests | 90 s |
-| LeakSanitizer (release) | 75 tests | **PASS** — zero leaks | 4.7 s |
+| Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 80 tests | **PASS** — zero warnings | 5.5 s |
+| Debug (`-g -DFASTALLOC_DEBUG`) | 92 tests | **PASS** (91 run + 1 by-design skip; all detections verified) | 6.2 s |
+| AddressSanitizer + UBSan (release) | 80 tests | **PASS** — zero memory errors | 45.8 s |
+| ThreadSanitizer | 80 tests | **PASS — zero data races** across the cross-thread MPSC handoff, thread-exit flush, 8-thread contended churn and cross-thread peak-sanity tests | 65.4 s |
+| LeakSanitizer (release) | 80 tests | **PASS** — zero leaks | 2.9 s |
 | LeakSanitizer-equivalent (registry) | via debug suite | leak counts exact in debug mode | — |
 
 ### Windows/MinGW (UCRT64, GCC 16.2, CMake 4.3, 12-core host, Release)
@@ -81,8 +86,8 @@ Run locally on 2026-10-15 via `python -m cmake` + MinGW Makefiles.
 
 | Suite | Tests | Result | Notes |
 | :--- | :--- | :--- | :--- |
-| `fast_alloc_tests` (main) | 75 | **74 PASS, 1 FAIL** | `ApiTest.ReallocFailurePreservesOriginal` — OOM injection does not fire on Windows (VirtualAlloc doesn't obey the countdown in the same code path as `mmap`); platform-expected |
-| `fast_alloc_audit_tests` (49 cases at run time; 54 in the current tree) | 49 | **48 PASS, 1 FAIL** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
+| `fast_alloc_tests` (main) | 80 compiled (2 POSIX-only runtime skips) | **1 platform-fail, rest pass** | `ApiTest.ReallocFailurePreservesOriginal` — OOM injection does not fire on Windows (VirtualAlloc doesn't obey the countdown in the same code path as `mmap`); platform-expected |
+| `fast_alloc_audit_tests` (54 cases in tree) | 49 ran (2026-10-15 local run) | **1 platform-fail, rest pass** | `AuditSlab.EmptySlabReturnedToOs` — RSS reporting via `/proc/self/status` is unavailable on Windows; RSS read returns 0; platform-expected |
 | `bench_suite` small-mixed T=1 | — | **41.2 M ops/s** (24.25 ns/op median) | Checksum OK |
 | `fast_alloc_bench` MallocFree 8B T=1 | — | **5.99 µs/iter** vs std 33.4 µs → **5.6× faster** | MinGW UCRT64, Release |
 | `fast_alloc_bench_memory` 4 threads | — | std 0.111 s / FastAlloc 0.347 s | VirtualAlloc reservation overhead dominates at T=4; expected on Windows |
@@ -132,13 +137,14 @@ invokes ctest (build-test Linux entries, sanitizers, leak-sanitizer, WINVA-emula
 | `probe_stats` | aligned/plain/realloc battery leaves `current_live_bytes`/`current_live_blocks` net zero |
 | `probe_stats4` | reproducer: the exact 100/9000/3000000 grow-shrink-free cycle (was: +1,499,136 bytes drift) |
 | `probe_remaining` | Clean-target battery: sized-free wrong hints, all 512 class boundaries, OOM rollback on cold classes, retention caps + purge, concurrent stats |
+| `probe_split_cap` | page-cache split-tail retention-cap enforcement: 512→16 page splits park tails only while the per-bin cap has room, else release them to the OS; `page_cache_total_bytes` never exceeds the global cap nor wraps (3 ctest entries: default + 4 MB + 256 MB `FASTALLOC_PAGE_CACHE_MB`) |
 
 Reproduce locally (Linux):
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFASTALLOC_BUILD_TESTS=ON
 cmake --build build -j
-ctest --test-dir build -R "fast_alloc_probe" --output-on-failure   # 11 entries
+ctest --test-dir build -R "fast_alloc_probe" --output-on-failure   # 14 entries
 ```
 
 The probes are POSIX-only (fresh-process `setenv`/`fork`/`exec` semantics); on Windows the

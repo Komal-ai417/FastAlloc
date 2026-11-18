@@ -103,7 +103,7 @@ set with the `FASTALLOC_LOG_LEVEL` environment variable (0–5).
 | Variable | Meaning | Default |
 | :--- | :--- | :--- |
 | `FASTALLOC_LOG_LEVEL` | Initial log level 0–5 | 0 (release) / 2 (debug) |
-| `FASTALLOC_PAGE_CACHE_MB` | Global page-cache retention cap in MB | 64 |
+| `FASTALLOC_PAGE_CACHE_MB` | Global page-cache retention cap in MB. Parsed with `strtoull`: fully-parsed integers in (0, 2^20] MB; `0`, trailing garbage, and overflow all fall back to the default (0 does NOT disable the cache) | 64 |
 
 ## Error Handling Summary
 

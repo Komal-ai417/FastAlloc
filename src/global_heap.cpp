@@ -8,6 +8,7 @@
 #include <tuple>
 #include <thread>
 #include <cstdlib>
+#include <cerrno>
 #include <new>
 
 namespace FastAlloc {
@@ -34,15 +35,23 @@ std::size_t PageCacheTotalLimit() {
         const char* env = fast_getenv("FASTALLOC_PAGE_CACHE_MB");
         std::size_t mb = 64; // documented default
         if (env && *env) {
-            long v = std::atol(env);
-            if (v > 0) mb = static_cast<std::size_t>(v);
-            // Overflow guard: prevent mb * 1024 * 1024 from wrapping in
-            // size_t, which would silently disable the page cache.
-            // Reject any value whose byte product cannot be represented and
-            // fall back to the default; cap values at 1 PB, which no
-            // real deployment exceeds.
-            constexpr std::size_t kMaxSaneMb = (1ull << 40) / (1024 * 1024);
-            if (mb > kMaxSaneMb) mb = 64;
+            // strtoull, not atol: atol has undefined behavior on overflow
+            // and is 32-bit wide on Windows LLP64, where any value above
+            // 2 GB wraps negative and is rejected by a v > 0 guard.
+            // strtoull reports overflow via errno instead. Accepted
+            // values: fully-parsed integers in (0, kMaxSaneMb]. 0,
+            // trailing garbage, and overflow all fall back to the
+            // documented 64 MB default ("0 disables the cache" is NOT the
+            // contract - see docs/api_reference.md).
+            char* end = nullptr;
+            errno = 0;
+            unsigned long long v = std::strtoull(env, &end, 10);
+            constexpr unsigned long long kMaxSaneMb =
+                (1ull << 40) / (1024 * 1024); // 1 TB of retention
+            if (end && *end == '\0' && errno == 0 && v > 0 &&
+                v <= kMaxSaneMb) {
+                mb = static_cast<std::size_t>(v);
+            }
         }
         return mb * 1024 * 1024;
     }();
@@ -196,24 +205,48 @@ void* PageHeapAllocate(std::size_t size) {
 
                 std::size_t rem_pages = p - pages;
                 if (rem_pages > 0) {
-                    // Internal move: no retention increase (net bytes
-                    // already subtracted above; the tail re-enters below).
-                    // Per-bin retention caps are skipped for splits - the
-                    // global high-water cap still bounds total retention.
+                    // Split tail: park it in the exact-size bin ONLY if the
+                    // per-bin retention cap has room (AGENTS.md 2.4: the 2 MB
+                    // per-bin cap must hold for every insertion, including
+                    // internal moves - a parked tail counts against the bin
+                    // exactly like a fresh free). Cap full -> the tail leaves
+                    // the cache and is returned to the OS below.
                     // Lock order is strictly high bin -> low bin
                     // (rem_pages < p), so concurrent splits cannot deadlock.
                     auto& rbin = page_bins_[rem_pages];
-                    PageNode* rem = reinterpret_cast<PageNode*>(
-                        reinterpret_cast<char*>(node) + size);
+                    bool parked = false;
                     AcquireBinLock(rbin.lock);
-                    rem->next = rbin.head;
-                    rbin.head = rem;
-                    rbin.count++;
-                    MarkNonEmpty(rem_pages);
+                    if (rbin.count < BinRetentionCount(rem_pages)) {
+                        PageNode* rem = reinterpret_cast<PageNode*>(
+                            reinterpret_cast<char*>(node) + size);
+                        rem->next = rbin.head;
+                        rbin.head = rem;
+                        rbin.count++;
+                        MarkNonEmpty(rem_pages);
+                        parked = true;
+                        // Account the tail's bytes while the bin lock is
+                        // held: a concurrent exact-size pop of this tail must
+                        // not fetch_sub() before our fetch_add() lands, or
+                        // the global counter transiently wraps near SIZE_MAX
+                        // and PageHeapFree's cap admission
+                        // (total + size <= limit) makes garbage decisions.
+                        // The lock pairs the list mutation and the counter
+                        // update into one critical section; sub/add net to
+                        // zero for the move.
+                        page_cache_total_bytes.fetch_add(rem_pages * page_size,
+                                                         std::memory_order_relaxed);
+                        stats::CountPageCacheStore(rem_pages * page_size);
+                    }
                     rbin.lock.clear(std::memory_order_release);
-                    page_cache_total_bytes.fetch_add(rem_pages * page_size,
-                                                     std::memory_order_relaxed);
-                    stats::CountPageCacheStore(rem_pages * page_size);
+                    if (!parked) {
+                        // Retention cap full: the tail never parks, so it
+                        // owes no bytes (the whole span's bytes were
+                        // subtracted above) - release the pages to the OS.
+                        OSMemory::FreePages(
+                            reinterpret_cast<char*>(node) + size,
+                            rem_pages * page_size);
+                        stats::CountPageCacheBypass();
+                    }
                 }
                 bin.lock.clear(std::memory_order_release);
                 stats::CountPageCacheHit();

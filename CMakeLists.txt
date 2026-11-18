@@ -183,6 +183,7 @@ if(FASTALLOC_BUILD_TESTS)
         scripts/probe_stats.cpp
         scripts/probe_stats4.cpp
         scripts/probe_remaining.cpp
+        scripts/probe_split_cap.cpp
     )
     set(FASTALLOC_PROBE_TARGETS "")
     if(NOT WIN32)
@@ -201,6 +202,15 @@ if(FASTALLOC_BUILD_TESTS)
                          COMMAND "${probe_target}" "17592186044416")
                 add_test(NAME "${probe_target}_wrap2p48"
                          COMMAND "${probe_target}" "281474976710656")
+            elseif(probe_name STREQUAL "probe_split_cap")
+                # Retention-cap enforcement under splits; also runs with a
+                # small (4 MB) and large (256 MB) FASTALLOC_PAGE_CACHE_MB so
+                # both admission directions are exercised in fresh processes.
+                add_test(NAME "${probe_target}" COMMAND "${probe_target}")
+                add_test(NAME "${probe_target}_mb4"
+                         COMMAND "${probe_target}" "4")
+                add_test(NAME "${probe_target}_mb256"
+                         COMMAND "${probe_target}" "256")
             else()
                 add_test(NAME "${probe_target}" COMMAND "${probe_target}")
             endif()

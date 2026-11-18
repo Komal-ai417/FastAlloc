@@ -23,8 +23,20 @@ void Slab::assert_fast(bool cond, const char* msg) {
 #endif
 
 Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size, uint32_t arena_index) {
-    // Need space for header + at least one block
-    if (!memory || memory_size <= sizeof(Slab) + block_size) {
+    // Geometry preconditions (public static entry point - internal callers
+    // always satisfy these, but a foreign/hostile caller must not reach the
+    // division or the eager debug wiring):
+    //   - block_size == 0 divides by zero in total_blocks (SIGFPE);
+    //   - block_size < sizeof(FreeBlock) makes the debug wiring below write
+    //     the 24-byte block header past each block's own storage;
+    //   - remaining capacity is checked by SUBTRACTION
+    //     (memory_size - sizeof(Slab) >= block_size), never by comparing
+    //     against sizeof(Slab) + block_size, which wraps for block_size
+    //     near SIZE_MAX and would admit a bogus geometry.
+    if (!memory || block_size == 0 || block_size < sizeof(FreeBlock)) {
+        return nullptr;
+    }
+    if (memory_size <= sizeof(Slab) || memory_size - sizeof(Slab) < block_size) {
         return nullptr;
     }
 

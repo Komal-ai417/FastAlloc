@@ -10,7 +10,7 @@
 
 <br>
 
-**FastAlloc** is a custom-built, ultra-low-latency memory allocator designed as a drop-in replacement for standard `malloc` and `free`. By combining platform-native Thread-Local Storage (TLS) caching with targeted lock-free structures and bounded OS-memory caching, FastAlloc reduces allocator overhead under heavy multi-threaded contention. It ships with a full memory-safety instrumentation mode, a 90-case Google Test suite (79 run in Release; 90 under FASTALLOC_DEBUG), sanitizer-clean (ASan/UBSan/TSan/LSan) verification in CI, and a one-command cross-allocator benchmark verdict tool.
+**FastAlloc** is a custom-built, ultra-low-latency memory allocator designed as a drop-in replacement for standard `malloc` and `free`. By combining platform-native Thread-Local Storage (TLS) caching with targeted lock-free structures and bounded OS-memory caching, FastAlloc reduces allocator overhead under heavy multi-threaded contention. It ships with a full memory-safety instrumentation mode, a Google Test suite of 80 cases in Release and 92 under `FASTALLOC_DEBUG` (plus 7 `new`/`delete`-override cases behind `FASTALLOC_OVERRIDE_NEW`), sanitizer-clean (ASan/UBSan/TSan/LSan) verification in CI, and a one-command cross-allocator benchmark verdict tool.
 
 ---
 
@@ -60,7 +60,7 @@ FastAlloc is built using CMake and requires **C++17** or higher.
 
 #### Linux / macOS
 ```bash
-git clone https://github.com/yourusername/FastAlloc.git
+git clone https://github.com/Komal-ai417/FastAlloc.git
 cd FastAlloc
 cmake -B build
 cmake --build build --config Release
@@ -226,15 +226,15 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 | Configuration | Tests | Status |
 | :--- | :--- | :--- |
-| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 79 | all pass, zero warnings |
-| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 90 (incl. death tests; 1 debug-only skip by design) | all pass |
-| Linux AddressSanitizer + UBSan | 79 | zero memory errors |
-| Linux ThreadSanitizer | 79 | **zero data races** |
-| Linux LeakSanitizer | 79 | zero leaks |
-| Linux audit probes (`scripts/`, 11 ctest entries; filter with `ctest -R fast_alloc_probe`) | 11 | all pass (run by every POSIX ctest job: build-test Linux, sanitizers, leaks, WINVA-emulation) |
-| Windows/MSVC Release | 75 | all pass |
-| Windows/MinGW UCRT64 Release (GCC 16.2) | 75 | **74 pass, 1 platform-skip** (`ReallocFailurePreservesOriginal` — OOM injection path differs on Windows) |
-| Windows/MinGW UCRT64 audit suite | 49 | **48 pass, 1 platform-skip** (`EmptySlabReturnedToOs` — `/proc/self/status` unavailable on Windows) |
+| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 80 | all pass, zero warnings |
+| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 92 (incl. death tests; 1 debug-only skip by design) | all pass |
+| Linux AddressSanitizer + UBSan | 80 | zero memory errors |
+| Linux ThreadSanitizer | 80 | **zero data races** |
+| Linux LeakSanitizer | 80 | zero leaks |
+| Linux audit probes (`scripts/`, 14 ctest entries; filter with `ctest -R fast_alloc_probe`) | 14 | all pass (run by every POSIX ctest job: build-test Linux, sanitizers, leaks, WINVA-emulation) |
+| Windows/MSVC Release | 80 (2 POSIX-only runtime skips) | all pass |
+| Windows/MinGW UCRT64 Release (GCC 16.2) | 80 (2 POSIX-only runtime skips) | `ReallocFailurePreservesOriginal` platform-fails (OOM injection path differs — VirtualAlloc); remaining pass (last local run 2026-10-15) |
+| Windows/MinGW UCRT64 audit suite | 54 in tree (49 ran on 2026-10-15) | `EmptySlabReturnedToOs` platform-fails (`/proc/self/status` unavailable on Windows) |
 | Benchmark checksums (132 suite cells + 92 gbench configs) | — | zero failures |
 
 CI runs on every push: ubuntu/windows × release/debug +
@@ -250,7 +250,7 @@ cmake -B build-asan -DFASTALLOC_SANITIZE=address,undefined && cmake --build buil
 cmake -B build-tsan -DFASTALLOC_SANITIZE=thread && cmake --build build-tsan && ctest --test-dir build-tsan
 cmake -B build-lsan -DFASTALLOC_SANITIZE=leak && cmake --build build-lsan && ctest --test-dir build-lsan
 
-# Run adversarial audit probes only (11 entries):
+# Run adversarial audit probes only (14 entries):
 ctest --test-dir build -R fast_alloc_probe --output-on-failure
 ```
 

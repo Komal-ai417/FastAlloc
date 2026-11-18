@@ -241,7 +241,7 @@ hardware before making claims.
 ## Thread-lifecycle & churn optimizations
 
 Each optimization below is verified by the full test and sanitizer battery
-(75/75 release, 86 debug incl. 11 death tests — one debug-only test
+(80/80 release, 92 debug incl. 11 death tests — one debug-only test
 intentionally skips because the registry fatals on forged pointers by design,
 ASan/UBSan/LSan clean, TSan zero warnings).
 
