@@ -78,14 +78,18 @@ TEST(StatsBalanceTest, ReallocGrowShrinkFreeNetsToZero) {
 // current_live returns exactly to baseline.
 TEST(StatsBalanceTest, CrossThreadPeakSanity) {
     FastAllocStats before = fast_alloc_stats();
-    constexpr int kThreads = 8;
-    constexpr int kRounds = 40;
+    // static storage duration: a static constant needs no lambda capture on
+    // any compiler — MSVC C3493 demands a capture for uncaptured constexpr
+    // locals, clang -Wunused-lambda-capture (in -Werror builds) rejects the
+    // same capture as unneeded. Referencing static constants avoids both.
+    static constexpr int kThreads = 8;
+    static constexpr int kRounds = 40;
     {
         // Scoped so the vector's own buffer (routed through FastAlloc when
         // new/delete are overridden) is freed before the after-snapshot.
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([t, kRounds] {
+            threads.emplace_back([t] {
                 for (int r = 0; r < kRounds; ++r) {
                     std::vector<void*> live;
                     live.reserve(64);
