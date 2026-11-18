@@ -85,7 +85,7 @@ TEST(StatsBalanceTest, CrossThreadPeakSanity) {
         // new/delete are overridden) is freed before the after-snapshot.
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([t] {
+            threads.emplace_back([t, kRounds] {
                 for (int r = 0; r < kRounds; ++r) {
                     std::vector<void*> live;
                     live.reserve(64);
